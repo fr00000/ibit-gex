@@ -341,27 +341,28 @@ def backfill_etf_flows(ticker_symbol, days=90):
 
         # Use Close price as NAV proxy for historical days
         conn = get_db()
-        c = conn.cursor()
-        prev_shares = None
-        for date_idx, row in hist.iterrows():
-            date_str = date_idx.strftime('%Y-%m-%d')
-            nav = float(row['Close'])
-            # Yahoo doesn't give historical shares outstanding directly,
-            # but we can estimate flows from price and volume as a proxy.
-            # For ETFs, large volume days with price increase = inflow, decrease = outflow.
-            # Better approach: use Volume * price as a rough flow proxy
-            volume = float(row.get('Volume', 0))
-            # Estimate: net flow ≈ volume * price * sign(close - open)
-            open_p = float(row['Open'])
-            close_p = float(row['Close'])
-            direction = 1 if close_p >= open_p else -1
-            # Scale down — not all volume is creation/redemption, ~10-20% typically is
-            estimated_flow = direction * volume * nav * 0.15
+        try:
+            c = conn.cursor()
+            for date_idx, row in hist.iterrows():
+                date_str = date_idx.strftime('%Y-%m-%d')
+                nav = float(row['Close'])
+                # Yahoo doesn't give historical shares outstanding directly,
+                # but we can estimate flows from price and volume as a proxy.
+                # For ETFs, large volume days with price increase = inflow, decrease = outflow.
+                # Better approach: use Volume * price as a rough flow proxy
+                volume = float(row.get('Volume', 0))
+                # Estimate: net flow ≈ volume * price * sign(close - open)
+                open_p = float(row['Open'])
+                close_p = float(row['Close'])
+                direction = 1 if close_p >= open_p else -1
+                # Scale down — not all volume is creation/redemption, ~10-20% typically is
+                estimated_flow = direction * volume * nav * 0.15
 
-            c.execute('INSERT OR IGNORE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
-                      (date_str, ticker_symbol, None, None, nav, 0, estimated_flow))
-        conn.commit()
-        conn.close()
+                c.execute('INSERT OR IGNORE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
+                          (date_str, ticker_symbol, None, None, nav, 0, estimated_flow))
+            conn.commit()
+        finally:
+            conn.close()
         print(f"  [etf-flows] Backfilled {len(hist)} days for {ticker_symbol}")
     except Exception as e:
         print(f"  [etf-flows] Backfill failed for {ticker_symbol}: {e}")
@@ -1322,6 +1323,8 @@ def api_candles():
 @app.route('/api/flows')
 def api_flows():
     ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
     conn = get_db()
     c = conn.cursor()
     c.execute('SELECT date, daily_flow_dollars, shares_outstanding, aum, nav FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 30', (ticker,))
