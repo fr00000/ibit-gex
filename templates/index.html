@@ -64,6 +64,10 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .conf-tip{display:none;position:absolute;top:100%;right:0;margin-top:6px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:6px 9px;font-size:9px;color:var(--t2);line-height:1.5;width:280px;white-space:normal;z-index:30;box-shadow:0 4px 12px rgba(0,0,0,.5);font-weight:400;letter-spacing:0}
 .conf-tip strong{color:var(--t1);display:block;margin-bottom:3px}
 .conf-tip .cw{margin-top:3px;padding-top:3px;border-top:1px solid var(--border)}
+.hdr-flow{font-size:9px;font-weight:600;letter-spacing:.6px;padding:2px 7px;border-radius:2px}
+.flow-in{background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)}
+.flow-out{background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)}
+.flow-flat{background:var(--bg3);color:var(--t3);border:1px solid var(--border)}
 
 .hdr-tabs{display:flex;gap:2px;background:var(--bg3);border-radius:3px;padding:2px}
 .hdr-tab{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.5px;padding:2px 10px;border-radius:2px;border:none;background:none;color:var(--t3);cursor:pointer;transition:all .15s}
@@ -89,12 +93,13 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .chart-legend-tip{display:none;position:absolute;top:100%;left:0;margin-top:4px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;font-size:9px;color:var(--t2);line-height:1.4;width:220px;white-space:normal;z-index:20;box-shadow:0 4px 12px rgba(0,0,0,.4)}
 
 /* BOTTOM CHARTS */
-.bottom{grid-row:2;grid-column:1;background:var(--bg);display:grid;grid-template-columns:1fr 1fr;gap:1px;height:180px}
+.bottom{grid-row:2;grid-column:1;background:var(--bg);display:grid;grid-template-columns:1fr 1fr 1fr;gap:1px;height:180px}
 .bottom .cell{background:var(--bg);padding:6px 10px;min-height:0;display:flex;flex-direction:column}
 .cell-label{font-size:9px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:4px;display:flex;align-items:center;gap:5px}
 .cell-label::before{content:'';display:inline-block;width:6px;height:6px;border-radius:1px}
 .cell-gex .cell-label::before{background:var(--amber)}
 .cell-oi .cell-label::before{background:var(--blue)}
+.cell-flow .cell-label::before{background:var(--green)}
 .cell canvas{flex:1;min-height:0}
 
 /* RIGHT PANEL */
@@ -247,6 +252,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="hdr-sep"></div>
   <div class="hdr-regime" id="hdr-regime">---</div>
   <div class="hdr-conf" id="hdr-conf" style="display:none"></div>
+  <div class="hdr-flow" id="hdr-flow" style="display:none"></div>
   <div class="hdr-right">
     <div class="hdr-ts" id="hdr-time"></div>
     <div class="hdr-sep"></div>
@@ -293,13 +299,17 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <div class="cell-label">Open Interest</div>
       <canvas id="oi-chart"></canvas>
     </div>
+    <div class="cell cell-flow">
+      <div class="cell-label">ETF Flows</div>
+      <canvas id="flow-chart"></canvas>
+    </div>
   </div>
   <div class="right" id="sidebar"></div>
   <div class="ai-panel" id="ai-panel"></div>
 </div>
 
 <script>
-let gexChart=null,oiChart=null,tvChart=null,tvSeries=null,priceLines=[];
+let gexChart=null,oiChart=null,flowChart=null,tvChart=null,tvSeries=null,priceLines=[];
 let aiData=null;
 let btcWs=null;
 let currentTicker='IBIT';
@@ -487,6 +497,28 @@ function renderOI(data){
   });
 }
 
+function renderFlowChart(flows){
+  if(typeof Chart==='undefined')return;
+  const ctx=document.getElementById('flow-chart');
+  if(!flows || !flows.length){if(flowChart){flowChart.destroy();flowChart=null}return}
+  if(flowChart)flowChart.destroy();
+  const labels=flows.map(d=>d.date.slice(5));
+  const vals=flows.map(d=>(d.flow||0)/1e6);
+  const colors=vals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
+  flowChart=new Chart(ctx,{
+    type:'bar',
+    data:{labels,datasets:[{label:'Flow ($M)',data:vals,backgroundColor:colors,borderWidth:0,borderRadius:1,barPercentage:.85}]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>`${i.raw>=0?'+':''}${i.raw.toFixed(1)}M`}}},
+      scales:{
+        x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:10,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+        y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${v>=0?'+':''}${v.toFixed(0)}M`},grid:{color:'#111620'},border:{color:'#1c2230'}}
+      }
+    }
+  });
+}
+
 function renderSidebar(data){
   const lv=data.levels,bps=data.btc_per_share;
   const b=s=>fB(s/bps);
@@ -626,6 +658,28 @@ function renderSidebar(data){
     h+=`<div class="oi-interp">${interp}</div></div></div>`;
   }
 
+  // ETF Fund Flows
+  if(data.etf_flows){
+    const fl=data.etf_flows;
+    const isIn=fl.direction==='inflow';
+    const dirCls=isIn?'ff-buy':'ff-sell';
+    const amt=Math.abs(fl.daily_flow_dollars/1e6);
+    const avg5=Math.abs(fl.avg_flow_5d/1e6);
+    // Streak dots: up to 5 dots, colored by direction
+    const abStrk=Math.min(Math.abs(fl.streak),5);
+    const dotCol=fl.streak>0?'bo-dot-g':'bo-dot-r';
+    const dots=Array.from({length:5},(_,i)=>`<div class="bo-dot ${i<abStrk?dotCol:'bo-dot-e'}"></div>`).join('');
+
+    h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--blue)"></span>ETF Fund Flows</div>`;
+    h+=`<div class="ff-box"><div class="ff-hdr">Daily Flow</div>`;
+    h+=`<div class="ff-row"><span class="ffl">Today</span><span class="ff-dir ${dirCls}">${isIn?'+':'-'}$${amt.toFixed(0)}M ${fl.direction.toUpperCase()}</span></div>`;
+    h+=`<div class="ff-row"><span class="ffl">Impact</span><span class="ffv">${fl.strength}</span></div>`;
+    h+=`</div>`;
+    h+=`<div class="ff-box"><div class="ff-hdr">5-Day Momentum</div>`;
+    h+=`<div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0"><div class="bo-dots" style="display:flex;gap:2px">${dots}</div><span style="font-size:10px;font-weight:500">${fl.avg_flow_5d>=0?'+':'-'}$${avg5.toFixed(0)}M/d avg</span></div>`;
+    h+=`</div></div>`;
+  }
+
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position</div>`;
   [['Net GEX',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
@@ -682,6 +736,16 @@ async function loadData(){
       confEl.innerHTML=`${conf}%<div class="conf-tip">${tip}</div>`;
       confEl.style.display='';
     }else{confEl.style.display='none'}
+    const flowEl=document.getElementById('hdr-flow');
+    if(data.etf_flows){
+      const fl=data.etf_flows;
+      const fc=fl.direction==='inflow'?'flow-in':'flow-out';
+      const arrow=fl.direction==='inflow'?'\u25b2':'\u25bc';
+      const amt=Math.abs(fl.daily_flow_dollars/1e6).toFixed(0);
+      flowEl.className=`hdr-flow ${fc}`;
+      flowEl.textContent=`${arrow} $${amt}M ${fl.streak>0?`(${fl.streak}d)`:fl.streak<0?`(${Math.abs(fl.streak)}d)`:''}`;
+      flowEl.style.display='';
+    }else{flowEl.style.display='none'}
     const exps=data.expirations||[];
     if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
     else document.getElementById('hdr-exp').textContent='';
@@ -710,6 +774,11 @@ async function loadData(){
 
     try{renderGEX(data)}catch(e){console.warn('GEX:',e)}
     try{renderOI(data)}catch(e){console.warn('OI:',e)}
+    try{
+      const fr=await fetch(`/api/flows?ticker=${currentTicker}`);
+      const flows=await fr.json();
+      if(seq===_loadSeq&&Array.isArray(flows))renderFlowChart(flows);
+    }catch(e){console.warn('Flows:',e)}
     try{renderSidebar(data)}catch(e){console.warn('Sidebar:',e)}
     try{renderAiPanel()}catch(e){console.warn('AI:',e)}
 
@@ -726,6 +795,9 @@ function renderAiPanel(){
   const aiDte=document.getElementById('dte-select').value+'d';
   let h=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis</div>`;
   h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button></div>`;
+  if(aiData&&aiData._timestamp){
+    h+=`<div style="font-size:9px;color:var(--t3);margin-bottom:4px">Updated ${esc(aiData._timestamp)}${aiData._btc_price?' · BTC '+fB(aiData._btc_price):''}</div>`;
+  }
   if(aiData){
     const dteTxt=aiData[aiDte];
     const allTxt=aiData['all'];
@@ -762,6 +834,7 @@ async function runAnalysis(){
   const btn=document.getElementById('ai-analyze-btn');
   if(!btn)return;
   btn.disabled=true;
+  btn.innerHTML='<div class="spin" style="width:10px;height:10px;display:inline-block;vertical-align:middle;border-width:1.5px"></div>';
   try{
     const resp=await fetch(`/api/analyze?ticker=${currentTicker}`,{method:'POST'});
     const data=await resp.json();
@@ -770,8 +843,9 @@ async function runAnalysis(){
     renderAiPanel();
   }catch(e){
     console.error('Analysis error:',e);
+    const b2=document.getElementById('ai-analyze-btn');
+    if(b2){b2.disabled=false;b2.innerHTML='&#x21bb;'}
   }
-  btn.disabled=false;
 }
 
 // Init
