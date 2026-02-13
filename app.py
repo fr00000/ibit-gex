@@ -229,6 +229,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     if not selected_exps:
         selected_exps = all_exps[:3]
 
+    # Fetch previous day's strike data (needed for Active GEX + breakout + sig levels)
+    conn = get_db()
+    prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
+    conn.close()
+
     # Collect options data
     strike_data = {}
     cached_chains = {}  # exp_str -> chain, reused for expected move
@@ -262,17 +267,24 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
                 dealer_delta = -delta * oi * 100
                 # Dealer vanna exposure: how dealer delta changes with IV
                 dealer_vanna = -sign * vanna * oi * 100 * spot * 0.01
-                # Dealer charm exposure: how dealer delta changes overnight
-                # Charm is dDelta/dT per year, convert to per-day: divide by 365
-                dealer_charm = -charm * oi * 100 / 365.0
+                # Dealer charm exposure: how dealer hedge changes overnight
+                # bs_charm returns -dΔ/dτ; dealer hedge change = bs_charm * OI * 100 / 365
+                dealer_charm = charm * oi * 100 / 365.0
+
+                vol = row.get('volume', 0)
+                if pd.isna(vol):
+                    vol = 0
+                vol = int(vol)
 
                 if strike not in strike_data:
                     strike_data[strike] = {'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
                                            'call_delta': 0, 'put_delta': 0,
                                            'call_vanna': 0, 'put_vanna': 0,
-                                           'call_charm': 0, 'put_charm': 0}
+                                           'call_charm': 0, 'put_charm': 0,
+                                           'call_volume': 0, 'put_volume': 0}
                 strike_data[strike][f'{opt_type}_oi'] += oi
                 strike_data[strike][f'{opt_type}_gex'] += gex
+                strike_data[strike][f'{opt_type}_volume'] += vol
                 strike_data[strike][f'{opt_type}_delta'] += dealer_delta
                 strike_data[strike][f'{opt_type}_vanna'] += dealer_vanna
                 strike_data[strike][f'{opt_type}_charm'] += dealer_charm
@@ -292,11 +304,27 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'net_charm': d['call_charm'] + d['put_charm'],
             'call_vanna': d['call_vanna'], 'put_vanna': d['put_vanna'],
             'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
+            'call_volume': d['call_volume'], 'put_volume': d['put_volume'],
+            'total_volume': d['call_volume'] + d['put_volume'],
         })
     df = pd.DataFrame(rows)
 
     if df.empty:
         raise ValueError(f"No options data found for {ticker_symbol} within {max_dte} DTE")
+
+    # Compute Active GEX: weight net_gex by fraction of OI that is new since yesterday
+    active_gex_values = []
+    for _, row in df.iterrows():
+        strike = row['strike']
+        total_oi = row['total_oi']
+        if prev_strikes and strike in prev_strikes and total_oi > 0:
+            prev_total_oi = prev_strikes[strike]['total_oi']
+            delta_oi = max(total_oi - prev_total_oi, 0)
+            ratio = min(delta_oi / total_oi, 1.0)
+        else:
+            ratio = 1.0  # no history = all new
+        active_gex_values.append(row['net_gex'] * ratio)
+    df['active_gex'] = active_gex_values
 
     # Derive levels
     levels = {}
@@ -341,6 +369,13 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     levels['total_put_oi'] = int(df['put_oi'].sum())
     levels['pcr'] = levels['total_put_oi'] / max(levels['total_call_oi'], 1)
 
+    # Active GEX totals and walls
+    levels['active_gex_total'] = float(df['active_gex'].sum())
+    active_pos = df[df['active_gex'] > 0]
+    active_neg = df[df['active_gex'] < 0]
+    levels['active_call_wall'] = float(active_pos.loc[active_pos['active_gex'].idxmax(), 'strike']) if not active_pos.empty else levels['call_wall']
+    levels['active_put_wall'] = float(active_neg.loc[active_neg['active_gex'].idxmin(), 'strike']) if not active_neg.empty else levels['put_wall']
+
     # Resistance / support
     levels['resistance'] = df[df['net_gex'] > 0].nlargest(3, 'net_gex')['strike'].tolist()
     levels['support'] = df[df['net_gex'] < 0].nsmallest(3, 'net_gex')['strike'].tolist()
@@ -369,24 +404,18 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     except Exception:
         pass
 
-    # Breakout signals
-    breakout = compute_breakout(df, spot, levels, expected_move, None, btc_per_share)
+    # Breakout signals (prev_strikes already available from early fetch)
+    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share)
 
     # Significant levels with regime behavior
-    sig_levels = compute_significant_levels(df, spot, levels, None, is_btc, btc_per_share)
+    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share)
 
     # Dealer flow forecast (vanna + charm)
     flow_forecast = compute_flow_forecast(df, spot, levels, is_btc)
 
     # Save to DB
     conn = get_db()
-    prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
     save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
-
-    # Recompute with prev data
-    if prev_strikes:
-        breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share)
-        sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share)
 
     # OI aggregate changes
     oi_changes = None
@@ -413,11 +442,15 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'strike': float(row['strike']),
             'btc': float(row['strike'] / btc_per_share) if is_btc else float(row['strike']),
             'net_gex': float(row['net_gex']),
+            'active_gex': float(row['active_gex']),
             'net_vanna': float(row['net_vanna']),
             'net_charm': float(row['net_charm']),
             'call_oi': int(row['call_oi']),
             'put_oi': int(row['put_oi']),
             'total_oi': int(row['total_oi']),
+            'call_volume': int(row['call_volume']),
+            'put_volume': int(row['put_volume']),
+            'total_volume': int(row['total_volume']),
         })
 
     history_data = []
@@ -1001,6 +1034,9 @@ def run_analysis(ticker='IBIT'):
                 'resistance': [round(s / bps) for s in lvl.get('resistance', [])],
                 'support': [round(s / bps) for s in lvl.get('support', [])],
             },
+            'active_gex_total': lvl.get('active_gex_total', 0),
+            'active_call_wall_btc': round(lvl.get('active_call_wall', lvl['call_wall']) / bps),
+            'active_put_wall_btc': round(lvl.get('active_put_wall', lvl['put_wall']) / bps),
             'levels': lvl,
             'expected_move': d['expected_move'],
             'breakout': {
@@ -1063,6 +1099,8 @@ If a "changes_vs_prev" field is present for a timeframe, it contains day-over-da
 - GEX and P/C ratio shifts
 - Spot movement relative to level changes
 This context is critical — a static snapshot is less useful than understanding the direction of positioning changes.
+
+Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new since yesterday. It surfaces where FRESH dealer exposure is concentrated vs stale "zombie gamma" from old positions. Active call/put walls show where the freshest positioning is strongest.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)

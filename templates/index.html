@@ -381,17 +381,38 @@ function renderGEX(data){
   const ctx=document.getElementById('gex-chart');
   if(gexChart)gexChart.destroy();
   const labels=data.gex_chart.map(d=>fB(d.btc));
-  const vals=data.gex_chart.map(d=>d.net_gex);
-  const cols=vals.map(v=>v>0?'#00dc82cc':'#ff4060cc');
+  const netVals=data.gex_chart.map(d=>d.net_gex);
+  const activeVals=data.gex_chart.map(d=>d.active_gex!=null?d.active_gex:d.net_gex);
+  // Stale = total - active (the portion of GEX from old OI)
+  const staleVals=netVals.map((v,i)=>v-activeVals[i]);
+  const staleCols=staleVals.map(v=>v>0?'rgba(0,220,130,0.25)':'rgba(255,64,96,0.25)');
+  const activeCols=activeVals.map(v=>v>0?'#00dc82cc':'#ff4060cc');
   gexChart=new Chart(ctx,{
     type:'bar',
-    data:{labels,datasets:[{data:vals,backgroundColor:cols,borderWidth:0,borderRadius:1,barPercentage:.85}]},
+    data:{labels,datasets:[
+      {label:'Stale GEX',data:staleVals,backgroundColor:staleCols,borderWidth:0,borderRadius:0,barPercentage:.85},
+      {label:'Active GEX',data:activeVals,backgroundColor:activeCols,borderWidth:0,borderRadius:1,barPercentage:.85}
+    ]},
     options:{
       responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false},tooltip:{callbacks:{title:i=>i[0].label,label:i=>`Net GEX: ${fG(i.raw)}`}}},
+      plugins:{
+        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
+        tooltip:{callbacks:{
+          title:i=>i[0].label,
+          afterBody:function(items){
+            const idx=items[0].dataIndex;
+            const d=data.gex_chart[idx];
+            const lines=[`Net GEX: ${fG(d.net_gex)}`];
+            if(d.active_gex!=null)lines.push(`Active GEX: ${fG(d.active_gex)}`);
+            if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
+            return lines;
+          },
+          label:()=>null
+        }}
+      },
       scales:{
-        x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
-        y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
+        x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+        y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
       }
     }
   });
@@ -560,7 +581,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position</div>`;
-  [['Net GEX',fG(lv.net_gex_total)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
+  [['Net GEX',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;
