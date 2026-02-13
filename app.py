@@ -16,6 +16,8 @@ import json
 import os
 import argparse
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -716,6 +718,7 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_shar
 # relying on a fixed clock cutoff. Throttle Yahoo checks to every 30 min.
 YAHOO_CHECK_INTERVAL = 1800  # seconds between re-checks
 _last_yahoo_check = {}  # (ticker, dte) -> datetime
+_yahoo_check_lock = threading.Lock()
 
 
 def get_latest_cache(ticker, dte):
@@ -767,13 +770,15 @@ def fetch_with_cache(ticker, dte):
 
     # Throttle: don't re-check Yahoo more than every 30 min
     check_key = (ticker, dte)
-    last_check = _last_yahoo_check.get(check_key)
-    if cached and last_check and (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
-        return cached
+    with _yahoo_check_lock:
+        last_check = _last_yahoo_check.get(check_key)
+        if cached and last_check and (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
+            return cached
 
     # Fetch from Yahoo
     data = fetch_and_analyze(ticker, dte)
-    _last_yahoo_check[check_key] = datetime.now()
+    with _yahoo_check_lock:
+        _last_yahoo_check[check_key] = datetime.now()
 
     # Compare OI to detect if data actually changed
     if cached:
@@ -788,8 +793,6 @@ def fetch_with_cache(ticker, dte):
 
 
 # ── BACKGROUND REFRESH ─────────────────────────────────────────────────────
-import threading
-import time
 
 REFRESH_DTES = [3, 7, 14, 30, 45]
 
