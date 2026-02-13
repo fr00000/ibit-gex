@@ -815,16 +815,21 @@ def _bg_refresh():
     while True:
         today = datetime.now().strftime('%Y-%m-%d')
         all_fresh = True
+        # Check which DTEs still need fetching
+        stale_dtes = []
         for dte in REFRESH_DTES:
-            try:
-                cache_date, _ = get_latest_cache('IBIT', dte)
-                if cache_date == today:
-                    continue  # already fresh
-                all_fresh = False
-                fetch_with_cache('IBIT', dte)
-            except Exception as e:
-                print(f"  [bg-refresh] DTE {dte} error: {e}")
-                all_fresh = False
+            cache_date, _ = get_latest_cache('IBIT', dte)
+            if cache_date != today:
+                stale_dtes.append(dte)
+        if stale_dtes:
+            all_fresh = False
+            with ThreadPoolExecutor(max_workers=len(stale_dtes)) as pool:
+                futures = {pool.submit(fetch_with_cache, 'IBIT', d): d for d in stale_dtes}
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"  [bg-refresh] DTE {futures[fut]} error: {e}")
 
         if all_fresh:
             # Auto-run AI analysis if not already cached for today
