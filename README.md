@@ -48,24 +48,19 @@ Create a `.env` file in the project root (loaded automatically via python-dotenv
 ## Usage
 
 ```bash
-# Default: 7 DTE, port 5000
+# Default: port 5000
 python3 app.py
-
-# 1 week of expirations only
-python3 app.py --dte 7
-
-# Full 45 day range
-python3 app.py --dte 45
 
 # Custom port and host
 python3 app.py --port 8080 --host 0.0.0.0
 ```
 
+DTE (days to expiration) is selectable from the web UI dropdown (3d, 7d, 14d, 30d, 45d).
+
 ### Flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dte`, `-d` | 7 | Max days to expiration for options chain |
 | `--port`, `-p` | 5000 | Server port |
 | `--host` | 127.0.0.1 | Server host (use 0.0.0.0 for WSL2) |
 
@@ -165,7 +160,7 @@ When IV changes, dealer delta shifts. The dashboard models two scenarios:
 | P/C ratio extremes | P/C > 1.5 = squeeze fuel | P/C < 0.6 = call skew unwind |
 
 ### DTE Selection
-Lower DTE (7) focuses on near-term expirations where gamma is strongest (gamma scales as 1/sqrt(T)). Higher DTE (14-45) includes longer-dated positioning which is structurally relevant but has less gamma impact. Default is 7 for short-term trading. The DTE can also be changed from the web UI dropdown.
+Lower DTE (7) focuses on near-term expirations where gamma is strongest (gamma scales as 1/sqrt(T)). Higher DTE (14-45) includes longer-dated positioning which is structurally relevant but has less gamma impact. Default is 7 for short-term trading. DTE is selectable from the web UI dropdown.
 
 ## Daily OI Tracking
 
@@ -193,7 +188,7 @@ Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON di
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `RISK_FREE_RATE` | 0.043 | Fed funds rate for Black-Scholes |
+| `RISK_FREE_RATE` | 13-week T-bill (^IRX) | Fetched daily from Yahoo Finance, falls back to 4.3% |
 | `BTC_PER_SHARE` | 0.000568 | Fallback — auto-calculated from live prices |
 | `STRIKE_RANGE_PCT` | 0.35 | Filter strikes to +/-35% of spot |
 

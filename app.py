@@ -49,10 +49,30 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-RISK_FREE_RATE = 0.043
+RISK_FREE_RATE_DEFAULT = 0.043
 BTC_PER_SHARE_DEFAULT = 0.000568
 STRIKE_RANGE_PCT = 0.35
 DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
+
+
+_rfr_cache = {'rate': None, 'date': None}
+
+def get_risk_free_rate():
+    """Fetch 13-week T-bill rate (^IRX) from Yahoo Finance, cached daily."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if _rfr_cache['rate'] is not None and _rfr_cache['date'] == today:
+        return _rfr_cache['rate']
+    try:
+        irx = yf.Ticker('^IRX').info.get('regularMarketPrice')
+        if irx and irx > 0:
+            rate = irx / 100.0
+            _rfr_cache['rate'] = rate
+            _rfr_cache['date'] = today
+            print(f"  [rfr] 13-week T-bill rate: {irx:.2f}% ({rate:.4f})")
+            return rate
+    except Exception as e:
+        print(f"  [rfr] Failed to fetch ^IRX, using default: {e}")
+    return RISK_FREE_RATE_DEFAULT
 
 
 # ── BLACK-SCHOLES ───────────────────────────────────────────────────────────
@@ -200,6 +220,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     btc_spot = spot / btc_per_share if is_btc else None
 
+    rfr = get_risk_free_rate()
+
     all_exps = list(ticker.options)
     now = datetime.now(timezone.utc)
     cutoff = now + timedelta(days=max_dte)
@@ -232,10 +254,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
                 if pd.isna(iv) or iv <= 0:
                     continue
 
-                gamma = bs_gamma(spot, strike, T, RISK_FREE_RATE, iv)
-                delta = bs_delta(spot, strike, T, RISK_FREE_RATE, iv, opt_type)
-                vanna = bs_vanna(spot, strike, T, RISK_FREE_RATE, iv)
-                charm = bs_charm(spot, strike, T, RISK_FREE_RATE, iv, opt_type)
+                gamma = bs_gamma(spot, strike, T, rfr, iv)
+                delta = bs_delta(spot, strike, T, rfr, iv, opt_type)
+                vanna = bs_vanna(spot, strike, T, rfr, iv)
+                charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
                 dealer_delta = -delta * oi * 100
                 # Dealer vanna exposure: how dealer delta changes with IV
@@ -880,7 +902,7 @@ def index():
 @app.route('/api/data')
 def api_data():
     try:
-        dte = request.args.get('dte', app.config.get('MAX_DTE', 7), type=int)
+        dte = request.args.get('dte', 7, type=int)
         dte = max(1, min(dte, 90))
         try:
             data = fetch_with_cache('IBIT', dte)
@@ -1130,11 +1152,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', '-p', type=int, default=5000)
     parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--dte', '-d', type=int, default=7, help='Max days to expiration (default: 7)')
     args = parser.parse_args()
     init_db()
-    app.config['MAX_DTE'] = args.dte
-    print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}  (DTE: {args.dte})\n")
+    print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}\n")
     # Start background refresh (skip reloader parent to avoid double threads)
     if os.environ.get('WERKZEUG_RUN_MAIN') or not app.debug:
         start_bg_refresh()
