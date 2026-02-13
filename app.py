@@ -181,6 +181,12 @@ def init_db():
         c.execute('DROP TABLE btc_candles')
         c.execute('ALTER TABLE btc_candles_new RENAME TO btc_candles')
     c.execute('CREATE INDEX IF NOT EXISTS idx_candles_sym_tf_time ON btc_candles(symbol, tf, time)')
+    c.execute('''CREATE TABLE IF NOT EXISTS etf_flows (
+        date TEXT NOT NULL, ticker TEXT NOT NULL,
+        shares_outstanding REAL, aum REAL, nav REAL,
+        daily_flow_shares REAL, daily_flow_dollars REAL,
+        UNIQUE(date, ticker)
+    )''')
     conn.commit()
     conn.close()
 
@@ -230,6 +236,135 @@ def get_history(conn, ticker, days=10):
                         max_pain, regime, net_gex, total_call_oi, total_put_oi
                  FROM snapshots WHERE ticker=? ORDER BY date DESC LIMIT ?''', (ticker, days))
     return c.fetchall()
+
+
+def fetch_etf_flows(ticker_symbol):
+    """Calculate daily ETF fund flows from shares outstanding changes."""
+    try:
+        info = yf.Ticker(ticker_symbol).info
+        shares = info.get('sharesOutstanding')
+        aum = info.get('totalAssets')
+        nav = info.get('navPrice') or info.get('regularMarketPrice')
+        # Derive shares from AUM/NAV if sharesOutstanding not available
+        if not shares and aum and nav:
+            shares = aum / nav
+        if not shares or not nav:
+            return None
+
+        conn = get_db()
+        try:
+            c = conn.cursor()
+            today = datetime.now().strftime('%Y-%m-%d')
+
+            # Get previous day's data
+            c.execute('SELECT date, shares_outstanding, aum, nav FROM etf_flows WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
+                      (ticker_symbol, today))
+            prev = c.fetchone()
+
+            # Calculate daily flow
+            daily_flow_shares = 0.0
+            daily_flow_dollars = 0.0
+            if prev and prev[1]:
+                daily_flow_shares = shares - prev[1]
+                daily_flow_dollars = daily_flow_shares * nav
+
+            # Store today's snapshot
+            c.execute('INSERT OR REPLACE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
+                      (today, ticker_symbol, shares, aum, nav, daily_flow_shares, daily_flow_dollars))
+            conn.commit()
+
+            # Compute 5-day flow streak and momentum
+            c.execute('SELECT daily_flow_shares, daily_flow_dollars FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 5',
+                      (ticker_symbol,))
+            history = c.fetchall()
+        finally:
+            conn.close()
+
+        streak = 0
+        if history:
+            direction = 1 if history[0][0] >= 0 else -1
+            for h in history:
+                if (h[0] >= 0) == (direction > 0):
+                    streak += 1
+                else:
+                    break
+            streak *= direction
+
+        avg_flow_5d = sum(h[1] for h in history) / len(history) if history else 0
+
+        # Categorize strength by dollar amount
+        abs_flow = abs(daily_flow_dollars)
+        if abs_flow < 10_000_000:
+            strength = 'negligible'
+        elif abs_flow < 50_000_000:
+            strength = 'minor'
+        elif abs_flow < 200_000_000:
+            strength = 'moderate'
+        else:
+            strength = 'strong'
+
+        return {
+            'daily_flow_shares': float(daily_flow_shares),
+            'daily_flow_dollars': float(daily_flow_dollars),
+            'direction': 'inflow' if daily_flow_shares >= 0 else 'outflow',
+            'strength': strength,
+            'streak': int(streak),          # positive = N consecutive inflow days, negative = outflow
+            'avg_flow_5d': float(avg_flow_5d),
+            'shares_outstanding': float(shares),
+        }
+    except Exception as e:
+        print(f"  [etf-flows] Failed for {ticker_symbol}: {e}")
+        return None
+
+
+def backfill_etf_flows(ticker_symbol, days=90):
+    """Backfill ETF flow history from Yahoo Finance historical data."""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM etf_flows WHERE ticker=?', (ticker_symbol,))
+        existing = c.fetchone()[0]
+        conn.close()
+        if existing >= 5:
+            return  # already have history
+
+        tk = yf.Ticker(ticker_symbol)
+        hist = tk.history(period=f'{days}d')
+        if hist.empty:
+            return
+
+        # Get current NAV/shares for reference
+        info = tk.info
+        current_nav = info.get('navPrice') or info.get('regularMarketPrice')
+        if not current_nav:
+            return
+
+        # Use Close price as NAV proxy for historical days
+        conn = get_db()
+        c = conn.cursor()
+        prev_shares = None
+        for date_idx, row in hist.iterrows():
+            date_str = date_idx.strftime('%Y-%m-%d')
+            nav = float(row['Close'])
+            # Yahoo doesn't give historical shares outstanding directly,
+            # but we can estimate flows from price and volume as a proxy.
+            # For ETFs, large volume days with price increase = inflow, decrease = outflow.
+            # Better approach: use Volume * price as a rough flow proxy
+            volume = float(row.get('Volume', 0))
+            # Estimate: net flow ≈ volume * price * sign(close - open)
+            open_p = float(row['Open'])
+            close_p = float(row['Close'])
+            direction = 1 if close_p >= open_p else -1
+            # Scale down — not all volume is creation/redemption, ~10-20% typically is
+            estimated_flow = direction * volume * nav * 0.15
+
+            c.execute('INSERT OR IGNORE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
+                      (date_str, ticker_symbol, None, None, nav, 0, estimated_flow))
+        conn.commit()
+        conn.close()
+        print(f"  [etf-flows] Backfilled {len(hist)} days for {ticker_symbol}")
+    except Exception as e:
+        print(f"  [etf-flows] Backfill failed for {ticker_symbol}: {e}")
 
 
 # ── CANDLES ─────────────────────────────────────────────────────────────────
@@ -356,6 +491,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     conn = get_db()
     prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
     conn.close()
+
+    etf_flows = fetch_etf_flows(ticker_symbol) if is_crypto else None
 
     # Collect options data
     strike_data = {}
@@ -534,6 +671,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             pos_conf -= 10
             pos_warnings.append(f'Single strike holds {max_call_oi_strike/total_call_oi*100:.0f}% of call OI — concentrated speculative bet')
 
+    # ETF fund flow context
+    if etf_flows and etf_flows['streak'] <= -3 and etf_flows['strength'] in ('moderate', 'strong'):
+        pos_conf -= 15
+        pos_warnings.append(f"ETF outflow streak ({etf_flows['streak']}d, avg ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M/d) — institutional exit weakens support")
+
     levels['positioning_confidence'] = max(0, min(100, pos_conf))
     levels['positioning_warnings'] = pos_warnings
 
@@ -566,10 +708,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         pass
 
     # Breakout signals (prev_strikes already available from early fetch)
-    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share)
+    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share, etf_flows)
 
     # Significant levels with regime behavior
-    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share)
+    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows)
 
     # Dealer flow forecast (vanna + charm)
     flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
@@ -637,6 +779,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         'gex_chart': gex_chart_data,
         'significant_levels': sig_levels,
         'breakout': breakout,
+        'etf_flows': etf_flows,
         'oi_changes': oi_changes,
         'flow_forecast': flow_forecast,
         'history': history_data,
@@ -771,7 +914,7 @@ def _level_greeks_note(ltype, regime, row, is_major):
     return ' | '.join(notes) if notes else None
 
 
-def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share):
+def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows=None):
     """Build list of significant levels with regime-adjusted behavior and OI deltas."""
     oi_90 = df['total_oi'].quantile(0.90)
     oi_75 = df['total_oi'].quantile(0.75)
@@ -815,6 +958,17 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
             else:
                 behavior = "OI magnet — gravitational pull near expiry"
 
+        # Flow modifier
+        if etf_flows and etf_flows['strength'] in ('moderate', 'strong'):
+            if ltype == 'put_wall' and etf_flows['direction'] == 'inflow':
+                behavior += " + inflows reinforce"
+            elif ltype == 'put_wall' and etf_flows['direction'] == 'outflow':
+                behavior += " — outflows weaken"
+            elif ltype == 'call_wall' and etf_flows['direction'] == 'outflow':
+                behavior += " + outflows reinforce"
+            elif ltype == 'call_wall' and etf_flows['direction'] == 'inflow':
+                behavior += " — inflows pressure"
+
         # OI delta
         oi_delta = None
         if prev_strikes and strike in prev_strikes:
@@ -845,7 +999,7 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
     return result
 
 
-def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share):
+def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share, etf_flows=None):
     """Compute breakout signals for both directions."""
     cw = levels['call_wall']
     pw = levels['put_wall']
@@ -916,6 +1070,17 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         down_signals.append(f"P/C ratio {pcr:.2f} — heavy put skew")
     elif pcr < 0.6:
         up_signals.append(f"P/C ratio {pcr:.2f} — aggressive call skew")
+
+    # ETF fund flow signals
+    if etf_flows:
+        if etf_flows['streak'] >= 3 and etf_flows['strength'] in ('moderate', 'strong'):
+            up_signals.append(f"ETF inflow streak ({etf_flows['streak']}d) — institutional accumulation")
+        elif etf_flows['streak'] <= -3 and etf_flows['strength'] in ('moderate', 'strong'):
+            down_signals.append(f"ETF outflow streak ({abs(etf_flows['streak'])}d) — institutional distribution")
+        if etf_flows['avg_flow_5d'] > 100_000_000:
+            up_signals.append(f"5d avg inflow ${etf_flows['avg_flow_5d']/1e6:.0f}M — sustained buying pressure")
+        elif etf_flows['avg_flow_5d'] < -100_000_000:
+            down_signals.append(f"5d avg outflow ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M — sustained selling pressure")
 
     # Targets
     up_targets = df[(df['strike'] > cw) & (df['net_gex'] > 0)].nlargest(2, 'net_gex')[
@@ -1034,6 +1199,13 @@ REFRESH_DTES = [3, 7, 14, 30, 45]
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
     pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
+    # Phase 0: Backfill ETF flow history
+    for tk in TICKER_CONFIG:
+        try:
+            backfill_etf_flows(tk, days=90)
+        except Exception as e:
+            print(f"  [bg-refresh] ETF flow backfill {tk} error: {e}")
+
     # Phase 1: Backfill candles for all tickers
     for tk, cfg in TICKER_CONFIG.items():
         symbol = cfg['binance_symbol']
@@ -1061,6 +1233,13 @@ def _bg_refresh():
                     except Exception as e:
                         print(f"  [bg-refresh] Candle update {symbol}/{tf} error: {e}")
             last_candle_update = now
+
+        # ETF flow snapshots for all tickers
+        for tk in TICKER_CONFIG:
+            try:
+                fetch_etf_flows(tk)
+            except Exception as e:
+                print(f"  [bg-refresh] ETF flow {tk} error: {e}")
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
@@ -1138,6 +1317,19 @@ def api_candles():
         return Response(json.dumps({'error': 'Backfill in progress'}), mimetype='application/json'), 503
     candles = get_btc_candles(symbol, tf)
     return Response(json.dumps(candles), mimetype='application/json')
+
+
+@app.route('/api/flows')
+def api_flows():
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT date, daily_flow_dollars, shares_outstanding, aum, nav FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 30', (ticker,))
+    rows = c.fetchall()
+    conn.close()
+    rows.reverse()
+    data = [{'date': r[0], 'flow': r[1], 'shares': r[2], 'aum': r[3], 'nav': r[4]} for r in rows]
+    return Response(json.dumps(data), mimetype='application/json')
 
 
 @app.route('/api/data')
@@ -1221,6 +1413,13 @@ def run_analysis(ticker='IBIT'):
     dtes = [3, 7, 14, 30, 45]
     results = {}
 
+    # Fetch live ref asset price so the AI sees current price, not stale cache
+    live_ref_price = None
+    try:
+        live_ref_price = yf.Ticker(cfg['ref_ticker']).info.get('regularMarketPrice')
+    except Exception:
+        pass
+
     def fetch_dte(dte):
         return dte, fetch_with_cache(ticker, dte)
 
@@ -1236,8 +1435,9 @@ def run_analysis(ticker='IBIT'):
         d = results[dte]
         bps = d['btc_per_share']
         lvl = d['levels']
+        current_btc = live_ref_price if live_ref_price else d['btc_spot']
         summaries[f"{dte}d"] = {
-            'spot_btc': round(d['btc_spot']),
+            'spot_btc': round(current_btc),
             'spot_ibit': d['spot'],
             'btc_per_share': bps,
             'levels_btc': {
@@ -1274,6 +1474,13 @@ def run_analysis(ticker='IBIT'):
                 'regime_note': d['flow_forecast']['regime_note'],
             },
             'oi_changes': d['oi_changes'],
+            'etf_flows': {
+                'daily_flow_millions': round(d['etf_flows']['daily_flow_dollars'] / 1e6, 1),
+                'direction': d['etf_flows']['direction'],
+                'strength': d['etf_flows']['strength'],
+                'streak': d['etf_flows']['streak'],
+                'avg_5d_millions': round(d['etf_flows']['avg_flow_5d'] / 1e6, 1),
+            } if d.get('etf_flows') else None,
             'significant_levels': [
                 {k: v for k, v in sl.items() if k != 'greeks_note'}
                 for sl in d['significant_levels'][:8]
@@ -1320,6 +1527,8 @@ This context is critical — a static snapshot is less useful than understanding
 Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new since yesterday. It surfaces where FRESH dealer exposure is concentrated vs stale "zombie gamma" from old positions. Active call/put walls show where the freshest positioning is strongest.
 
 Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
+
+ETF fund flows (etf_flows) show daily creation/redemption activity. Positive = institutional inflows, negative = outflows. A streak of 3+ days in one direction is significant. Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)
@@ -1372,11 +1581,12 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
     except json.JSONDecodeError as e:
         raise RuntimeError(f'Failed to parse LLM response: {e}. Raw: {raw[:500]}')
     # Store BTC price at analysis time for staleness checks
-    btc_price = None
-    for dte in dtes:
-        if dte in results and results[dte].get('btc_spot'):
-            btc_price = results[dte]['btc_spot']
-            break
+    btc_price = live_ref_price
+    if not btc_price:
+        for dte in dtes:
+            if dte in results and results[dte].get('btc_spot'):
+                btc_price = results[dte]['btc_spot']
+                break
     set_cached_analysis(ticker, analysis, btc_price)
     return analysis
 
