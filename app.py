@@ -56,16 +56,23 @@ DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
 
 
 # ── BLACK-SCHOLES ───────────────────────────────────────────────────────────
+def _bs_d1d2(S, K, T, r, sigma):
+    """Shared d1/d2 computation for all Black-Scholes Greeks."""
+    sqrt_T = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / sqrt_T
+    d2 = d1 - sqrt_T
+    return d1, d2
+
 def bs_gamma(S, K, T, r, sigma):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma)
     return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
 def bs_delta(S, K, T, r, sigma, option_type='call'):
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d1, _ = _bs_d1d2(S, K, T, r, sigma)
     if option_type == 'call':
         return norm.cdf(d1)
     else:
@@ -75,16 +82,14 @@ def bs_vanna(S, K, T, r, sigma):
     """Vanna = dDelta/dVol — dealer rebalancing when IV moves."""
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma)
     return -norm.pdf(d1) * d2 / sigma
 
 def bs_charm(S, K, T, r, sigma, option_type='call'):
     """Charm = dDelta/dT — dealer rebalancing from time decay of delta."""
     if T <= 0 or sigma <= 0 or S <= 0:
         return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    d1, d2 = _bs_d1d2(S, K, T, r, sigma)
     charm = -norm.pdf(d1) * (2 * r * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
     if option_type == 'put':
         charm += r * np.exp(-r * T) * norm.cdf(-d2)
