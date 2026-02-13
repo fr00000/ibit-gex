@@ -1,8 +1,10 @@
 # IBIT GEX Trading Dashboard
 
-A web dashboard that pulls IBIT (iShares Bitcoin Trust ETF) options chain data from Yahoo Finance, calculates Gamma Exposure (GEX) using Black-Scholes, and displays actionable trading levels for **BTC perpetual futures trading with leverage**.
+A web dashboard that pulls crypto ETF (IBIT/ETHA) options chain data from Yahoo Finance, calculates Gamma Exposure (GEX) using Black-Scholes, and displays actionable trading levels for **BTC/ETH perpetual futures trading with leverage**.
 
-The core thesis: IBIT options flow creates dealer hedging dynamics that produce support/resistance levels in BTC. When the gamma regime is positive, BTC is range-bound and you can fade the extremes on perps. When negative, ranges break and you should trade momentum or sit out.
+The core thesis: ETF options flow creates dealer hedging dynamics that produce support/resistance levels in the underlying crypto asset. When the gamma regime is positive, price is range-bound and you can fade the extremes on perps. When negative, ranges break and you should trade momentum or sit out.
+
+Supports **IBIT** (Bitcoin ETF) and **ETHA** (Ethereum ETF) with ticker switching in the header.
 
 ## Options Primer
 
@@ -25,7 +27,7 @@ The Black-Scholes model produces several sensitivity measures called "Greeks":
 
 ### Why This Matters for BTC
 
-IBIT is a Bitcoin ETF with a large, liquid options market. When dealers hedge IBIT options, they're effectively creating supply/demand at specific BTC price levels. A strike with massive call open interest at $60 IBIT translates to a resistance zone in BTC at the equivalent price. The hedging flows are mechanical — dealers don't have a view, they just follow their risk models. This makes the levels predictable and tradeable.
+IBIT and ETHA are crypto ETFs with liquid options markets. When dealers hedge these options, they're effectively creating supply/demand at specific BTC/ETH price levels. A strike with massive call open interest at $60 IBIT translates to a resistance zone in BTC at the equivalent price. The hedging flows are mechanical — dealers don't have a view, they just follow their risk models. This makes the levels predictable and tradeable.
 
 ## Quick Start
 
@@ -67,16 +69,19 @@ DTE (days to expiration) is selectable from the web UI dropdown (3d, 7d, 14d, 30
 ## Dashboard
 
 ### Header
-BTC price, IBIT price, gamma regime badge, timestamp, DTE selector, candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
+Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE selector, candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
 
-### BTC Candlestick Chart
-BTC candles (via Binance) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, and support/resistance levels. Timeframe is selectable from the header.
+### Candlestick Chart
+Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, and support/resistance levels. Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
 
 ### GEX Profile
-Bar chart of net gamma exposure at each strike. Green = positive gamma (dealers dampen moves), red = negative gamma (dealers amplify moves).
+Stacked bar chart showing Active GEX (new OI since yesterday, solid) and Stale GEX (existing positions, faded) at each strike. Green = positive gamma, red = negative gamma. Active GEX highlights where fresh dealer exposure is concentrated vs legacy "zombie gamma."
 
 ### Open Interest Profile
 Call vs put open interest at each strike, showing where hedging activity is concentrated.
+
+### ETF Flows
+Bar chart of daily ETF fund flows over the last 30 days. Green bars = inflow days (creation/accumulation), red bars = outflow days (redemption/distribution). Backfilled from Yahoo Finance historical data on first run, then updated daily from shares outstanding changes.
 
 ### Sidebar
 
@@ -86,20 +91,22 @@ Call vs put open interest at each strike, showing where hedging activity is conc
 - **Range Visual** — In positive gamma: tradeable range between put wall and call wall with spot indicator
 - **Key Levels** — Call Wall, Put Wall, Gamma Flip, Max Pain with BTC prices and distance from spot
 - **Significant Levels** — High-OI strikes with regime-adjusted behavior, OI changes (BUILDING/DECAYING), and vanna/charm notes
-- **Breakout Assessment** — Upside/downside signal scoring with targets
+- **Breakout Assessment** — Upside/downside signal scoring with targets, includes ETF flow streak signals
 - **Dealer Flows** — Overnight charm forecast, vanna vol scenarios, and combined overnight dealer rebalancing estimate
 - **OI Changes** — Call/put open interest shifts vs prior snapshot
-- **Dealer Position** — Net GEX, dealer delta, net vanna, net charm, put/call ratio
+- **ETF Fund Flows** — Daily flow amount, direction, strength, and 5-day momentum with streak dots
+- **Dealer Position** — Net GEX, Active GEX, dealer delta, net vanna, net charm, put/call ratio
 - **History** — Daily snapshots of regime and levels
 
 ## How It Works
 
 ### Data Pipeline
-1. Fetches IBIT spot price and BTC-USD price from Yahoo Finance
-2. Auto-calculates BTC/Share ratio (IBIT price / BTC price)
+1. Fetches ETF spot price and reference crypto price (BTC-USD or ETH-USD) from Yahoo Finance
+2. Auto-calculates crypto/share ratio (ETF price / crypto price)
 3. Pulls options chains across expirations within the DTE window
 4. Calculates Black-Scholes gamma, delta, vanna, and charm using per-strike implied volatility
 5. Aggregates to build a GEX profile, derive levels, and compute dealer flow forecasts
+6. Fetches ETF fund flows from shares outstanding changes (daily creation/redemption activity)
 
 ### Data Caching
 Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed.
@@ -113,6 +120,19 @@ GEX = Gamma x OI x 100 x Spot^2 x 0.01
 - **Call GEX** = positive (dealers short calls -> buy dips / sell rips)
 - **Put GEX** = negative (dealers short puts -> sell dips / buy rips)
 - **Net GEX** at each strike = Call GEX + Put GEX
+
+### Active GEX
+Active GEX weights net GEX by the fraction of OI that is new since yesterday (delta_OI / total_OI). This surfaces where fresh dealer exposure is concentrated vs stale positions from days ago. Active walls show the strikes with the most new positioning.
+
+### Positioning Confidence
+A 0-100% score indicating how much to trust the standard GEX sign convention (dealers long calls, short puts). Penalized by:
+- Low P/C ratio (heavy speculative call buying)
+- High OTM call concentration
+- Elevated call volume/OI turnover
+- Concentrated single-strike bets
+- Sustained ETF outflow streaks
+
+When below ~60%, call walls may act as squeeze triggers rather than resistance.
 
 ### Key Levels
 - **Call Wall**: Strike with highest call GEX (resistance)
@@ -158,6 +178,8 @@ When IV changes, dealer delta shifts. The dashboard models two scenarios:
 | Negative gamma + proximity | Near call wall = squeeze | Near put wall = waterfall |
 | OI beyond walls | >40% call OI above call wall | >40% put OI below put wall |
 | P/C ratio extremes | P/C > 1.5 = squeeze fuel | P/C < 0.6 = call skew unwind |
+| ETF flow streak | 3+ day inflow streak | 3+ day outflow streak |
+| ETF flow momentum | 5d avg inflow > $100M | 5d avg outflow > $100M |
 
 ### DTE Selection
 Lower DTE (7) focuses on near-term expirations where gamma is strongest (gamma scales as 1/sqrt(T)). Higher DTE (14-45) includes longer-dated positioning which is structurally relevant but has less gamma impact. Default is 7 for short-term trading. DTE is selectable from the web UI dropdown.
@@ -174,27 +196,34 @@ The database also stores full data caches (per DTE) and AI analysis results, bot
 ## API
 
 ### `GET /api/data`
-Returns JSON with spot prices, levels, GEX/OI chart data, significant levels, breakout assessment, dealer flow forecast, OI changes, and history. Served from cache when available.
+Returns JSON with spot prices, levels, GEX/OI chart data, significant levels, breakout assessment, dealer flow forecast, ETF flows, OI changes, and history. Served from cache when available.
 
-Accepts `?dte=N` query parameter (1-90) to override the DTE window.
+Accepts `?ticker=IBIT` (or `ETHA`) and `?dte=N` (1-90) query parameters.
+
+### `GET /api/candles`
+Returns candlestick data from SQLite (90-day backfill from Binance). Accepts `?ticker=IBIT` and `?tf=15m` (15m/1h/4h/1d).
+
+### `GET /api/flows`
+Returns last 30 days of ETF fund flow data (date, flow in dollars, shares outstanding, AUM, NAV). Accepts `?ticker=IBIT`.
 
 ### `GET /api/analysis`
-Returns the cached AI analysis for today, or `{"status": "pending"}` if not yet generated.
+Returns the cached AI analysis for today, or `{"status": "pending"}` if not yet generated. Accepts `?ticker=IBIT`.
 
 ### `POST /api/analyze`
-Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON directly. Requires `ANTHROPIC_API_KEY`.
+Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON directly. Requires `ANTHROPIC_API_KEY`. Accepts `?ticker=IBIT`.
 
 ## Config Constants
 
 | Constant | Default | Purpose |
 |---|---|---|
 | `RISK_FREE_RATE` | 13-week T-bill (^IRX) | Fetched daily from Yahoo Finance, falls back to 4.3% |
-| `BTC_PER_SHARE` | 0.000568 | Fallback — auto-calculated from live prices |
+| `BTC_PER_SHARE` | 0.000568 (IBIT), 0.0091 (ETHA) | Fallback — auto-calculated from live prices |
 | `STRIKE_RANGE_PCT` | 0.35 | Filter strikes to +/-35% of spot |
 
 ## Known Limitations
 - Yahoo Finance OI updates once daily (after market close), not intraday
-- Assumes dealers are net short all options (standard but not always true)
-- BTC/Share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
+- Assumes dealers are net short all options (standard but not always true — see positioning confidence)
+- Crypto/share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
 - Vanna/charm magnitudes are estimates — actual dealer positioning depends on their book, which isn't public
+- ETF flow backfill uses a volume-based heuristic (~15% of daily volume as creation/redemption proxy); real flow calculations begin after 2+ days of actual shares outstanding data
 - AI analysis requires an Anthropic API key and uses Claude Opus (~$0.15/day)
