@@ -193,6 +193,14 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <option value="45">45d</option>
     </select>
     <span id="hdr-exp" style="color:var(--t3);font-size:9px"></span>
+    <div class="hdr-sep"></div>
+    <label style="color:var(--t3);font-size:10px;">TF</label>
+    <select id="tf-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
+      <option value="15m">15m</option>
+      <option value="1h" selected>1h</option>
+      <option value="4h">4h</option>
+      <option value="1d">1d</option>
+    </select>
     <button class="hdr-btn" onclick="loadData()">REFRESH</button>
   </div>
 </div>
@@ -240,7 +248,10 @@ function initTV(){
 }
 
 async function loadBTC(){
-  const urls=['https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=720','https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=720'];
+  const tf=document.getElementById('tf-select').value;
+  const limits={'15m':960,'1h':720,'4h':360,'1d':365};
+  const lim=limits[tf]||720;
+  const urls=[`https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`,`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`];
   for(const url of urls){
     try{
       const r=await fetch(url);
