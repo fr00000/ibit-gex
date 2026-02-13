@@ -359,6 +359,19 @@ function startBtcWs(tf){
 
 async function loadBTC(){
   const tf=document.getElementById('tf-select').value;
+  // Try backend API first (90-day history from SQLite)
+  try{
+    const r=await fetch(`/api/btc-candles?tf=${tf}`);
+    if(r.ok){
+      const d=await r.json();
+      if(Array.isArray(d)&&d.length>0){
+        tvSeries.setData(d);
+        startBtcWs(tf);
+        return d;
+      }
+    }
+  }catch(e){console.warn('Backend BTC candles unavailable, falling back to Binance:',e)}
+  // Fallback: direct Binance fetch (~10 days for 15m)
   const limits={'15m':960,'1h':720,'4h':360,'1d':365};
   const lim=limits[tf]||720;
   const urls=[`https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`,`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`];

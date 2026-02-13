@@ -18,6 +18,7 @@ import argparse
 import sqlite3
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -147,6 +148,14 @@ def init_db():
         analysis_json TEXT NOT NULL,
         UNIQUE(date, ticker)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS btc_candles (
+        tf TEXT NOT NULL,
+        time INTEGER NOT NULL,
+        open REAL NOT NULL, high REAL NOT NULL,
+        low REAL NOT NULL, close REAL NOT NULL,
+        UNIQUE(tf, time)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_btc_candles_tf_time ON btc_candles(tf, time)')
     conn.commit()
     conn.close()
 
@@ -196,6 +205,94 @@ def get_history(conn, ticker, days=10):
                         max_pain, regime, net_gex, total_call_oi, total_put_oi
                  FROM snapshots WHERE ticker=? ORDER BY date DESC LIMIT ?''', (ticker, days))
     return c.fetchall()
+
+
+# ── BTC CANDLES ─────────────────────────────────────────────────────────────
+_btc_backfill_done = threading.Event()
+
+TF_DURATIONS_MS = {
+    '15m': 15 * 60 * 1000,
+    '1h': 60 * 60 * 1000,
+    '4h': 4 * 60 * 60 * 1000,
+    '1d': 24 * 60 * 60 * 1000,
+}
+
+
+def _fetch_binance_klines(tf, start_ms, end_ms, limit=1000):
+    """Fetch klines from Binance REST API with .com/.us fallback."""
+    urls = [
+        f'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+        f'https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+    ]
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'ibit-gex/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            print(f"  [btc] Binance fetch failed ({url[:50]}...): {e}")
+    return []
+
+
+def backfill_btc_candles(tf, days=90):
+    """Paginated backfill of BTC candles for a given timeframe."""
+    tf_ms = TF_DURATIONS_MS.get(tf)
+    if not tf_ms:
+        return
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - days * 24 * 60 * 60 * 1000
+    conn = get_db()
+    c = conn.cursor()
+    cursor = start_ms
+    total = 0
+    while cursor < now_ms:
+        klines = _fetch_binance_klines(tf, cursor, now_ms, limit=1000)
+        if not klines:
+            break
+        rows = [(tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
+                for k in klines]
+        c.executemany('INSERT OR REPLACE INTO btc_candles (tf, time, open, high, low, close) VALUES (?,?,?,?,?,?)', rows)
+        conn.commit()
+        total += len(rows)
+        last_open_ms = int(klines[-1][0])
+        cursor = last_open_ms + tf_ms
+        if len(klines) < 1000:
+            break
+        time.sleep(0.2)
+    conn.close()
+    print(f"  [btc] Backfilled {total} candles for {tf}")
+
+
+def get_btc_candles(tf):
+    """Return all stored candles for a timeframe as TradingView-format dicts."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT time, open, high, low, close FROM btc_candles WHERE tf=? ORDER BY time ASC', (tf,))
+    rows = c.fetchall()
+    conn.close()
+    return [{'time': r[0], 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4]} for r in rows]
+
+
+def update_btc_candles(tf):
+    """Fetch candles since the latest stored one and upsert."""
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT MAX(time) FROM btc_candles WHERE tf=?', (tf,))
+    row = c.fetchone()
+    if row and row[0]:
+        start_ms = row[0] * 1000
+    else:
+        start_ms = int(time.time() * 1000) - 90 * 24 * 60 * 60 * 1000
+    now_ms = int(time.time() * 1000)
+    klines = _fetch_binance_klines(tf, start_ms, now_ms, limit=1000)
+    if klines:
+        rows = [(tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
+                for k in klines]
+        c.executemany('INSERT OR REPLACE INTO btc_candles (tf, time, open, high, low, close) VALUES (?,?,?,?,?,?)', rows)
+        conn.commit()
+    conn.close()
 
 
 # ── DATA ────────────────────────────────────────────────────────────────────
@@ -907,13 +1004,34 @@ def fetch_with_cache(ticker, dte):
 REFRESH_DTES = [3, 7, 14, 30, 45]
 
 def _bg_refresh():
-    """Background thread: pre-fetch all DTEs on startup, then re-check
-    every 30 min until today's fresh data is confirmed for all DTEs.
-    Once all fresh, auto-run AI analysis if not already cached."""
+    """Background thread: backfill BTC candles on startup, pre-fetch all DTEs,
+    then periodically update candles (every 5 min) and re-check GEX data."""
+    # Phase 1: Backfill BTC candles for all timeframes
+    print("  [bg-refresh] Starting BTC candle backfill...")
+    for tf in ('15m', '1h', '4h', '1d'):
+        try:
+            backfill_btc_candles(tf, days=90)
+        except Exception as e:
+            print(f"  [bg-refresh] Backfill {tf} error: {e}")
+    _btc_backfill_done.set()
+    print("  [bg-refresh] BTC candle backfill complete")
+
+    # Phase 2: Main loop — GEX refresh + candle updates
+    last_candle_update = 0
     while True:
+        # Update BTC candles every 5 minutes
+        now = time.time()
+        if now - last_candle_update >= 300:
+            for tf in ('15m', '1h', '4h', '1d'):
+                try:
+                    update_btc_candles(tf)
+                except Exception as e:
+                    print(f"  [bg-refresh] Candle update {tf} error: {e}")
+            last_candle_update = now
+
+        # Existing GEX refresh logic
         today = datetime.now().strftime('%Y-%m-%d')
         all_fresh = True
-        # Check which DTEs still need fetching
         stale_dtes = []
         for dte in REFRESH_DTES:
             cache_date, _ = get_latest_cache('IBIT', dte)
@@ -953,9 +1071,9 @@ def _bg_refresh():
                     print("  [bg-refresh] AI analysis complete and cached")
                 except Exception as e:
                     print(f"  [bg-refresh] AI analysis error: {e}")
-            time.sleep(3600)
-        else:
-            time.sleep(YAHOO_CHECK_INTERVAL)
+
+        # Sleep 5 min (candle update cadence), but also covers GEX re-check
+        time.sleep(300)
 
 
 def start_bg_refresh():
@@ -968,6 +1086,17 @@ def start_bg_refresh():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/api/btc-candles')
+def api_btc_candles():
+    tf = request.args.get('tf', '15m')
+    if tf not in ('15m', '1h', '4h', '1d'):
+        return Response(json.dumps({'error': f'Invalid tf: {tf}'}), mimetype='application/json'), 400
+    if not _btc_backfill_done.is_set():
+        return Response(json.dumps({'error': 'Backfill in progress'}), mimetype='application/json'), 503
+    candles = get_btc_candles(tf)
+    return Response(json.dumps(candles), mimetype='application/json')
 
 
 @app.route('/api/data')
