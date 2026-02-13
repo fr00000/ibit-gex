@@ -114,6 +114,11 @@ def init_db():
         dte INTEGER NOT NULL, data_json TEXT NOT NULL,
         UNIQUE(date, ticker, dte)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS analysis_cache (
+        date TEXT NOT NULL, ticker TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        UNIQUE(date, ticker)
+    )''')
     conn.commit()
     return conn
 
@@ -727,6 +732,20 @@ def get_latest_cache(ticker, dte):
     return None, None
 
 
+def get_prev_cache(ticker, dte):
+    """Return the second most recent cached data (yesterday's), or None."""
+    conn = init_db()
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date<? ORDER BY date DESC LIMIT 1',
+              (ticker, dte, today))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0], json.loads(row[1])
+    return None, None
+
+
 def set_cached_data(ticker, dte, data):
     """Cache the full response JSON keyed to today's date."""
     conn = init_db()
@@ -777,7 +796,8 @@ REFRESH_DTES = [3, 7, 14, 30, 45]
 
 def _bg_refresh():
     """Background thread: pre-fetch all DTEs on startup, then re-check
-    every 30 min until today's fresh data is confirmed for all DTEs."""
+    every 30 min until today's fresh data is confirmed for all DTEs.
+    Once all fresh, auto-run AI analysis if not already cached."""
     while True:
         today = datetime.now().strftime('%Y-%m-%d')
         all_fresh = True
@@ -793,7 +813,14 @@ def _bg_refresh():
                 all_fresh = False
 
         if all_fresh:
-            # All DTEs confirmed for today — sleep 1hr, re-check will be instant
+            # Auto-run AI analysis if not already cached for today
+            if not get_cached_analysis('IBIT'):
+                try:
+                    print("  [bg-refresh] All DTEs fresh — running AI analysis...")
+                    run_analysis('IBIT')
+                    print("  [bg-refresh] AI analysis complete and cached")
+                except Exception as e:
+                    print(f"  [bg-refresh] AI analysis error: {e}")
             time.sleep(3600)
         else:
             time.sleep(YAHOO_CHECK_INTERVAL)
@@ -822,118 +849,211 @@ def api_data():
         return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
 
 
-@app.route('/api/analyze', methods=['POST'])
-def api_analyze():
+# ── AI ANALYSIS ────────────────────────────────────────────────────────────
+def get_cached_analysis(ticker):
+    """Return cached analysis for today if it exists."""
+    conn = init_db()
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute('SELECT analysis_json FROM analysis_cache WHERE date=? AND ticker=?',
+              (today, ticker))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row[0])
+    return None
+
+
+def get_prev_analysis(ticker):
+    """Return the most recent analysis before today, or None."""
+    conn = init_db()
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute('SELECT date, analysis_json FROM analysis_cache WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
+              (ticker, today))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0], json.loads(row[1])
+    return None, None
+
+
+def set_cached_analysis(ticker, analysis):
+    """Cache AI analysis for today."""
+    conn = init_db()
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
+              (today, ticker, json.dumps(analysis)))
+    conn.commit()
+    conn.close()
+
+
+def run_analysis(ticker='IBIT'):
+    """Run AI analysis across all DTEs. Returns analysis dict or raises."""
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
-        return Response(json.dumps({'error': 'ANTHROPIC_API_KEY not set'}),
-                        mimetype='application/json'), 500
+        raise RuntimeError('ANTHROPIC_API_KEY not set')
 
-    try:
-        dtes = [3, 7, 14, 30, 45]
-        results = {}
+    dtes = [3, 7, 14, 30, 45]
+    results = {}
 
-        def fetch_dte(dte):
-            return dte, fetch_with_cache('IBIT', dte)
+    def fetch_dte(dte):
+        return dte, fetch_with_cache(ticker, dte)
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = {pool.submit(fetch_dte, d): d for d in dtes}
-            for fut in as_completed(futures):
-                dte, data = fut.result()
-                results[dte] = data
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(fetch_dte, d): d for d in dtes}
+        for fut in as_completed(futures):
+            dte, data = fut.result()
+            results[dte] = data
 
-        # Build concise summaries (strip chart data to keep prompt small)
-        summaries = {}
-        for dte in dtes:
-            d = results[dte]
-            bps = d['btc_per_share']
-            lvl = d['levels']
-            summaries[f"{dte}d"] = {
-                'spot_btc': round(d['btc_spot']),
-                'spot_ibit': d['spot'],
-                'btc_per_share': bps,
-                'levels_btc': {
-                    'call_wall': round(lvl['call_wall'] / bps),
-                    'put_wall': round(lvl['put_wall'] / bps),
-                    'gamma_flip': round(lvl['gamma_flip'] / bps),
-                    'max_pain': round(lvl['max_pain'] / bps),
-                    'resistance': [round(s / bps) for s in lvl.get('resistance', [])],
-                    'support': [round(s / bps) for s in lvl.get('support', [])],
+    # Build concise summaries (strip chart data to keep prompt small)
+    summaries = {}
+    for dte in dtes:
+        d = results[dte]
+        bps = d['btc_per_share']
+        lvl = d['levels']
+        summaries[f"{dte}d"] = {
+            'spot_btc': round(d['btc_spot']),
+            'spot_ibit': d['spot'],
+            'btc_per_share': bps,
+            'levels_btc': {
+                'call_wall': round(lvl['call_wall'] / bps),
+                'put_wall': round(lvl['put_wall'] / bps),
+                'gamma_flip': round(lvl['gamma_flip'] / bps),
+                'max_pain': round(lvl['max_pain'] / bps),
+                'resistance': [round(s / bps) for s in lvl.get('resistance', [])],
+                'support': [round(s / bps) for s in lvl.get('support', [])],
+            },
+            'levels': lvl,
+            'expected_move': d['expected_move'],
+            'breakout': {
+                'up_signals': d['breakout']['up_signals'],
+                'down_signals': d['breakout']['down_signals'],
+                'up_score': d['breakout']['up_score'],
+                'down_score': d['breakout']['down_score'],
+                'bias': d['breakout']['bias'],
+            },
+            'flow_forecast': {
+                'charm': d['flow_forecast']['charm'],
+                'vanna': {
+                    'net_exposure': d['flow_forecast']['vanna']['net_exposure'],
+                    'strength': d['flow_forecast']['vanna']['strength'],
+                    'crush_scenario': d['flow_forecast']['vanna']['crush_scenario'],
+                    'spike_scenario': d['flow_forecast']['vanna']['spike_scenario'],
                 },
-                'levels': lvl,
-                'expected_move': d['expected_move'],
-                'breakout': {
-                    'up_signals': d['breakout']['up_signals'],
-                    'down_signals': d['breakout']['down_signals'],
-                    'up_score': d['breakout']['up_score'],
-                    'down_score': d['breakout']['down_score'],
-                    'bias': d['breakout']['bias'],
-                },
-                'flow_forecast': {
-                    'charm': d['flow_forecast']['charm'],
-                    'vanna': {
-                        'net_exposure': d['flow_forecast']['vanna']['net_exposure'],
-                        'strength': d['flow_forecast']['vanna']['strength'],
-                        'crush_scenario': d['flow_forecast']['vanna']['crush_scenario'],
-                        'spike_scenario': d['flow_forecast']['vanna']['spike_scenario'],
-                    },
-                    'overnight': d['flow_forecast']['overnight'],
-                    'regime_note': d['flow_forecast']['regime_note'],
-                },
-                'oi_changes': d['oi_changes'],
-                'significant_levels': [
-                    {k: v for k, v in sl.items() if k != 'greeks_note'}
-                    for sl in d['significant_levels'][:8]
-                ],
+                'overnight': d['flow_forecast']['overnight'],
+                'regime_note': d['flow_forecast']['regime_note'],
+            },
+            'oi_changes': d['oi_changes'],
+            'significant_levels': [
+                {k: v for k, v in sl.items() if k != 'greeks_note'}
+                for sl in d['significant_levels'][:8]
+            ],
+        }
+
+        # Add day-over-day level changes if previous data exists
+        prev_date, prev_data = get_prev_cache(ticker, dte)
+        if prev_data:
+            prev_lvl = prev_data['levels']
+            prev_bps = prev_data.get('btc_per_share', bps)
+            summaries[f"{dte}d"]['changes_vs_prev'] = {
+                'prev_date': prev_date,
+                'spot_btc_prev': round(prev_data.get('btc_spot', 0)),
+                'spot_btc_change': round(d['btc_spot'] - prev_data.get('btc_spot', d['btc_spot'])),
+                'regime_prev': prev_lvl.get('regime', 'unknown'),
+                'regime_changed': prev_lvl.get('regime') != lvl.get('regime'),
+                'call_wall_btc_prev': round(prev_lvl['call_wall'] / prev_bps),
+                'call_wall_btc_change': round(lvl['call_wall'] / bps - prev_lvl['call_wall'] / prev_bps),
+                'put_wall_btc_prev': round(prev_lvl['put_wall'] / prev_bps),
+                'put_wall_btc_change': round(lvl['put_wall'] / bps - prev_lvl['put_wall'] / prev_bps),
+                'gamma_flip_btc_prev': round(prev_lvl['gamma_flip'] / prev_bps),
+                'gamma_flip_btc_change': round(lvl['gamma_flip'] / bps - prev_lvl['gamma_flip'] / prev_bps),
+                'net_gex_prev': prev_lvl.get('net_gex_total', 0),
+                'net_gex_change': lvl.get('net_gex_total', 0) - prev_lvl.get('net_gex_total', 0),
+                'pcr_prev': prev_lvl.get('pcr', 0),
+                'pcr_change': round(lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
             }
 
-        prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
+    prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
-        system_prompt = """You are a GEX (Gamma Exposure) trading analyst for IBIT (Bitcoin ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
+    system_prompt = """You are a GEX (Gamma Exposure) trading analyst for IBIT (Bitcoin ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
 
 IMPORTANT: IBIT is a Bitcoin ETF proxy. The data contains both IBIT share prices and BTC-equivalent prices (in levels_btc). ALWAYS use BTC prices in your analysis (e.g. "$65,200" not "$37.0"). Use the levels_btc fields for all price references. You can convert any IBIT price to BTC by dividing by btc_per_share.
 
+If a "changes_vs_prev" field is present for a timeframe, it contains day-over-day changes — use this to highlight what shifted overnight:
+- Level migrations (walls, gamma flip moving up/down)
+- Regime flips (positive ↔ negative gamma)
+- GEX and P/C ratio shifts
+- Spot movement relative to level changes
+This context is critical — a static snapshot is less useful than understanding the direction of positioning changes.
+
 For each timeframe, provide:
+- What changed overnight and why it matters (if changes_vs_prev available)
 - Regime summary and implication (1-2 sentences)
 - Key levels in BTC price and their significance relative to spot
 - Dealer flow direction (charm/vanna implications)
 - Risk assessment
 - Actionable setup (if any clear one exists)
 
-For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup.
+If a previous analysis is provided, use it to:
+- Note whether your prior calls played out or not (e.g. "yesterday's $65K support held as expected" or "prior upside bias was invalidated")
+- Update your thesis based on how positioning evolved
+- Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
-Keep each analysis to 3-5 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes.
+
+Keep each analysis to 4-6 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
 IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
 
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": f"Analyze the following IBIT GEX data across all timeframes:\n\n{prompt_data}"
-            }],
-        )
+    # Build user message with optional previous analysis
+    prev_analysis_date, prev_analysis = get_prev_analysis(ticker)
+    user_content = f"Analyze the following IBIT GEX data across all timeframes:\n\n{prompt_data}"
+    if prev_analysis:
+        prev_json = json.dumps(prev_analysis, indent=1)
+        user_content += f"\n\n--- PREVIOUS ANALYSIS ({prev_analysis_date}) ---\n{prev_json}"
 
-        if msg.stop_reason == 'max_tokens':
-            return Response(json.dumps({'error': 'LLM response truncated — analysis too long'}),
-                            mimetype='application/json'), 500
+    client = anthropic.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=5120,
+        system=system_prompt,
+        messages=[{
+            "role": "user",
+            "content": user_content
+        }],
+    )
 
-        raw = msg.content[0].text.strip()
-        # Strip markdown code fences if present
-        if raw.startswith('```'):
-            raw = raw.split('\n', 1)[1]
-            if raw.endswith('```'):
-                raw = raw[:-3].strip()
+    if msg.stop_reason == 'max_tokens':
+        raise RuntimeError('LLM response truncated — analysis too long')
 
-        analysis = json.loads(raw)
+    raw = msg.content[0].text.strip()
+    if raw.startswith('```'):
+        raw = raw.split('\n', 1)[1]
+        if raw.endswith('```'):
+            raw = raw[:-3].strip()
+
+    analysis = json.loads(raw)
+    set_cached_analysis(ticker, analysis)
+    return analysis
+
+
+@app.route('/api/analysis')
+def api_analysis():
+    """GET cached analysis, or return status if not ready."""
+    cached = get_cached_analysis('IBIT')
+    if cached:
+        return Response(json.dumps(cached), mimetype='application/json')
+    return Response(json.dumps({'status': 'pending'}), mimetype='application/json')
+
+
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze():
+    """Force re-run analysis (manual refresh)."""
+    try:
+        analysis = run_analysis('IBIT')
         return Response(json.dumps(analysis), mimetype='application/json')
-
-    except json.JSONDecodeError as e:
-        return Response(json.dumps({'error': f'Failed to parse LLM response: {str(e)}', 'raw': raw}),
-                        mimetype='application/json'), 500
     except Exception as e:
         return Response(json.dumps({'error': str(e)}),
                         mimetype='application/json'), 500

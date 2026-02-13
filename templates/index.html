@@ -363,7 +363,7 @@ function renderSidebar(data){
   // AI Analysis section
   h+=`<div class="ai-sec">`;
   h+=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis</div>`;
-  h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()">ANALYZE</button></div>`;
+  h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button></div>`;
   h+=`<div class="ai-tabs">`;
   ['3d','7d','14d','30d','45d','ALL'].forEach(t=>{
     const key=t.toLowerCase();
@@ -375,7 +375,7 @@ function renderSidebar(data){
     const txt=aiData[aiActiveTab]||'No analysis for this timeframe.';
     h+=formatAiText(txt);
   }else{
-    h+=`<span class="ai-empty">Click ANALYZE to generate AI-powered trading insights across all DTE timeframes.</span>`;
+    h+=`<div class="ai-loading"><div class="spin"></div>Waiting for analysis...</div>`;
   }
   h+=`</div></div>`;
 
@@ -600,13 +600,30 @@ function switchAiTab(key){
   }
 }
 
+async function loadAnalysis(){
+  // Fetch cached analysis; if pending, poll every 10s
+  try{
+    const resp=await fetch('/api/analysis');
+    const data=await resp.json();
+    if(data.status==='pending'){
+      setTimeout(loadAnalysis,10000);
+      return;
+    }
+    aiData=data;
+    const el=document.getElementById('ai-content');
+    if(el){
+      const txt=aiData[aiActiveTab]||'No analysis for this timeframe.';
+      el.innerHTML=formatAiText(txt);
+    }
+  }catch(e){console.warn('Analysis fetch:',e)}
+}
+
 async function runAnalysis(){
   const btn=document.getElementById('ai-analyze-btn');
   const el=document.getElementById('ai-content');
   if(!btn||!el)return;
   btn.disabled=true;
-  btn.textContent='...';
-  el.innerHTML='<div class="ai-loading"><div class="spin"></div>Fetching all timeframes & running analysis...</div>';
+  el.innerHTML='<div class="ai-loading"><div class="spin"></div>Re-running analysis...</div>';
   try{
     const resp=await fetch('/api/analyze',{method:'POST'});
     const data=await resp.json();
@@ -618,12 +635,12 @@ async function runAnalysis(){
     el.innerHTML=`<span style="color:var(--red)">Error: ${e.message}</span>`;
   }
   btn.disabled=false;
-  btn.textContent='ANALYZE';
 }
 
 // Init
 try{initTV()}catch(e){console.warn('TV init:',e)}
 loadData();
+loadAnalysis();
 </script>
 </body>
 </html>
