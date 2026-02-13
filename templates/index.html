@@ -192,6 +192,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <option value="30">30d</option>
       <option value="45">45d</option>
     </select>
+    <span id="hdr-exp" style="color:var(--t3);font-size:9px"></span>
     <button class="hdr-btn" onclick="loadData()">REFRESH</button>
   </div>
 </div>
@@ -436,6 +437,9 @@ async function loadData(){
     const neg=data.levels.regime==='negative_gamma';
     re.className=`hdr-regime ${neg?'regime-neg':'regime-pos'}`;
     re.textContent=neg?'\u25bc NEG GAMMA':'\u25b2 POS GAMMA';
+    const exps=data.expirations||[];
+    if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
+    else document.getElementById('hdr-exp').textContent='';
 
     // Chart overlay
     try{
