@@ -31,10 +31,19 @@ IBIT is a Bitcoin ETF with a large, liquid options market. When dealers hedge IB
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env  # add your Anthropic API key
 python3 app.py
 ```
 
 Open http://localhost:5000 in your browser.
+
+### Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | For AI analysis | Claude API key for automated trading analysis |
+
+Create a `.env` file in the project root (loaded automatically via python-dotenv).
 
 ## Usage
 
@@ -76,6 +85,7 @@ Call vs put open interest at each strike, showing where hedging activity is conc
 
 ### Sidebar
 
+- **AI Analysis** — Claude-powered trading analysis across all DTE timeframes (3d/7d/14d/30d/45d + combined). Auto-runs daily when fresh data arrives. Includes day-over-day level changes and prior analysis context for thesis continuity.
 - **Regime Banner** — Positive gamma (range-bound, fade extremes) or negative gamma (trending, don't fade)
 - **Expected Move** — Implied straddle range for nearest expiry
 - **Range Visual** — In positive gamma: tradeable range between put wall and call wall with spot indicator
@@ -95,6 +105,11 @@ Call vs put open interest at each strike, showing where hedging activity is conc
 3. Pulls options chains across expirations within the DTE window
 4. Calculates Black-Scholes gamma, delta, vanna, and charm using per-strike implied volatility
 5. Aggregates to build a GEX profile, derive levels, and compute dealer flow forecasts
+
+### Data Caching
+Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed.
+
+A background thread pre-fetches all 5 DTE timeframes on startup and keeps the cache warm. Once all timeframes are fresh for the day, it auto-runs AI analysis (if `ANTHROPIC_API_KEY` is set).
 
 ### GEX Calculation
 ```
@@ -154,17 +169,25 @@ Lower DTE (7) focuses on near-term expirations where gamma is strongest (gamma s
 
 ## Daily OI Tracking
 
-Snapshots are stored in SQLite (`~/.ibit_gex_history.db`). On each load the dashboard compares against the previous snapshot:
+Snapshots are stored in SQLite (`~/.ibit_gex_history.db`). The dashboard compares against the previous day's snapshot:
 - Aggregate OI changes with positioning interpretation
 - Per-level OI deltas (BUILDING / DECAYING)
 - Historical regime and level trends
 
+The database also stores full data caches (per DTE) and AI analysis results, both keyed by date.
+
 ## API
 
 ### `GET /api/data`
-Returns JSON with spot prices, levels, GEX/OI chart data, significant levels, breakout assessment, dealer flow forecast, OI changes, and history.
+Returns JSON with spot prices, levels, GEX/OI chart data, significant levels, breakout assessment, dealer flow forecast, OI changes, and history. Served from cache when available.
 
 Accepts `?dte=N` query parameter (1-90) to override the DTE window.
+
+### `GET /api/analysis`
+Returns the cached AI analysis for today, or `{"status": "pending"}` if not yet generated.
+
+### `POST /api/analyze`
+Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON directly. Requires `ANTHROPIC_API_KEY`.
 
 ## Config Constants
 
@@ -179,3 +202,4 @@ Accepts `?dte=N` query parameter (1-90) to override the DTE window.
 - Assumes dealers are net short all options (standard but not always true)
 - BTC/Share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
 - Vanna/charm magnitudes are estimates — actual dealer positioning depends on their book, which isn't public
+- AI analysis requires an Anthropic API key and uses Claude Opus (~$0.15/day)
