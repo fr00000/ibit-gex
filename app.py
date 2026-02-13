@@ -285,13 +285,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
                 all_flips.append(flip)
     levels['gamma_flip'] = float(min(all_flips, key=lambda x: abs(x - spot))) if all_flips else float(spot)
 
-    # Max pain
-    def calc_payout(settle):
-        return sum(row['call_oi'] * max(0, settle - row['strike']) * 100 +
-                   row['put_oi'] * max(0, row['strike'] - settle) * 100
-                   for _, row in df.iterrows())
-    pain = {s: calc_payout(s) for s in df['strike'].values}
-    levels['max_pain'] = float(min(pain, key=pain.get))
+    # Max pain (vectorized)
+    strikes_arr = df['strike'].values
+    call_oi_arr = df['call_oi'].values
+    put_oi_arr = df['put_oi'].values
+    # For each potential settle price, compute total payout across all strikes
+    # Shape: (num_settles, num_strikes) via broadcasting
+    settle_grid = strikes_arr[:, np.newaxis]  # column of settle prices
+    call_pain = call_oi_arr * np.maximum(0, settle_grid - strikes_arr) * 100
+    put_pain = put_oi_arr * np.maximum(0, strikes_arr - settle_grid) * 100
+    total_pain = (call_pain + put_pain).sum(axis=1)
+    levels['max_pain'] = float(strikes_arr[np.argmin(total_pain)])
 
     # Regime
     near_spot = df[(df['strike'] >= spot * 0.98) & (df['strike'] <= spot * 1.02)]
