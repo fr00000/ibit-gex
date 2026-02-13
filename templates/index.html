@@ -588,6 +588,7 @@ async function loadData(){
     window._lastData=data;
 
     // Header
+    if(data.fallback_from){document.getElementById('dte-select').value='7';console.warn(`DTE ${data.fallback_from}d unavailable, fell back to 7d`)}
     document.getElementById('hdr-btc').textContent=data.btc_spot?fB(data.btc_spot):fmt(data.spot);
     document.getElementById('hdr-ibit').textContent=`IBIT ${fmt(data.spot)}`;
     document.getElementById('hdr-time').textContent=data.timestamp;

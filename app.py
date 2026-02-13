@@ -867,7 +867,14 @@ def api_data():
     try:
         dte = request.args.get('dte', app.config.get('MAX_DTE', 7), type=int)
         dte = max(1, min(dte, 90))
-        data = fetch_with_cache('IBIT', dte)
+        try:
+            data = fetch_with_cache('IBIT', dte)
+        except (ValueError, KeyError):
+            if dte != 7:
+                data = fetch_with_cache('IBIT', 7)
+                data['fallback_from'] = dte
+            else:
+                raise
         return Response(json.dumps(data, cls=NumpyEncoder), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
