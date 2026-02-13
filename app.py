@@ -109,6 +109,11 @@ def init_db():
         put_oi INTEGER, total_oi INTEGER, net_gex REAL,
         UNIQUE(date, ticker, strike)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS data_cache (
+        date TEXT NOT NULL, ticker TEXT NOT NULL,
+        dte INTEGER NOT NULL, data_json TEXT NOT NULL,
+        UNIQUE(date, ticker, dte)
+    )''')
     conn.commit()
     return conn
 
@@ -701,6 +706,105 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes):
     }
 
 
+# ── CACHE ──────────────────────────────────────────────────────────────────
+# OI updates once per day (after market close, available next morning).
+# Strategy: compare OI to detect when Yahoo has fresh data rather than
+# relying on a fixed clock cutoff. Throttle Yahoo checks to every 30 min.
+YAHOO_CHECK_INTERVAL = 1800  # seconds between re-checks
+_last_yahoo_check = {}  # (ticker, dte) -> datetime
+
+
+def get_latest_cache(ticker, dte):
+    """Return the most recent cached data and its date, or (None, None)."""
+    conn = init_db()
+    c = conn.cursor()
+    c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+              (ticker, dte))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0], json.loads(row[1])
+    return None, None
+
+
+def set_cached_data(ticker, dte, data):
+    """Cache the full response JSON keyed to today's date."""
+    conn = init_db()
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute('INSERT OR REPLACE INTO data_cache (date, ticker, dte, data_json) VALUES (?,?,?,?)',
+              (today, ticker, dte, json.dumps(data, cls=NumpyEncoder)))
+    conn.commit()
+    conn.close()
+
+
+def fetch_with_cache(ticker, dte):
+    """Return cached data if fresh, otherwise check Yahoo for new OI."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    cache_date, cached = get_latest_cache(ticker, dte)
+
+    # Already confirmed today's data
+    if cached and cache_date == today:
+        return cached
+
+    # Throttle: don't re-check Yahoo more than every 30 min
+    check_key = (ticker, dte)
+    last_check = _last_yahoo_check.get(check_key)
+    if cached and last_check and (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
+        return cached
+
+    # Fetch from Yahoo
+    data = fetch_and_analyze(ticker, dte)
+    _last_yahoo_check[check_key] = datetime.now()
+
+    # Compare OI to detect if data actually changed
+    if cached:
+        old_oi = (cached['levels']['total_call_oi'], cached['levels']['total_put_oi'])
+        new_oi = (data['levels']['total_call_oi'], data['levels']['total_put_oi'])
+        if old_oi == new_oi:
+            return cached  # Still stale, serve previous cache
+
+    # New data (or first run) — save as today
+    set_cached_data(ticker, dte, data)
+    return data
+
+
+# ── BACKGROUND REFRESH ─────────────────────────────────────────────────────
+import threading
+import time
+
+REFRESH_DTES = [3, 7, 14, 30, 45]
+
+def _bg_refresh():
+    """Background thread: pre-fetch all DTEs on startup, then re-check
+    every 30 min until today's fresh data is confirmed for all DTEs."""
+    while True:
+        today = datetime.now().strftime('%Y-%m-%d')
+        all_fresh = True
+        for dte in REFRESH_DTES:
+            try:
+                cache_date, _ = get_latest_cache('IBIT', dte)
+                if cache_date == today:
+                    continue  # already fresh
+                all_fresh = False
+                fetch_with_cache('IBIT', dte)
+            except Exception as e:
+                print(f"  [bg-refresh] DTE {dte} error: {e}")
+                all_fresh = False
+
+        if all_fresh:
+            # All DTEs confirmed for today — sleep 1hr, re-check will be instant
+            time.sleep(3600)
+        else:
+            time.sleep(YAHOO_CHECK_INTERVAL)
+
+
+def start_bg_refresh():
+    t = threading.Thread(target=_bg_refresh, daemon=True)
+    t.start()
+    print("  [bg-refresh] Background data refresh started")
+
+
 # ── ROUTES ──────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
@@ -712,7 +816,7 @@ def api_data():
     try:
         dte = request.args.get('dte', app.config.get('MAX_DTE', 7), type=int)
         dte = max(1, min(dte, 90))
-        data = fetch_and_analyze('IBIT', dte)
+        data = fetch_with_cache('IBIT', dte)
         return Response(json.dumps(data, cls=NumpyEncoder), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
@@ -730,7 +834,7 @@ def api_analyze():
         results = {}
 
         def fetch_dte(dte):
-            return dte, fetch_and_analyze('IBIT', dte)
+            return dte, fetch_with_cache('IBIT', dte)
 
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {pool.submit(fetch_dte, d): d for d in dtes}
@@ -843,4 +947,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
     app.config['MAX_DTE'] = args.dte
     print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}  (DTE: {args.dte})\n")
+    # Start background refresh (only in main process, not the reloader child)
+    if not os.environ.get('WERKZEUG_RUN_MAIN'):
+        pass  # reloader parent — skip
+    else:
+        start_bg_refresh()
     app.run(host=args.host, port=args.port, debug=True)
