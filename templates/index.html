@@ -394,12 +394,12 @@ function renderOI(data){
   if(typeof Chart==='undefined')return;
   const ctx=document.getElementById('oi-chart');
   if(oiChart)oiChart.destroy();
-  const labels=data.oi_chart.map(d=>fB(d.btc));
+  const labels=data.gex_chart.map(d=>fB(d.btc));
   oiChart=new Chart(ctx,{
     type:'bar',
     data:{labels,datasets:[
-      {label:'Calls',data:data.oi_chart.map(d=>d.call_oi),backgroundColor:'#00dc8288',borderRadius:1,barPercentage:.85},
-      {label:'Puts',data:data.oi_chart.map(d=>d.put_oi),backgroundColor:'#ff406088',borderRadius:1,barPercentage:.85}
+      {label:'Calls',data:data.gex_chart.map(d=>d.call_oi),backgroundColor:'#00dc8288',borderRadius:1,barPercentage:.85},
+      {label:'Puts',data:data.gex_chart.map(d=>d.put_oi),backgroundColor:'#ff406088',borderRadius:1,barPercentage:.85}
     ]},
     options:{
       responsive:true,maintainAspectRatio:false,

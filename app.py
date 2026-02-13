@@ -390,8 +390,6 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'total_oi': int(row['total_oi']),
         })
 
-    oi_chart_data = gex_chart_data  # same data, different rendering
-
     history_data = []
     for h in history:
         history_data.append({
@@ -411,7 +409,6 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
                    for k, v in levels.items()},
         'expected_move': expected_move,
         'gex_chart': gex_chart_data,
-        'oi_chart': oi_chart_data,
         'significant_levels': sig_levels,
         'breakout': breakout,
         'oi_changes': oi_changes,
