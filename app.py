@@ -870,7 +870,12 @@ def api_data():
         try:
             data = fetch_with_cache('IBIT', dte)
         except (ValueError, KeyError):
-            if dte != 7:
+            # Serve most recent cached data for this DTE if available
+            _, cached = get_latest_cache('IBIT', dte)
+            if cached:
+                data = cached
+                data['stale'] = True
+            elif dte != 7:
                 data = fetch_with_cache('IBIT', 7)
                 data['fallback_from'] = dte
             else:
