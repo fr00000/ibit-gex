@@ -273,8 +273,8 @@ def fetch_etf_flows(ticker_symbol):
                       (today, ticker_symbol, shares, aum, nav, daily_flow_shares, daily_flow_dollars))
             conn.commit()
 
-            # Compute 5-day flow streak and momentum
-            c.execute('SELECT daily_flow_shares, daily_flow_dollars FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 5',
+            # Compute 5-day flow streak and momentum (real data only, not backfill estimates)
+            c.execute('SELECT daily_flow_shares, daily_flow_dollars FROM etf_flows WHERE ticker=? AND shares_outstanding IS NOT NULL ORDER BY date DESC LIMIT 5',
                       (ticker_symbol,))
             history = c.fetchall()
         finally:
@@ -317,8 +317,11 @@ def fetch_etf_flows(ticker_symbol):
         return None
 
 
+
 def backfill_etf_flows(ticker_symbol, days=90):
-    """Backfill ETF flow history from Yahoo Finance historical data."""
+    """Backfill ETF flow history from Yahoo Finance historical data.
+    Uses a volume-based heuristic — estimates only, for chart visualization.
+    Real flow calculations use actual shares outstanding deltas (fetch_etf_flows)."""
     try:
         conn = get_db()
         c = conn.cursor()
@@ -333,31 +336,25 @@ def backfill_etf_flows(ticker_symbol, days=90):
         if hist.empty:
             return
 
-        # Get current NAV/shares for reference
         info = tk.info
         current_nav = info.get('navPrice') or info.get('regularMarketPrice')
         if not current_nav:
             return
 
-        # Use Close price as NAV proxy for historical days
         conn = get_db()
         try:
             c = conn.cursor()
             for date_idx, row in hist.iterrows():
                 date_str = date_idx.strftime('%Y-%m-%d')
                 nav = float(row['Close'])
-                # Yahoo doesn't give historical shares outstanding directly,
-                # but we can estimate flows from price and volume as a proxy.
-                # For ETFs, large volume days with price increase = inflow, decrease = outflow.
-                # Better approach: use Volume * price as a rough flow proxy
                 volume = float(row.get('Volume', 0))
-                # Estimate: net flow ≈ volume * price * sign(close - open)
                 open_p = float(row['Open'])
                 close_p = float(row['Close'])
                 direction = 1 if close_p >= open_p else -1
-                # Scale down — not all volume is creation/redemption, ~10-20% typically is
+                # Rough proxy: ~15% of volume is creation/redemption
                 estimated_flow = direction * volume * nav * 0.15
 
+                # shares_outstanding=NULL marks this as an estimate (not real data)
                 c.execute('INSERT OR IGNORE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
                           (date_str, ticker_symbol, None, None, nav, 0, estimated_flow))
             conn.commit()
@@ -1200,7 +1197,7 @@ REFRESH_DTES = [3, 7, 14, 30, 45]
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
     pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
-    # Phase 0: Backfill ETF flow history
+    # Phase 0: Backfill ETF flow history (estimates for chart, real data accumulates daily)
     for tk in TICKER_CONFIG:
         try:
             backfill_etf_flows(tk, days=90)
