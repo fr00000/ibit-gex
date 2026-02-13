@@ -1044,10 +1044,14 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
 
 @app.route('/api/analysis')
 def api_analysis():
-    """GET cached analysis, or return status if not ready."""
+    """GET cached analysis. Returns today's if available, otherwise most recent."""
     cached = get_cached_analysis('IBIT')
     if cached:
         return Response(json.dumps(cached), mimetype='application/json')
+    # Fall back to most recent analysis (e.g. overnight before new data arrives)
+    prev_date, prev = get_prev_analysis('IBIT')
+    if prev:
+        return Response(json.dumps(prev), mimetype='application/json')
     return Response(json.dumps({'status': 'pending'}), mimetype='application/json')
 
 

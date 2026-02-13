@@ -219,8 +219,8 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="hdr-sep"></div>
     <label style="color:var(--t3);font-size:10px;">DTE</label>
     <select id="dte-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
-      <option value="3">3d</option>
-      <option value="7" selected>7d</option>
+      <option value="3" selected>3d</option>
+      <option value="7">7d</option>
       <option value="14">14d</option>
       <option value="30">30d</option>
       <option value="45">45d</option>
@@ -229,8 +229,8 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="hdr-sep"></div>
     <label style="color:var(--t3);font-size:10px;">TF</label>
     <select id="tf-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
-      <option value="15m">15m</option>
-      <option value="1h" selected>1h</option>
+      <option value="15m" selected>15m</option>
+      <option value="1h">1h</option>
       <option value="4h">4h</option>
       <option value="1d">1d</option>
     </select>
@@ -255,7 +255,8 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 
 <script>
 let gexChart=null,oiChart=null,tvChart=null,tvSeries=null,priceLines=[];
-let aiData=null,aiActiveTab='all';
+let aiData=null,aiActiveTab='3d';
+let btcWs=null;
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
 const fB=n=>`$${Math.round(n).toLocaleString()}`;
 const fO=n=>n.toLocaleString();
@@ -281,6 +282,38 @@ function initTV(){
   new ResizeObserver(()=>tvChart.applyOptions({width:c.clientWidth,height:c.clientHeight})).observe(c);
 }
 
+function startBtcWs(tf){
+  if(btcWs){btcWs.close();btcWs=null}
+  if(!tvSeries)return;
+  const wsUrls=[
+    `wss://stream.binance.com:9443/ws/btcusdt@kline_${tf}`,
+    `wss://stream.binance.us:9443/ws/btcusdt@kline_${tf}`
+  ];
+  let idx=0;
+  function connect(){
+    if(idx>=wsUrls.length){console.warn('BTC WebSocket: all sources failed');return}
+    const ws=new WebSocket(wsUrls[idx]);
+    ws.onopen=()=>{console.log('BTC WebSocket connected:',wsUrls[idx])};
+    ws.onmessage=e=>{
+      try{
+        const msg=JSON.parse(e.data);
+        if(!msg.k)return;
+        const k=msg.k;
+        tvSeries.update({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c});
+        const price=fB(+k.c);
+        const hdr=document.getElementById('hdr-btc');
+        if(hdr.textContent!==price)hdr.textContent=price;
+      }catch(err){}
+    };
+    ws.onerror=()=>{ws.close()};
+    ws.onclose=()=>{
+      if(btcWs===ws){idx++;connect()}
+    };
+    btcWs=ws;
+  }
+  connect();
+}
+
 async function loadBTC(){
   const tf=document.getElementById('tf-select').value;
   const limits={'15m':960,'1h':720,'4h':360,'1d':365};
@@ -293,7 +326,9 @@ async function loadBTC(){
       const raw=await r.json();
       if(!Array.isArray(raw))continue;
       const d=raw.map(k=>({time:Math.floor(k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4]}));
-      tvSeries.setData(d);return d;
+      tvSeries.setData(d);
+      startBtcWs(tf);
+      return d;
     }catch(e){console.warn('BTC source failed:',url,e)}
   }
   return[];
