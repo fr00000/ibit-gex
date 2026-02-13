@@ -183,7 +183,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             btc_price = yf.Ticker("BTC-USD").info.get('regularMarketPrice')
             if btc_price and btc_price > 0:
                 BTC_PER_SHARE = spot / btc_price
-        except:
+        except Exception:
             pass
 
     btc_spot = spot / BTC_PER_SHARE if is_btc else None
@@ -202,7 +202,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         T = max((exp_date - now).days / 365.0, 0.5 / 365)
         try:
             chain = ticker.option_chain(exp_str)
-        except:
+        except Exception:
             continue
 
         for opt_type, df_chain, sign in [('call', chain.calls, 1), ('put', chain.puts, -1)]:
@@ -323,7 +323,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'lower_btc': float((spot - straddle) / BTC_PER_SHARE) if is_btc else None,
             'expiration': nearest_exp, 'dte': dte,
         }
-    except:
+    except Exception:
         pass
 
     # Breakout signals
@@ -1034,7 +1034,10 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
         if raw.endswith('```'):
             raw = raw[:-3].strip()
 
-    analysis = json.loads(raw)
+    try:
+        analysis = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f'Failed to parse LLM response: {e}. Raw: {raw[:500]}')
     set_cached_analysis(ticker, analysis)
     return analysis
 
@@ -1067,9 +1070,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     app.config['MAX_DTE'] = args.dte
     print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}  (DTE: {args.dte})\n")
-    # Start background refresh (only in main process, not the reloader child)
-    if not os.environ.get('WERKZEUG_RUN_MAIN'):
-        pass  # reloader parent — skip
-    else:
+    # Start background refresh (skip reloader parent to avoid double threads)
+    if os.environ.get('WERKZEUG_RUN_MAIN') or not app.debug:
         start_bg_refresh()
     app.run(host=args.host, port=args.port, debug=True)
