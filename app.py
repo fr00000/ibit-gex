@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-IBIT GEX Web Dashboard
-======================
-Flask app that calculates Gamma Exposure (GEX) from IBIT options chains
-and serves an interactive trading dashboard with BTC candlestick chart,
+GEX Terminal
+============
+Flask app that calculates Gamma Exposure (GEX) from crypto ETF options chains
+(IBIT/ETHA) and serves an interactive trading dashboard with candlestick chart,
 GEX/OI profiles, and regime-adjusted level overlays.
 
 Usage:
@@ -51,9 +51,19 @@ class NumpyEncoder(json.JSONEncoder):
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 RISK_FREE_RATE_DEFAULT = 0.043
-BTC_PER_SHARE_DEFAULT = 0.000568
 STRIKE_RANGE_PCT = 0.35
 DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
+
+TICKER_CONFIG = {
+    'IBIT': {
+        'name': 'IBIT', 'asset_label': 'BTC', 'ref_ticker': 'BTC-USD',
+        'binance_symbol': 'BTCUSDT', 'per_share_default': 0.000568,
+    },
+    'ETHA': {
+        'name': 'ETHA', 'asset_label': 'ETH', 'ref_ticker': 'ETH-USD',
+        'binance_symbol': 'ETHUSDT', 'per_share_default': 0.0091,
+    },
+}
 
 
 _rfr_cache = {'rate': None, 'date': None}
@@ -149,13 +159,28 @@ def init_db():
         UNIQUE(date, ticker)
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS btc_candles (
+        symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
         tf TEXT NOT NULL,
         time INTEGER NOT NULL,
         open REAL NOT NULL, high REAL NOT NULL,
         low REAL NOT NULL, close REAL NOT NULL,
-        UNIQUE(tf, time)
+        UNIQUE(symbol, tf, time)
     )''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_btc_candles_tf_time ON btc_candles(tf, time)')
+    # Migrate old btc_candles table (no symbol column) to new schema
+    cols = [row[1] for row in c.execute('PRAGMA table_info(btc_candles)').fetchall()]
+    if 'symbol' not in cols:
+        c.execute('''CREATE TABLE btc_candles_new (
+            symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
+            tf TEXT NOT NULL,
+            time INTEGER NOT NULL,
+            open REAL NOT NULL, high REAL NOT NULL,
+            low REAL NOT NULL, close REAL NOT NULL,
+            UNIQUE(symbol, tf, time)
+        )''')
+        c.execute("INSERT INTO btc_candles_new (symbol, tf, time, open, high, low, close) SELECT 'BTCUSDT', tf, time, open, high, low, close FROM btc_candles")
+        c.execute('DROP TABLE btc_candles')
+        c.execute('ALTER TABLE btc_candles_new RENAME TO btc_candles')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_candles_sym_tf_time ON btc_candles(symbol, tf, time)')
     conn.commit()
     conn.close()
 
@@ -207,8 +232,8 @@ def get_history(conn, ticker, days=10):
     return c.fetchall()
 
 
-# ── BTC CANDLES ─────────────────────────────────────────────────────────────
-_btc_backfill_done = threading.Event()
+# ── CANDLES ─────────────────────────────────────────────────────────────────
+_candle_backfill_done = {}  # symbol -> threading.Event
 
 TF_DURATIONS_MS = {
     '15m': 15 * 60 * 1000,
@@ -218,11 +243,11 @@ TF_DURATIONS_MS = {
 }
 
 
-def _fetch_binance_klines(tf, start_ms, end_ms, limit=1000):
+def _fetch_binance_klines(symbol, tf, start_ms, end_ms, limit=1000):
     """Fetch klines from Binance REST API with .com/.us fallback."""
     urls = [
-        f'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
-        f'https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+        f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+        f'https://api.binance.us/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
     ]
     for url in urls:
         try:
@@ -232,12 +257,12 @@ def _fetch_binance_klines(tf, start_ms, end_ms, limit=1000):
                 if isinstance(data, list):
                     return data
         except Exception as e:
-            print(f"  [btc] Binance fetch failed ({url[:50]}...): {e}")
+            print(f"  [candles] Binance fetch failed ({url[:50]}...): {e}")
     return []
 
 
-def backfill_btc_candles(tf, days=90):
-    """Paginated backfill of BTC candles for a given timeframe."""
+def backfill_btc_candles(symbol, tf, days=90):
+    """Paginated backfill of candles for a given symbol and timeframe."""
     tf_ms = TF_DURATIONS_MS.get(tf)
     if not tf_ms:
         return
@@ -248,12 +273,12 @@ def backfill_btc_candles(tf, days=90):
     cursor = start_ms
     total = 0
     while cursor < now_ms:
-        klines = _fetch_binance_klines(tf, cursor, now_ms, limit=1000)
+        klines = _fetch_binance_klines(symbol, tf, cursor, now_ms, limit=1000)
         if not klines:
             break
-        rows = [(tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
+        rows = [(symbol, tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
                 for k in klines]
-        c.executemany('INSERT OR REPLACE INTO btc_candles (tf, time, open, high, low, close) VALUES (?,?,?,?,?,?)', rows)
+        c.executemany('INSERT OR REPLACE INTO btc_candles (symbol, tf, time, open, high, low, close) VALUES (?,?,?,?,?,?,?)', rows)
         conn.commit()
         total += len(rows)
         last_open_ms = int(klines[-1][0])
@@ -262,60 +287,61 @@ def backfill_btc_candles(tf, days=90):
             break
         time.sleep(0.2)
     conn.close()
-    print(f"  [btc] Backfilled {total} candles for {tf}")
+    print(f"  [candles] Backfilled {total} candles for {symbol}/{tf}")
 
 
-def get_btc_candles(tf):
-    """Return all stored candles for a timeframe as TradingView-format dicts."""
+def get_btc_candles(symbol, tf):
+    """Return all stored candles for a symbol/timeframe as TradingView-format dicts."""
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT time, open, high, low, close FROM btc_candles WHERE tf=? ORDER BY time ASC', (tf,))
+    c.execute('SELECT time, open, high, low, close FROM btc_candles WHERE symbol=? AND tf=? ORDER BY time ASC', (symbol, tf))
     rows = c.fetchall()
     conn.close()
     return [{'time': r[0], 'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4]} for r in rows]
 
 
-def update_btc_candles(tf):
+def update_btc_candles(symbol, tf):
     """Fetch candles since the latest stored one and upsert."""
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT MAX(time) FROM btc_candles WHERE tf=?', (tf,))
+    c.execute('SELECT MAX(time) FROM btc_candles WHERE symbol=? AND tf=?', (symbol, tf))
     row = c.fetchone()
     if row and row[0]:
         start_ms = row[0] * 1000
     else:
         start_ms = int(time.time() * 1000) - 90 * 24 * 60 * 60 * 1000
     now_ms = int(time.time() * 1000)
-    klines = _fetch_binance_klines(tf, start_ms, now_ms, limit=1000)
+    klines = _fetch_binance_klines(symbol, tf, start_ms, now_ms, limit=1000)
     if klines:
-        rows = [(tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
+        rows = [(symbol, tf, int(k[0] // 1000), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
                 for k in klines]
-        c.executemany('INSERT OR REPLACE INTO btc_candles (tf, time, open, high, low, close) VALUES (?,?,?,?,?,?)', rows)
+        c.executemany('INSERT OR REPLACE INTO btc_candles (symbol, tf, time, open, high, low, close) VALUES (?,?,?,?,?,?,?)', rows)
         conn.commit()
     conn.close()
 
 
 # ── DATA ────────────────────────────────────────────────────────────────────
 def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
+    cfg = TICKER_CONFIG.get(ticker_symbol)
+    is_crypto = cfg is not None
+
     ticker = yf.Ticker(ticker_symbol)
     spot = ticker.info.get('regularMarketPrice')
     if spot is None:
         hist = ticker.history(period="1d")
         spot = float(hist['Close'].iloc[-1])
 
-    is_btc = ticker_symbol in ('IBIT', 'BITO', 'GBTC', 'FBTC')
-
-    # Auto BTC/Share — compute locally to avoid race conditions
-    btc_per_share = BTC_PER_SHARE_DEFAULT
-    if is_btc:
+    # Auto ref_per_share — compute locally to avoid race conditions
+    ref_per_share = cfg['per_share_default'] if cfg else 1.0
+    if is_crypto:
         try:
-            btc_price = yf.Ticker("BTC-USD").info.get('regularMarketPrice')
-            if btc_price and btc_price > 0:
-                btc_per_share = spot / btc_price
+            ref_price = yf.Ticker(cfg['ref_ticker']).info.get('regularMarketPrice')
+            if ref_price and ref_price > 0:
+                ref_per_share = spot / ref_price
         except Exception:
             pass
 
-    btc_spot = spot / btc_per_share if is_btc else None
+    btc_spot = spot / ref_per_share if is_crypto else None
 
     rfr = get_risk_free_rate()
 
@@ -391,7 +417,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     for strike, d in sorted(strike_data.items()):
         rows.append({
             'strike': strike,
-            'btc_price': strike / btc_per_share if is_btc else strike,
+            'btc_price': strike / ref_per_share if is_crypto else strike,
             'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
             'total_oi': d['call_oi'] + d['put_oi'],
             'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
@@ -532,21 +558,21 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         expected_move = {
             'straddle': float(straddle), 'pct': float((straddle / spot) * 100),
             'upper': float(spot + straddle), 'lower': float(spot - straddle),
-            'upper_btc': float((spot + straddle) / btc_per_share) if is_btc else None,
-            'lower_btc': float((spot - straddle) / btc_per_share) if is_btc else None,
+            'upper_btc': float((spot + straddle) / ref_per_share) if is_crypto else None,
+            'lower_btc': float((spot - straddle) / ref_per_share) if is_crypto else None,
             'expiration': nearest_exp, 'dte': dte,
         }
     except Exception:
         pass
 
     # Breakout signals (prev_strikes already available from early fetch)
-    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share)
+    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share)
 
     # Significant levels with regime behavior
-    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share)
+    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share)
 
     # Dealer flow forecast (vanna + charm)
-    flow_forecast = compute_flow_forecast(df, spot, levels, is_btc)
+    flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
 
     # Save to DB
     conn = get_db()
@@ -575,7 +601,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     for _, row in df[(df['strike'] >= spot * 0.82) & (df['strike'] <= spot * 1.22)].iterrows():
         gex_chart_data.append({
             'strike': float(row['strike']),
-            'btc': float(row['strike'] / btc_per_share) if is_btc else float(row['strike']),
+            'btc': float(row['strike'] / ref_per_share) if is_crypto else float(row['strike']),
             'net_gex': float(row['net_gex']),
             'active_gex': float(row['active_gex']),
             'net_vanna': float(row['net_vanna']),
@@ -598,10 +624,12 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         })
 
     return {
+        'ticker': ticker_symbol,
+        'asset_label': cfg['asset_label'] if cfg else ticker_symbol,
         'spot': float(spot),
         'btc_spot': float(btc_spot) if btc_spot else None,
-        'btc_per_share': float(btc_per_share),
-        'is_btc': bool(is_btc),
+        'btc_per_share': float(ref_per_share),
+        'is_btc': bool(is_crypto),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'levels': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                    for k, v in levels.items()},
@@ -616,7 +644,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     }
 
 
-def compute_flow_forecast(df, spot, levels, is_btc):
+def compute_flow_forecast(df, spot, levels, is_crypto):
     """Compute dealer flow forecasts from vanna and charm exposures."""
     net_vanna = float(df['net_vanna'].sum())
     net_charm = float(df['net_charm'].sum())
@@ -667,7 +695,7 @@ def compute_flow_forecast(df, spot, levels, is_btc):
 
     # Narrative
     charm_narrative = f"Dealers {charm_direction} ~{abs(charm_delta_shares):,.0f} shares overnight from delta decay"
-    if is_btc:
+    if is_crypto:
         charm_narrative += f" (~${abs(charm_delta_notional):,.0f} notional)"
 
     if net_vanna > 0:
@@ -743,7 +771,7 @@ def _level_greeks_note(ltype, regime, row, is_major):
     return ' | '.join(notes) if notes else None
 
 
-def compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share):
+def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share):
     """Build list of significant levels with regime-adjusted behavior and OI deltas."""
     oi_90 = df['total_oi'].quantile(0.90)
     oi_75 = df['total_oi'].quantile(0.75)
@@ -800,7 +828,7 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_s
 
         result.append({
             'strike': float(strike),
-            'btc': float(strike / btc_per_share) if is_btc else float(strike),
+            'btc': float(strike / ref_per_share) if is_crypto else float(strike),
             'type': ltype,
             'call_oi': call_oi, 'put_oi': put_oi, 'total_oi': total_oi,
             'net_gex': float(net_gex),
@@ -817,7 +845,7 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_s
     return result
 
 
-def compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share):
+def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share):
     """Compute breakout signals for both directions."""
     cw = levels['call_wall']
     pw = levels['put_wall']
@@ -908,11 +936,11 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_shar
         'up_signals': up_signals, 'down_signals': down_signals,
         'up_score': up_score, 'down_score': down_score,
         'up_targets': [{'strike': float(t['strike']),
-                        'btc': float(t['strike'] / btc_per_share),
+                        'btc': float(t['strike'] / ref_per_share),
                         'total_oi': int(t['total_oi']),
                         'net_gex': float(t['net_gex'])} for t in up_targets],
         'down_targets': [{'strike': float(t['strike']),
-                          'btc': float(t['strike'] / btc_per_share),
+                          'btc': float(t['strike'] / ref_per_share),
                           'total_oi': int(t['total_oi']),
                           'net_gex': float(t['net_gex'])} for t in down_targets],
         'bias': bias,
@@ -1004,73 +1032,79 @@ def fetch_with_cache(ticker, dte):
 REFRESH_DTES = [3, 7, 14, 30, 45]
 
 def _bg_refresh():
-    """Background thread: backfill BTC candles on startup, pre-fetch all DTEs,
-    then periodically update candles (every 5 min) and re-check GEX data."""
-    # Phase 1: Backfill BTC candles for all timeframes
-    print("  [bg-refresh] Starting BTC candle backfill...")
-    for tf in ('15m', '1h', '4h', '1d'):
-        try:
-            backfill_btc_candles(tf, days=90)
-        except Exception as e:
-            print(f"  [bg-refresh] Backfill {tf} error: {e}")
-    _btc_backfill_done.set()
-    print("  [bg-refresh] BTC candle backfill complete")
+    """Background thread: backfill candles on startup for all tickers,
+    pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
+    # Phase 1: Backfill candles for all tickers
+    for tk, cfg in TICKER_CONFIG.items():
+        symbol = cfg['binance_symbol']
+        _candle_backfill_done.setdefault(symbol, threading.Event())
+        print(f"  [bg-refresh] Starting {symbol} candle backfill...")
+        for tf in ('15m', '1h', '4h', '1d'):
+            try:
+                backfill_btc_candles(symbol, tf, days=90)
+            except Exception as e:
+                print(f"  [bg-refresh] Backfill {symbol}/{tf} error: {e}")
+        _candle_backfill_done[symbol].set()
+        print(f"  [bg-refresh] {symbol} candle backfill complete")
 
     # Phase 2: Main loop — GEX refresh + candle updates
     last_candle_update = 0
     while True:
-        # Update BTC candles every 5 minutes
+        # Update candles every 5 minutes for all tickers
         now = time.time()
         if now - last_candle_update >= 300:
-            for tf in ('15m', '1h', '4h', '1d'):
-                try:
-                    update_btc_candles(tf)
-                except Exception as e:
-                    print(f"  [bg-refresh] Candle update {tf} error: {e}")
+            for tk, cfg in TICKER_CONFIG.items():
+                symbol = cfg['binance_symbol']
+                for tf in ('15m', '1h', '4h', '1d'):
+                    try:
+                        update_btc_candles(symbol, tf)
+                    except Exception as e:
+                        print(f"  [bg-refresh] Candle update {symbol}/{tf} error: {e}")
             last_candle_update = now
 
-        # Existing GEX refresh logic
-        today = datetime.now().strftime('%Y-%m-%d')
-        all_fresh = True
-        stale_dtes = []
-        for dte in REFRESH_DTES:
-            cache_date, _ = get_latest_cache('IBIT', dte)
-            if cache_date != today:
-                stale_dtes.append(dte)
-        if stale_dtes:
-            all_fresh = False
-            with ThreadPoolExecutor(max_workers=len(stale_dtes)) as pool:
-                futures = {pool.submit(fetch_with_cache, 'IBIT', d): d for d in stale_dtes}
-                for fut in as_completed(futures):
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        print(f"  [bg-refresh] DTE {futures[fut]} error: {e}")
+        # GEX refresh logic for all tickers
+        for tk, cfg in TICKER_CONFIG.items():
+            today = datetime.now().strftime('%Y-%m-%d')
+            all_fresh = True
+            stale_dtes = []
+            for dte in REFRESH_DTES:
+                cache_date, _ = get_latest_cache(tk, dte)
+                if cache_date != today:
+                    stale_dtes.append(dte)
+            if stale_dtes:
+                all_fresh = False
+                with ThreadPoolExecutor(max_workers=len(stale_dtes)) as pool:
+                    futures = {pool.submit(fetch_with_cache, tk, d): d for d in stale_dtes}
+                    for fut in as_completed(futures):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            print(f"  [bg-refresh] {tk} DTE {futures[fut]} error: {e}")
 
-        if all_fresh:
-            # Auto-run AI analysis if not cached, or re-run if BTC moved >2%
-            cached_analysis = get_cached_analysis('IBIT')
-            should_run = False
-            if not cached_analysis:
-                should_run = True
-            elif cached_analysis.get('_btc_price'):
-                try:
-                    current_btc = yf.Ticker("BTC-USD").info.get('regularMarketPrice')
-                    if current_btc:
-                        old_btc = cached_analysis['_btc_price']
-                        pct_move = abs(current_btc - old_btc) / old_btc * 100
-                        if pct_move > 2:
-                            print(f"  [bg-refresh] BTC moved {pct_move:.1f}% since last analysis (${old_btc:,.0f} → ${current_btc:,.0f})")
-                            should_run = True
-                except Exception:
-                    pass
-            if should_run:
-                try:
-                    print("  [bg-refresh] Running AI analysis...")
-                    run_analysis('IBIT')
-                    print("  [bg-refresh] AI analysis complete and cached")
-                except Exception as e:
-                    print(f"  [bg-refresh] AI analysis error: {e}")
+            if all_fresh:
+                # Auto-run AI analysis if not cached, or re-run if ref asset moved >2%
+                cached_analysis = get_cached_analysis(tk)
+                should_run = False
+                if not cached_analysis:
+                    should_run = True
+                elif cached_analysis.get('_btc_price'):
+                    try:
+                        current_price = yf.Ticker(cfg['ref_ticker']).info.get('regularMarketPrice')
+                        if current_price:
+                            old_price = cached_analysis['_btc_price']
+                            pct_move = abs(current_price - old_price) / old_price * 100
+                            if pct_move > 2:
+                                print(f"  [bg-refresh] {cfg['asset_label']} moved {pct_move:.1f}% since last {tk} analysis (${old_price:,.0f} -> ${current_price:,.0f})")
+                                should_run = True
+                    except Exception:
+                        pass
+                if should_run:
+                    try:
+                        print(f"  [bg-refresh] Running {tk} AI analysis...")
+                        run_analysis(tk)
+                        print(f"  [bg-refresh] {tk} AI analysis complete and cached")
+                    except Exception as e:
+                        print(f"  [bg-refresh] {tk} AI analysis error: {e}")
 
         # Sleep 5 min (candle update cadence), but also covers GEX re-check
         time.sleep(300)
@@ -1088,32 +1122,42 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/candles')
 @app.route('/api/btc-candles')
-def api_btc_candles():
+def api_candles():
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    cfg = TICKER_CONFIG.get(ticker)
+    if not cfg:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+    symbol = cfg['binance_symbol']
     tf = request.args.get('tf', '15m')
     if tf not in ('15m', '1h', '4h', '1d'):
         return Response(json.dumps({'error': f'Invalid tf: {tf}'}), mimetype='application/json'), 400
-    if not _btc_backfill_done.is_set():
+    evt = _candle_backfill_done.get(symbol)
+    if not evt or not evt.is_set():
         return Response(json.dumps({'error': 'Backfill in progress'}), mimetype='application/json'), 503
-    candles = get_btc_candles(tf)
+    candles = get_btc_candles(symbol, tf)
     return Response(json.dumps(candles), mimetype='application/json')
 
 
 @app.route('/api/data')
 def api_data():
     try:
+        ticker = request.args.get('ticker', 'IBIT').upper()
+        if ticker not in TICKER_CONFIG:
+            return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
         dte = request.args.get('dte', 7, type=int)
         dte = max(1, min(dte, 90))
         try:
-            data = fetch_with_cache('IBIT', dte)
+            data = fetch_with_cache(ticker, dte)
         except (ValueError, KeyError):
             # Serve most recent cached data for this DTE if available
-            _, cached = get_latest_cache('IBIT', dte)
+            _, cached = get_latest_cache(ticker, dte)
             if cached:
                 data = cached
                 data['stale'] = True
             elif dte != 7:
-                data = fetch_with_cache('IBIT', 7)
+                data = fetch_with_cache(ticker, 7)
                 data['fallback_from'] = dte
             else:
                 raise
@@ -1167,6 +1211,9 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
 
 def run_analysis(ticker='IBIT'):
     """Run AI analysis across all DTEs. Returns analysis dict or raises."""
+    cfg = TICKER_CONFIG.get(ticker)
+    if not cfg:
+        raise ValueError(f'Unknown ticker: {ticker}')
     api_key = os.environ.get('ANTHROPIC_API_KEY')
     if not api_key:
         raise RuntimeError('ANTHROPIC_API_KEY not set')
@@ -1258,9 +1305,10 @@ def run_analysis(ticker='IBIT'):
 
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
-    system_prompt = """You are a GEX (Gamma Exposure) trading analyst for IBIT (Bitcoin ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
+    asset = cfg['asset_label']
+    system_prompt = f"""You are a GEX (Gamma Exposure) trading analyst for {cfg['name']} ({asset} ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
 
-IMPORTANT: IBIT is a Bitcoin ETF proxy. The data contains both IBIT share prices and BTC-equivalent prices (in levels_btc). ALWAYS use BTC prices in your analysis (e.g. "$65,200" not "$37.0"). Use the levels_btc fields for all price references. You can convert any IBIT price to BTC by dividing by btc_per_share.
+IMPORTANT: {cfg['name']} is a {asset} ETF proxy. The data contains both {cfg['name']} share prices and {asset}-equivalent prices (in levels_btc). ALWAYS use {asset} prices in your analysis (e.g. "$65,200" not "$37.0"). Use the levels_btc fields for all price references. You can convert any {cfg['name']} price to {asset} by dividing by btc_per_share.
 
 If a "changes_vs_prev" field is present for a timeframe, it contains day-over-day changes — use this to highlight what shifted overnight:
 - Level migrations (walls, gamma flip moving up/down)
@@ -1294,7 +1342,7 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
 
     # Build user message with optional previous analysis
     prev_analysis_date, prev_analysis = get_prev_analysis(ticker)
-    user_content = f"Analyze the following IBIT GEX data across all timeframes:\n\n{prompt_data}"
+    user_content = f"Analyze the following {cfg['name']} GEX data across all timeframes:\n\n{prompt_data}"
     if prev_analysis:
         prev_json = json.dumps(prev_analysis, indent=1)
         user_content += f"\n\n--- PREVIOUS ANALYSIS ({prev_analysis_date}) ---\n{prev_json}"
@@ -1336,11 +1384,14 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
 @app.route('/api/analysis')
 def api_analysis():
     """GET cached analysis. Returns today's if available, otherwise most recent."""
-    cached = get_cached_analysis('IBIT')
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+    cached = get_cached_analysis(ticker)
     if cached:
         return Response(json.dumps(cached), mimetype='application/json')
     # Fall back to most recent analysis (e.g. overnight before new data arrives)
-    prev_date, prev = get_prev_analysis('IBIT')
+    prev_date, prev = get_prev_analysis(ticker)
     if prev:
         return Response(json.dumps(prev), mimetype='application/json')
     return Response(json.dumps({'status': 'pending'}), mimetype='application/json')
@@ -1349,8 +1400,11 @@ def api_analysis():
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
     """Force re-run analysis (manual refresh)."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
     try:
-        analysis = run_analysis('IBIT')
+        analysis = run_analysis(ticker)
         return Response(json.dumps(analysis), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}),
@@ -1363,7 +1417,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='127.0.0.1')
     args = parser.parse_args()
     init_db()
-    print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}\n")
+    print(f"\n  GEX Terminal → http://{args.host}:{args.port}\n")
     # Start background refresh (skip reloader parent to avoid double threads)
     if os.environ.get('WERKZEUG_RUN_MAIN') or not app.debug:
         start_bg_refresh()

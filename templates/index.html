@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>IBIT GEX Terminal</title>
+<title>GEX Terminal</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -65,6 +65,10 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .conf-tip strong{color:var(--t1);display:block;margin-bottom:3px}
 .conf-tip .cw{margin-top:3px;padding-top:3px;border-top:1px solid var(--border)}
 
+.hdr-tabs{display:flex;gap:2px;background:var(--bg3);border-radius:3px;padding:2px}
+.hdr-tab{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.5px;padding:2px 10px;border-radius:2px;border:none;background:none;color:var(--t3);cursor:pointer;transition:all .15s}
+.hdr-tab:hover{color:var(--t2)}
+.hdr-tab.active{background:var(--blue);color:var(--bg)}
 .hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
 .hdr-ts{color:var(--t3);font-size:10px}
 .hdr-btn{background:none;border:1px solid var(--border2);color:var(--t3);padding:3px 10px;border-radius:2px;cursor:pointer;font-family:var(--mono);font-size:10px;transition:all .15s}
@@ -233,6 +237,11 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 <div class="hdr">
   <div class="hdr-logo">GEX<b>TERM</b></div>
   <div class="hdr-sep"></div>
+  <div class="hdr-tabs">
+    <button class="hdr-tab active" data-ticker="IBIT" onclick="switchTicker('IBIT')">IBIT</button>
+    <button class="hdr-tab" data-ticker="ETHA" onclick="switchTicker('ETHA')">ETHA</button>
+  </div>
+  <div class="hdr-sep"></div>
   <div class="hdr-price" id="hdr-btc">---</div>
   <div class="hdr-sub" id="hdr-ibit"></div>
   <div class="hdr-sep"></div>
@@ -293,12 +302,25 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 let gexChart=null,oiChart=null,tvChart=null,tvSeries=null,priceLines=[];
 let aiData=null;
 let btcWs=null;
+let currentTicker='IBIT';
+let _loadSeq=0;
+const TICKER_WS={IBIT:'btcusdt',ETHA:'ethusdt'};
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
 const fB=n=>`$${Math.round(n).toLocaleString()}`;
 const fO=n=>n.toLocaleString();
 const fP=n=>`${n>=0?'+':''}${n.toFixed(1)}%`;
 const fG=n=>{const a=Math.abs(n);if(a>=1e6)return `${n<0?'-':''}$${(a/1e6).toFixed(1)}M`;if(a>=1e3)return `${n<0?'-':''}$${(a/1e3).toFixed(0)}K`;return `$${Math.round(n)}`};
 const esc=s=>{if(!s)return '';const d=document.createElement('div');d.textContent=s;return d.innerHTML};
+
+function switchTicker(tk){
+  if(tk===currentTicker)return;
+  currentTicker=tk;
+  if(btcWs){btcWs.close();btcWs=null}
+  document.querySelectorAll('.hdr-tab').forEach(b=>b.classList.toggle('active',b.dataset.ticker===tk));
+  aiData=null;
+  loadData();
+  loadAnalysis();
+}
 
 function initTV(){
   if(typeof LightweightCharts==='undefined')return;
@@ -319,24 +341,23 @@ function initTV(){
   new ResizeObserver(()=>tvChart.applyOptions({width:c.clientWidth,height:c.clientHeight})).observe(c);
 }
 
-function startBtcWs(tf){
+function startCryptoWs(tf,wsSym){
   if(btcWs){btcWs.close();btcWs=null}
   if(!tvSeries)return;
   const wsUrls=[
-    `wss://stream.binance.com:9443/ws/btcusdt@kline_${tf}`,
-    `wss://stream.binance.us:9443/ws/btcusdt@kline_${tf}`
+    `wss://stream.binance.com:9443/ws/${wsSym}@kline_${tf}`,
+    `wss://stream.binance.us:9443/ws/${wsSym}@kline_${tf}`
   ];
   let idx=0,retryDelay=1000;
   function connect(){
     if(idx>=wsUrls.length){
-      // All sources exhausted — retry from the beginning with backoff
-      console.warn(`BTC WebSocket: all sources failed, retrying in ${retryDelay/1000}s`);
+      console.warn(`${wsSym} WebSocket: all sources failed, retrying in ${retryDelay/1000}s`);
       setTimeout(()=>{idx=0;connect()},retryDelay);
       retryDelay=Math.min(retryDelay*2,60000);
       return;
     }
     const ws=new WebSocket(wsUrls[idx]);
-    ws.onopen=()=>{console.log('BTC WebSocket connected:',wsUrls[idx]);retryDelay=1000};
+    ws.onopen=()=>{console.log(`${wsSym} WebSocket connected:`,wsUrls[idx]);retryDelay=1000};
     ws.onmessage=e=>{
       try{
         const msg=JSON.parse(e.data);
@@ -359,22 +380,24 @@ function startBtcWs(tf){
 
 async function loadBTC(){
   const tf=document.getElementById('tf-select').value;
+  const wsSym=TICKER_WS[currentTicker]||'btcusdt';
+  const binSym=wsSym.toUpperCase();
   // Try backend API first (90-day history from SQLite)
   try{
-    const r=await fetch(`/api/btc-candles?tf=${tf}`);
+    const r=await fetch(`/api/candles?ticker=${currentTicker}&tf=${tf}`);
     if(r.ok){
       const d=await r.json();
       if(Array.isArray(d)&&d.length>0){
         tvSeries.setData(d);
-        startBtcWs(tf);
+        startCryptoWs(tf,wsSym);
         return d;
       }
     }
-  }catch(e){console.warn('Backend BTC candles unavailable, falling back to Binance:',e)}
-  // Fallback: direct Binance fetch (~10 days for 15m)
+  }catch(e){console.warn('Backend candles unavailable, falling back to Binance:',e)}
+  // Fallback: direct Binance fetch
   const limits={'15m':960,'1h':720,'4h':360,'1d':365};
   const lim=limits[tf]||720;
-  const urls=[`https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`,`https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=${tf}&limit=${lim}`];
+  const urls=[`https://api.binance.us/api/v3/klines?symbol=${binSym}&interval=${tf}&limit=${lim}`,`https://api.binance.com/api/v3/klines?symbol=${binSym}&interval=${tf}&limit=${lim}`];
   for(const url of urls){
     try{
       const r=await fetch(url);
@@ -383,9 +406,9 @@ async function loadBTC(){
       if(!Array.isArray(raw))continue;
       const d=raw.map(k=>({time:Math.floor(k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4]}));
       tvSeries.setData(d);
-      startBtcWs(tf);
+      startCryptoWs(tf,wsSym);
       return d;
-    }catch(e){console.warn('BTC source failed:',url,e)}
+    }catch(e){console.warn('Candle source failed:',url,e)}
   }
   return[];
 }
@@ -624,18 +647,22 @@ function renderSidebar(data){
 }
 
 async function loadData(){
+  const seq=++_loadSeq;
   document.getElementById('loading').classList.remove('hidden');
   try{
     const dte=document.getElementById('dte-select').value;
-    const resp=await fetch(`/api/data?dte=${dte}`);
+    const resp=await fetch(`/api/data?ticker=${currentTicker}&dte=${dte}`);
+    if(seq!==_loadSeq)return;
     const data=await resp.json();
+    if(seq!==_loadSeq)return;
     if(data.error)throw new Error(data.error);
     window._lastData=data;
 
     // Header
     if(data.fallback_from){document.getElementById('dte-select').value='7';console.warn(`DTE ${data.fallback_from}d unavailable, fell back to 7d`)}
     document.getElementById('hdr-btc').textContent=data.btc_spot?fB(data.btc_spot):fmt(data.spot);
-    document.getElementById('hdr-ibit').textContent=`IBIT ${fmt(data.spot)}`;
+    const tkLabel=data.ticker||currentTicker;
+    document.getElementById('hdr-ibit').textContent=`${tkLabel} ${fmt(data.spot)}`;
     document.getElementById('hdr-time').textContent=data.timestamp;
     const re=document.getElementById('hdr-regime');
     const neg=data.levels.regime==='negative_gamma';
@@ -665,6 +692,7 @@ async function loadData(){
         clearLines();
         const bps=data.btc_per_share;
         const candles=await loadBTC();
+        if(seq!==_loadSeq)return;
         if(candles.length){
           addLine(data.levels.call_wall/bps,'#00dc82','Call Wall',1,2);
           addLine(data.levels.put_wall/bps,'#ff4060','Put Wall',1,2);
@@ -719,7 +747,7 @@ function formatAiText(text){
 async function loadAnalysis(){
   // Fetch cached analysis; if pending, poll every 10s
   try{
-    const resp=await fetch('/api/analysis');
+    const resp=await fetch(`/api/analysis?ticker=${currentTicker}`);
     const data=await resp.json();
     if(data.status==='pending'){
       setTimeout(loadAnalysis,10000);
@@ -735,7 +763,7 @@ async function runAnalysis(){
   if(!btn)return;
   btn.disabled=true;
   try{
-    const resp=await fetch('/api/analyze',{method:'POST'});
+    const resp=await fetch(`/api/analyze?ticker=${currentTicker}`,{method:'POST'});
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     aiData=data;
