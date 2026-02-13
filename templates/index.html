@@ -148,6 +148,22 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .ds-row .dl{color:var(--t3)}
 .ds-row .dv{font-weight:500}
 
+/* FLOW FORECAST */
+.ff-box{background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:6px 8px;margin-bottom:5px}
+.ff-hdr{font-weight:600;font-size:9px;letter-spacing:.4px;margin-bottom:4px;display:flex;align-items:center;gap:5px}
+.ff-row{display:flex;justify-content:space-between;padding:2px 0;font-size:10px}
+.ff-row .ffl{color:var(--t3);font-size:9px}
+.ff-row .ffv{font-weight:500;font-size:10px}
+.ff-dir{font-size:9px;font-weight:600;padding:1px 6px;border-radius:2px;display:inline-block;margin-top:2px}
+.ff-buy{background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)}
+.ff-sell{background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)}
+.ff-negl{color:var(--t3);font-size:9px;font-style:italic}
+.ff-note{font-size:9px;color:var(--t3);margin-top:3px;padding-top:3px;border-top:1px solid var(--border);line-height:1.4}
+.ff-scenario{display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:9px}
+.ff-scenario .ffs-l{color:var(--t3)}
+.ff-scenario .ffs-v{font-weight:500}
+.sl-greeks{font-size:8px;color:var(--purple);margin-top:1px;opacity:.8}
+
 /* OI CHANGES */
 .oi-box{background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:5px 8px;font-size:10px}
 .oi-box .oi-hdr{font-weight:600;color:var(--t3);font-size:9px;margin-bottom:3px}
@@ -370,7 +386,9 @@ function renderSidebar(data){
         dh=`<span class="sl-delta ${cls}">${ar}${Math.abs(sl.oi_delta.delta).toLocaleString()} ${sl.oi_delta.status}</span>`;
       }
       h+=`<div class="sl-row"><div class="sl-top"><span><span class="sl-price">${fB(sl.btc)}</span> ${db(sl.strike)}</span><span class="sl-oi">${fO(sl.total_oi)}${dh}</span></div>`;
-      h+=`<div class="sl-beh">${sl.behavior}</div></div>`;
+      h+=`<div class="sl-beh">${sl.behavior}</div>`;
+      if(sl.greeks_note)h+=`<div class="sl-greeks">${sl.greeks_note}</div>`;
+      h+=`</div>`;
     });
     h+=`</div>`;
   }
@@ -397,6 +415,49 @@ function renderSidebar(data){
   const bt=bo.bias==='upside'?'\u25b2 BIAS: UPSIDE':bo.bias==='downside'?'\u25bc BIAS: DOWNSIDE':'\u2014 BALANCED';
   h+=`<div class="bias-box" style="color:${bc}">${bt}</div></div>`;
 
+  // Dealer Flow Forecast (Vanna + Charm)
+  if(data.flow_forecast){
+    const ff=data.flow_forecast;
+    h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--purple)"></span>Dealer Flows</div>`;
+
+    // Overnight charm
+    const ch=ff.charm;
+    h+=`<div class="ff-box"><div class="ff-hdr">\u23f0 Overnight (Charm)</div>`;
+    if(ch.strength==='negligible'){
+      h+=`<div class="ff-negl">Negligible charm — no meaningful overnight delta shift</div>`;
+    }else{
+      h+=`<div class="ff-row"><span class="ffl">Dealers must</span><span class="ff-dir ${ch.direction==='buy'?'ff-buy':'ff-sell'}">${ch.direction.toUpperCase()} ${Math.abs(ch.net_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></div>`;
+      if(ch.notional)h+=`<div class="ff-row"><span class="ffl">Notional</span><span class="ffv">${ch.direction==='buy'?'+':'-'}$${Math.abs(ch.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
+      h+=`<div class="ff-row"><span class="ffl">Impact</span><span class="ffv">${ch.strength}</span></div>`;
+    }
+    h+=`</div>`;
+
+    // Vanna scenarios
+    const vn=ff.vanna;
+    h+=`<div class="ff-box"><div class="ff-hdr">\u26a1 Vol Scenarios (Vanna)</div>`;
+    if(vn.strength==='negligible'){
+      h+=`<div class="ff-negl">Negligible vanna — IV moves won't trigger significant rebalancing</div>`;
+    }else{
+      h+=`<div class="ff-scenario"><span class="ffs-l">IV -5pts (crush)</span><span class="ffs-v"><span class="ff-dir ${vn.crush_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.crush_scenario.direction.toUpperCase()} ${Math.abs(vn.crush_scenario.delta_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></span></div>`;
+      h+=`<div class="ff-scenario"><span class="ffs-l">IV +5pts (spike)</span><span class="ffs-v"><span class="ff-dir ${vn.spike_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.spike_scenario.direction.toUpperCase()} ${Math.abs(vn.spike_scenario.delta_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></span></div>`;
+      h+=`<div class="ff-row"><span class="ffl">Sensitivity</span><span class="ffv">${vn.strength}</span></div>`;
+    }
+    h+=`</div>`;
+
+    // Combined overnight
+    const ov=ff.overnight;
+    if(Math.abs(ov.net_shares)>100){
+      const ovDir=ov.direction==='buy'?'ff-buy':'ff-sell';
+      h+=`<div class="ff-box"><div class="ff-hdr">\u{1f303} Net Overnight (Charm + Vol Decay)</div>`;
+      h+=`<div class="ff-row"><span class="ffl">Combined</span><span class="ff-dir ${ovDir}">${ov.direction.toUpperCase()} ${Math.abs(ov.net_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></div>`;
+      if(ov.notional)h+=`<div class="ff-row"><span class="ffl">Notional</span><span class="ffv">${ov.direction==='buy'?'+':'-'}$${Math.abs(ov.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
+      h+=`</div>`;
+    }
+
+    h+=`<div class="ff-note">${ff.regime_note}</div>`;
+    h+=`</div>`;
+  }
+
   // OI Changes
   if(data.oi_changes){
     const oc=data.oi_changes;
@@ -414,7 +475,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position</div>`;
-  [['Net GEX',fG(lv.net_gex_total)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
+  [['Net GEX',fG(lv.net_gex_total)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;

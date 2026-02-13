@@ -64,6 +64,25 @@ def bs_delta(S, K, T, r, sigma, option_type='call'):
     else:
         return norm.cdf(d1) - 1
 
+def bs_vanna(S, K, T, r, sigma):
+    """Vanna = dDelta/dVol — dealer rebalancing when IV moves."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return -norm.pdf(d1) * d2 / sigma
+
+def bs_charm(S, K, T, r, sigma, option_type='call'):
+    """Charm = dDelta/dT — dealer rebalancing from time decay of delta."""
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    charm = -norm.pdf(d1) * (2 * r * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
+    if option_type == 'put':
+        charm += r * np.exp(-r * T) * norm.cdf(-d2)
+    return charm
+
 
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
@@ -186,15 +205,26 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
                 gamma = bs_gamma(spot, strike, T, RISK_FREE_RATE, iv)
                 delta = bs_delta(spot, strike, T, RISK_FREE_RATE, iv, opt_type)
+                vanna = bs_vanna(spot, strike, T, RISK_FREE_RATE, iv)
+                charm = bs_charm(spot, strike, T, RISK_FREE_RATE, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
                 dealer_delta = -delta * oi * 100
+                # Dealer vanna exposure: how dealer delta changes with IV
+                dealer_vanna = -sign * vanna * oi * 100 * spot * 0.01
+                # Dealer charm exposure: how dealer delta changes overnight
+                # Charm is dDelta/dT per year, convert to per-day: divide by 365
+                dealer_charm = -charm * oi * 100 / 365.0
 
                 if strike not in strike_data:
                     strike_data[strike] = {'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
-                                           'call_delta': 0, 'put_delta': 0}
+                                           'call_delta': 0, 'put_delta': 0,
+                                           'call_vanna': 0, 'put_vanna': 0,
+                                           'call_charm': 0, 'put_charm': 0}
                 strike_data[strike][f'{opt_type}_oi'] += oi
                 strike_data[strike][f'{opt_type}_gex'] += gex
                 strike_data[strike][f'{opt_type}_delta'] += dealer_delta
+                strike_data[strike][f'{opt_type}_vanna'] += dealer_vanna
+                strike_data[strike][f'{opt_type}_charm'] += dealer_charm
 
     # Build dataframe
     rows = []
@@ -207,6 +237,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
             'net_gex': d['call_gex'] + d['put_gex'],
             'net_dealer_delta': d['call_delta'] + d['put_delta'],
+            'net_vanna': d['call_vanna'] + d['put_vanna'],
+            'net_charm': d['call_charm'] + d['put_charm'],
+            'call_vanna': d['call_vanna'], 'put_vanna': d['put_vanna'],
+            'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
         })
     df = pd.DataFrame(rows)
 
@@ -243,6 +277,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     # Totals
     levels['net_gex_total'] = float(df['net_gex'].sum())
     levels['net_dealer_delta'] = float(df['net_dealer_delta'].sum())
+    levels['net_vanna'] = float(df['net_vanna'].sum())
+    levels['net_charm'] = float(df['net_charm'].sum())
     levels['total_call_oi'] = int(df['call_oi'].sum())
     levels['total_put_oi'] = int(df['put_oi'].sum())
     levels['pcr'] = levels['total_put_oi'] / max(levels['total_call_oi'], 1)
@@ -281,6 +317,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     # Significant levels with regime behavior
     sig_levels = compute_significant_levels(df, spot, levels, None, is_btc)
 
+    # Dealer flow forecast (vanna + charm)
+    flow_forecast = compute_flow_forecast(df, spot, levels, is_btc)
+
     # Save to DB
     conn = init_db()
     prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
@@ -316,6 +355,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'strike': float(row['strike']),
             'btc': float(row['strike'] / BTC_PER_SHARE) if is_btc else float(row['strike']),
             'net_gex': float(row['net_gex']),
+            'net_vanna': float(row['net_vanna']),
+            'net_charm': float(row['net_charm']),
             'call_oi': int(row['call_oi']),
             'put_oi': int(row['put_oi']),
             'total_oi': int(row['total_oi']),
@@ -346,9 +387,137 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         'significant_levels': sig_levels,
         'breakout': breakout,
         'oi_changes': oi_changes,
+        'flow_forecast': flow_forecast,
         'history': history_data,
         'expirations': selected_exps,
     }
+
+
+def compute_flow_forecast(df, spot, levels, is_btc):
+    """Compute dealer flow forecasts from vanna and charm exposures."""
+    net_vanna = float(df['net_vanna'].sum())
+    net_charm = float(df['net_charm'].sum())
+    regime = levels['regime']
+
+    # Charm: overnight dealer rebalancing
+    # Positive net charm = dealers need to BUY delta tomorrow (bullish flow)
+    # Negative net charm = dealers need to SELL delta tomorrow (bearish flow)
+    charm_delta_shares = net_charm  # shares dealers need to trade
+    charm_delta_notional = charm_delta_shares * spot  # dollar notional (shares × IBIT price)
+    charm_direction = 'buy' if net_charm > 0 else 'sell'
+    charm_magnitude = abs(net_charm)
+
+    # Categorize charm impact
+    if charm_magnitude < 1000:
+        charm_strength = 'negligible'
+    elif charm_magnitude < 10000:
+        charm_strength = 'minor'
+    elif charm_magnitude < 50000:
+        charm_strength = 'moderate'
+    else:
+        charm_strength = 'significant'
+
+    # Vanna: IV-dependent dealer rebalancing
+    # Positive net vanna = vol CRUSH forces dealers to BUY (bullish)
+    # Negative net vanna = vol CRUSH forces dealers to SELL (bearish)
+    # (reverse for vol spike)
+    vanna_magnitude = abs(net_vanna)
+    if vanna_magnitude < 1000:
+        vanna_strength = 'negligible'
+    elif vanna_magnitude < 10000:
+        vanna_strength = 'minor'
+    elif vanna_magnitude < 50000:
+        vanna_strength = 'moderate'
+    else:
+        vanna_strength = 'significant'
+
+    # Scenarios: 5-point IV move
+    iv_move = 5  # vol points
+    vanna_crush_delta = net_vanna * iv_move  # shares from -5pt IV
+    vanna_spike_delta = -net_vanna * iv_move  # shares from +5pt IV
+
+    # Combined overnight forecast (charm + expected vanna from typical overnight vol decay)
+    # Overnight vol typically drifts down ~0.5-1pt in calm markets
+    overnight_vanna_adj = net_vanna * 0.5  # conservative overnight vol decay
+    overnight_total = net_charm + overnight_vanna_adj
+    overnight_direction = 'buy' if overnight_total > 0 else 'sell'
+
+    # Narrative
+    charm_narrative = f"Dealers {charm_direction} ~{abs(charm_delta_shares):,.0f} shares overnight from delta decay"
+    if is_btc:
+        charm_narrative += f" (~${abs(charm_delta_btc):,.0f} notional BTC)"
+
+    if net_vanna > 0:
+        vanna_crush_narrative = "Vol crush → dealers BUY (supportive)"
+        vanna_spike_narrative = "Vol spike → dealers SELL (pressuring)"
+    else:
+        vanna_crush_narrative = "Vol crush → dealers SELL (pressuring)"
+        vanna_spike_narrative = "Vol spike → dealers BUY (supportive)"
+
+    # Regime interaction
+    if regime == 'positive_gamma':
+        regime_note = "Positive gamma reinforces mean-reversion. Charm and vanna flows add directional bias within the range."
+    else:
+        regime_note = "Negative gamma amplifies moves. Vanna and charm flows can accelerate breakouts."
+
+    return {
+        'charm': {
+            'net_shares': float(net_charm),
+            'direction': charm_direction,
+            'strength': charm_strength,
+            'notional': float(charm_delta_notional),
+            'narrative': charm_narrative,
+        },
+        'vanna': {
+            'net_exposure': float(net_vanna),
+            'strength': vanna_strength,
+            'crush_scenario': {
+                'delta_shares': float(vanna_crush_delta),
+                'notional': float(vanna_crush_delta * spot),
+                'direction': 'buy' if vanna_crush_delta > 0 else 'sell',
+                'narrative': vanna_crush_narrative,
+            },
+            'spike_scenario': {
+                'delta_shares': float(vanna_spike_delta),
+                'notional': float(vanna_spike_delta * spot),
+                'direction': 'buy' if vanna_spike_delta > 0 else 'sell',
+                'narrative': vanna_spike_narrative,
+            },
+        },
+        'overnight': {
+            'net_shares': float(overnight_total),
+            'direction': overnight_direction,
+            'notional': float(overnight_total * spot),
+        },
+        'regime_note': regime_note,
+    }
+
+
+def _level_greeks_note(ltype, regime, row, is_major):
+    """Generate a short note about vanna/charm dynamics at this level."""
+    notes = []
+    net_vanna = row.get('net_vanna', 0) if isinstance(row, dict) else (row['net_vanna'] if 'net_vanna' in row.index else 0)
+    net_charm = row.get('net_charm', 0) if isinstance(row, dict) else (row['net_charm'] if 'net_charm' in row.index else 0)
+
+    # Vanna context
+    if abs(net_vanna) > 500:
+        if ltype == 'put_wall' and net_vanna > 0:
+            notes.append("Vol spike weakens support (vanna sells)")
+        elif ltype == 'put_wall' and net_vanna < 0:
+            notes.append("Vol spike strengthens support (vanna buys)")
+        elif ltype == 'call_wall' and net_vanna > 0:
+            notes.append("Vol crush strengthens ceiling (vanna buys into resistance)")
+        elif ltype == 'call_wall' and net_vanna < 0:
+            notes.append("Vol crush weakens ceiling (vanna sells)")
+
+    # Charm context
+    if abs(net_charm) > 500:
+        if net_charm > 0:
+            notes.append("Charm: dealers buy overnight")
+        else:
+            notes.append("Charm: dealers sell overnight")
+
+    return ' | '.join(notes) if notes else None
 
 
 def compute_significant_levels(df, spot, levels, prev_strikes, is_btc):
@@ -412,9 +581,12 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_btc):
             'type': ltype,
             'call_oi': call_oi, 'put_oi': put_oi, 'total_oi': total_oi,
             'net_gex': float(net_gex),
+            'net_vanna': float(row['net_vanna']) if 'net_vanna' in row else 0.0,
+            'net_charm': float(row['net_charm']) if 'net_charm' in row else 0.0,
             'dist_pct': float(((strike - spot) / spot) * 100),
             'is_major': is_major,
             'behavior': behavior,
+            'greeks_note': _level_greeks_note(ltype, regime, row, is_major),
             'oi_delta': oi_delta,
         })
 
