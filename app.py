@@ -48,7 +48,7 @@ class NumpyEncoder(json.JSONEncoder):
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 RISK_FREE_RATE = 0.043
-BTC_PER_SHARE = 0.000568
+BTC_PER_SHARE_DEFAULT = 0.000568
 STRIKE_RANGE_PCT = 0.35
 DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
 
@@ -167,8 +167,6 @@ def get_history(conn, ticker, days=10):
 
 # ── DATA ────────────────────────────────────────────────────────────────────
 def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
-    global BTC_PER_SHARE
-
     ticker = yf.Ticker(ticker_symbol)
     spot = ticker.info.get('regularMarketPrice')
     if spot is None:
@@ -177,16 +175,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     is_btc = ticker_symbol in ('IBIT', 'BITO', 'GBTC', 'FBTC')
 
-    # Auto BTC/Share
+    # Auto BTC/Share — compute locally to avoid race conditions
+    btc_per_share = BTC_PER_SHARE_DEFAULT
     if is_btc:
         try:
             btc_price = yf.Ticker("BTC-USD").info.get('regularMarketPrice')
             if btc_price and btc_price > 0:
-                BTC_PER_SHARE = spot / btc_price
+                btc_per_share = spot / btc_price
         except Exception:
             pass
 
-    btc_spot = spot / BTC_PER_SHARE if is_btc else None
+    btc_spot = spot / btc_per_share if is_btc else None
 
     all_exps = list(ticker.options)
     now = datetime.now(timezone.utc)
@@ -246,7 +245,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     for strike, d in sorted(strike_data.items()):
         rows.append({
             'strike': strike,
-            'btc_price': strike / BTC_PER_SHARE if is_btc else strike,
+            'btc_price': strike / btc_per_share if is_btc else strike,
             'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
             'total_oi': d['call_oi'] + d['put_oi'],
             'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
@@ -319,18 +318,18 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         expected_move = {
             'straddle': float(straddle), 'pct': float((straddle / spot) * 100),
             'upper': float(spot + straddle), 'lower': float(spot - straddle),
-            'upper_btc': float((spot + straddle) / BTC_PER_SHARE) if is_btc else None,
-            'lower_btc': float((spot - straddle) / BTC_PER_SHARE) if is_btc else None,
+            'upper_btc': float((spot + straddle) / btc_per_share) if is_btc else None,
+            'lower_btc': float((spot - straddle) / btc_per_share) if is_btc else None,
             'expiration': nearest_exp, 'dte': dte,
         }
     except Exception:
         pass
 
     # Breakout signals
-    breakout = compute_breakout(df, spot, levels, expected_move, None)
+    breakout = compute_breakout(df, spot, levels, expected_move, None, btc_per_share)
 
     # Significant levels with regime behavior
-    sig_levels = compute_significant_levels(df, spot, levels, None, is_btc)
+    sig_levels = compute_significant_levels(df, spot, levels, None, is_btc, btc_per_share)
 
     # Dealer flow forecast (vanna + charm)
     flow_forecast = compute_flow_forecast(df, spot, levels, is_btc)
@@ -342,8 +341,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     # Recompute with prev data
     if prev_strikes:
-        breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes)
-        sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_btc)
+        breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share)
+        sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share)
 
     # OI aggregate changes
     oi_changes = None
@@ -368,7 +367,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     for _, row in df[(df['strike'] >= spot * 0.82) & (df['strike'] <= spot * 1.22)].iterrows():
         gex_chart_data.append({
             'strike': float(row['strike']),
-            'btc': float(row['strike'] / BTC_PER_SHARE) if is_btc else float(row['strike']),
+            'btc': float(row['strike'] / btc_per_share) if is_btc else float(row['strike']),
             'net_gex': float(row['net_gex']),
             'net_vanna': float(row['net_vanna']),
             'net_charm': float(row['net_charm']),
@@ -391,7 +390,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     return {
         'spot': float(spot),
         'btc_spot': float(btc_spot) if btc_spot else None,
-        'btc_per_share': float(BTC_PER_SHARE),
+        'btc_per_share': float(btc_per_share),
         'is_btc': bool(is_btc),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'levels': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
@@ -535,7 +534,7 @@ def _level_greeks_note(ltype, regime, row, is_major):
     return ' | '.join(notes) if notes else None
 
 
-def compute_significant_levels(df, spot, levels, prev_strikes, is_btc):
+def compute_significant_levels(df, spot, levels, prev_strikes, is_btc, btc_per_share):
     """Build list of significant levels with regime-adjusted behavior and OI deltas."""
     oi_90 = df['total_oi'].quantile(0.90)
     oi_75 = df['total_oi'].quantile(0.75)
@@ -592,7 +591,7 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_btc):
 
         result.append({
             'strike': float(strike),
-            'btc': float(strike / BTC_PER_SHARE) if is_btc else float(strike),
+            'btc': float(strike / btc_per_share) if is_btc else float(strike),
             'type': ltype,
             'call_oi': call_oi, 'put_oi': put_oi, 'total_oi': total_oi,
             'net_gex': float(net_gex),
@@ -609,7 +608,7 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_btc):
     return result
 
 
-def compute_breakout(df, spot, levels, expected_move, prev_strikes):
+def compute_breakout(df, spot, levels, expected_move, prev_strikes, btc_per_share):
     """Compute breakout signals for both directions."""
     cw = levels['call_wall']
     pw = levels['put_wall']
@@ -700,11 +699,11 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes):
         'up_signals': up_signals, 'down_signals': down_signals,
         'up_score': up_score, 'down_score': down_score,
         'up_targets': [{'strike': float(t['strike']),
-                        'btc': float(t['strike'] / BTC_PER_SHARE),
+                        'btc': float(t['strike'] / btc_per_share),
                         'total_oi': int(t['total_oi']),
                         'net_gex': float(t['net_gex'])} for t in up_targets],
         'down_targets': [{'strike': float(t['strike']),
-                          'btc': float(t['strike'] / BTC_PER_SHARE),
+                          'btc': float(t['strike'] / btc_per_share),
                           'total_oi': int(t['total_oi']),
                           'net_gex': float(t['net_gex'])} for t in down_targets],
         'bias': bias,
