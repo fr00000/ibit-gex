@@ -742,10 +742,21 @@ def api_analyze():
         summaries = {}
         for dte in dtes:
             d = results[dte]
+            bps = d['btc_per_share']
+            lvl = d['levels']
             summaries[f"{dte}d"] = {
-                'spot': d['spot'],
-                'btc_spot': d['btc_spot'],
-                'levels': d['levels'],
+                'spot_btc': round(d['btc_spot']),
+                'spot_ibit': d['spot'],
+                'btc_per_share': bps,
+                'levels_btc': {
+                    'call_wall': round(lvl['call_wall'] / bps),
+                    'put_wall': round(lvl['put_wall'] / bps),
+                    'gamma_flip': round(lvl['gamma_flip'] / bps),
+                    'max_pain': round(lvl['max_pain'] / bps),
+                    'resistance': [round(s / bps) for s in lvl.get('resistance', [])],
+                    'support': [round(s / bps) for s in lvl.get('support', [])],
+                },
+                'levels': lvl,
                 'expected_move': d['expected_move'],
                 'breakout': {
                     'up_signals': d['breakout']['up_signals'],
@@ -776,16 +787,18 @@ def api_analyze():
 
         system_prompt = """You are a GEX (Gamma Exposure) trading analyst for IBIT (Bitcoin ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
 
+IMPORTANT: IBIT is a Bitcoin ETF proxy. The data contains both IBIT share prices and BTC-equivalent prices (in levels_btc). ALWAYS use BTC prices in your analysis (e.g. "$65,200" not "$37.0"). Use the levels_btc fields for all price references. You can convert any IBIT price to BTC by dividing by btc_per_share.
+
 For each timeframe, provide:
 - Regime summary and implication (1-2 sentences)
-- Key levels and their significance relative to spot price
+- Key levels in BTC price and their significance relative to spot
 - Dealer flow direction (charm/vanna implications)
 - Risk assessment
 - Actionable setup (if any clear one exists)
 
 For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup.
 
-Keep each analysis to 3-5 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific price levels.
+Keep each analysis to 3-5 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
 IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
 
