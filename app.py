@@ -273,6 +273,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         })
     df = pd.DataFrame(rows)
 
+    if df.empty:
+        raise ValueError(f"No options data found for {ticker_symbol} within {max_dte} DTE")
+
     # Derive levels
     levels = {}
     levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
