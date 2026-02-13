@@ -93,6 +93,7 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
 
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
+    """Create tables once at startup."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
@@ -122,7 +123,12 @@ def init_db():
         UNIQUE(date, ticker)
     )''')
     conn.commit()
-    return conn
+    conn.close()
+
+
+def get_db():
+    """Get a SQLite connection (one per call, thread-safe)."""
+    return sqlite3.connect(DB_PATH)
 
 
 def get_prev_strikes(conn, ticker):
@@ -337,7 +343,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     flow_forecast = compute_flow_forecast(df, spot, levels, is_btc)
 
     # Save to DB
-    conn = init_db()
+    conn = get_db()
     prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
     save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
 
@@ -723,7 +729,7 @@ _yahoo_check_lock = threading.Lock()
 
 def get_latest_cache(ticker, dte):
     """Return the most recent cached data and its date, or (None, None)."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
               (ticker, dte))
@@ -736,7 +742,7 @@ def get_latest_cache(ticker, dte):
 
 def get_prev_cache(ticker, dte):
     """Return the second most recent cached data (yesterday's), or None."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date<? ORDER BY date DESC LIMIT 1',
@@ -750,7 +756,7 @@ def get_prev_cache(ticker, dte):
 
 def set_cached_data(ticker, dte, data):
     """Cache the full response JSON keyed to today's date."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     c.execute('INSERT OR REPLACE INTO data_cache (date, ticker, dte, data_json) VALUES (?,?,?,?)',
@@ -854,7 +860,7 @@ def api_data():
 # ── AI ANALYSIS ────────────────────────────────────────────────────────────
 def get_cached_analysis(ticker):
     """Return cached analysis for today if it exists."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     c.execute('SELECT analysis_json FROM analysis_cache WHERE date=? AND ticker=?',
@@ -868,7 +874,7 @@ def get_cached_analysis(ticker):
 
 def get_prev_analysis(ticker):
     """Return the most recent analysis before today, or None."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     c.execute('SELECT date, analysis_json FROM analysis_cache WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
@@ -882,7 +888,7 @@ def get_prev_analysis(ticker):
 
 def set_cached_analysis(ticker, analysis):
     """Cache AI analysis for today."""
-    conn = init_db()
+    conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
     c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
@@ -1074,6 +1080,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--dte', '-d', type=int, default=7, help='Max days to expiration (default: 7)')
     args = parser.parse_args()
+    init_db()
     app.config['MAX_DTE'] = args.dte
     print(f"\n  IBIT GEX Dashboard → http://{args.host}:{args.port}  (DTE: {args.dte})\n")
     # Start background refresh (skip reloader parent to avoid double threads)
