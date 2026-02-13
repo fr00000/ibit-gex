@@ -18,12 +18,17 @@ import argparse
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
 from flask import Flask, render_template, Response, request
+import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -711,6 +716,110 @@ def api_data():
         return Response(json.dumps(data, cls=NumpyEncoder), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
+
+
+@app.route('/api/analyze', methods=['POST'])
+def api_analyze():
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        return Response(json.dumps({'error': 'ANTHROPIC_API_KEY not set'}),
+                        mimetype='application/json'), 500
+
+    try:
+        dtes = [3, 7, 14, 30, 45]
+        results = {}
+
+        def fetch_dte(dte):
+            return dte, fetch_and_analyze('IBIT', dte)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch_dte, d): d for d in dtes}
+            for fut in as_completed(futures):
+                dte, data = fut.result()
+                results[dte] = data
+
+        # Build concise summaries (strip chart data to keep prompt small)
+        summaries = {}
+        for dte in dtes:
+            d = results[dte]
+            summaries[f"{dte}d"] = {
+                'spot': d['spot'],
+                'btc_spot': d['btc_spot'],
+                'levels': d['levels'],
+                'expected_move': d['expected_move'],
+                'breakout': {
+                    'up_signals': d['breakout']['up_signals'],
+                    'down_signals': d['breakout']['down_signals'],
+                    'up_score': d['breakout']['up_score'],
+                    'down_score': d['breakout']['down_score'],
+                    'bias': d['breakout']['bias'],
+                },
+                'flow_forecast': {
+                    'charm': d['flow_forecast']['charm'],
+                    'vanna': {
+                        'net_exposure': d['flow_forecast']['vanna']['net_exposure'],
+                        'strength': d['flow_forecast']['vanna']['strength'],
+                        'crush_scenario': d['flow_forecast']['vanna']['crush_scenario'],
+                        'spike_scenario': d['flow_forecast']['vanna']['spike_scenario'],
+                    },
+                    'overnight': d['flow_forecast']['overnight'],
+                    'regime_note': d['flow_forecast']['regime_note'],
+                },
+                'oi_changes': d['oi_changes'],
+                'significant_levels': [
+                    {k: v for k, v in sl.items() if k != 'greeks_note'}
+                    for sl in d['significant_levels'][:8]
+                ],
+            }
+
+        prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
+
+        system_prompt = """You are a GEX (Gamma Exposure) trading analyst for IBIT (Bitcoin ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
+
+For each timeframe, provide:
+- Regime summary and implication (1-2 sentences)
+- Key levels and their significance relative to spot price
+- Dealer flow direction (charm/vanna implications)
+- Risk assessment
+- Actionable setup (if any clear one exists)
+
+For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup.
+
+Keep each analysis to 3-5 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific price levels.
+
+IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
+
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{
+                "role": "user",
+                "content": f"Analyze the following IBIT GEX data across all timeframes:\n\n{prompt_data}"
+            }],
+        )
+
+        if msg.stop_reason == 'max_tokens':
+            return Response(json.dumps({'error': 'LLM response truncated — analysis too long'}),
+                            mimetype='application/json'), 500
+
+        raw = msg.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith('```'):
+            raw = raw.split('\n', 1)[1]
+            if raw.endswith('```'):
+                raw = raw[:-3].strip()
+
+        analysis = json.loads(raw)
+        return Response(json.dumps(analysis), mimetype='application/json')
+
+    except json.JSONDecodeError as e:
+        return Response(json.dumps({'error': f'Failed to parse LLM response: {str(e)}', 'raw': raw}),
+                        mimetype='application/json'), 500
+    except Exception as e:
+        return Response(json.dumps({'error': str(e)}),
+                        mimetype='application/json'), 500
 
 
 if __name__ == '__main__':
