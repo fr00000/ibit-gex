@@ -445,7 +445,7 @@ def compute_flow_forecast(df, spot, levels, is_btc):
     # Narrative
     charm_narrative = f"Dealers {charm_direction} ~{abs(charm_delta_shares):,.0f} shares overnight from delta decay"
     if is_btc:
-        charm_narrative += f" (~${abs(charm_delta_btc):,.0f} notional BTC)"
+        charm_narrative += f" (~${abs(charm_delta_notional):,.0f} notional)"
 
     if net_vanna > 0:
         vanna_crush_narrative = "Vol crush → dealers BUY (supportive)"
