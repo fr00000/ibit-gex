@@ -376,6 +376,44 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     levels['active_call_wall'] = float(active_pos.loc[active_pos['active_gex'].idxmax(), 'strike']) if not active_pos.empty else levels['call_wall']
     levels['active_put_wall'] = float(active_neg.loc[active_neg['active_gex'].idxmin(), 'strike']) if not active_neg.empty else levels['put_wall']
 
+    # Positioning confidence: how much to trust the naive GEX sign convention
+    # (dealers long calls, short puts — the Perfiliev/SqueezeMetrics assumption)
+    pos_conf = 100
+    pos_warnings = []
+    pcr = levels['pcr']
+    if pcr < 0.5:
+        pos_conf -= 40
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — heavy speculative call buying, dealers likely short calls')
+    elif pcr < 0.7:
+        pos_conf -= 25
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — call-heavy flow suggests dealers short calls')
+    elif pcr < 0.85:
+        pos_conf -= 10
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — mild call skew')
+
+    otm_call_oi = int(df[df['strike'] > spot]['call_oi'].sum())
+    total_call_oi = levels['total_call_oi']
+    if total_call_oi > 0 and (otm_call_oi / total_call_oi) > 0.6:
+        pos_conf -= 15
+        pos_warnings.append(f'{otm_call_oi/total_call_oi*100:.0f}% of call OI is OTM — speculative accumulation')
+
+    total_call_vol = int(df['call_volume'].sum())
+    total_put_vol = int(df['put_volume'].sum())
+    call_voi = total_call_vol / max(total_call_oi, 1)
+    put_voi = total_put_vol / max(levels['total_put_oi'], 1)
+    if put_voi > 0 and call_voi > 2 * put_voi:
+        pos_conf -= 10
+        pos_warnings.append(f'Call V/OI {call_voi:.2f} vs put V/OI {put_voi:.2f} — active speculative call turnover')
+
+    if total_call_oi > 0:
+        max_call_oi_strike = int(df['call_oi'].max())
+        if (max_call_oi_strike / total_call_oi) > 0.2:
+            pos_conf -= 10
+            pos_warnings.append(f'Single strike holds {max_call_oi_strike/total_call_oi*100:.0f}% of call OI — concentrated speculative bet')
+
+    levels['positioning_confidence'] = max(0, min(100, pos_conf))
+    levels['positioning_warnings'] = pos_warnings
+
     # Resistance / support
     levels['resistance'] = df[df['net_gex'] > 0].nlargest(3, 'net_gex')['strike'].tolist()
     levels['support'] = df[df['net_gex'] < 0].nsmallest(3, 'net_gex')['strike'].tolist()
@@ -1037,6 +1075,8 @@ def run_analysis(ticker='IBIT'):
             'active_gex_total': lvl.get('active_gex_total', 0),
             'active_call_wall_btc': round(lvl.get('active_call_wall', lvl['call_wall']) / bps),
             'active_put_wall_btc': round(lvl.get('active_put_wall', lvl['put_wall']) / bps),
+            'positioning_confidence': lvl.get('positioning_confidence', 100),
+            'positioning_warnings': lvl.get('positioning_warnings', []),
             'levels': lvl,
             'expected_move': d['expected_move'],
             'breakout': {
@@ -1101,6 +1141,8 @@ If a "changes_vs_prev" field is present for a timeframe, it contains day-over-da
 This context is critical — a static snapshot is less useful than understanding the direction of positioning changes.
 
 Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new since yesterday. It surfaces where FRESH dealer exposure is concentrated vs stale "zombie gamma" from old positions. Active call/put walls show where the freshest positioning is strongest.
+
+Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)

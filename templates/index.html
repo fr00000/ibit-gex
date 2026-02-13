@@ -55,6 +55,16 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .hdr-regime{font-size:9px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;padding:2px 8px;border-radius:2px}
 .regime-neg{background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)}
 .regime-pos{background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)}
+/* CONFIDENCE BADGE */
+.hdr-conf{font-size:9px;font-weight:600;letter-spacing:.6px;padding:2px 7px;border-radius:2px;cursor:default;position:relative}
+.hdr-conf:hover .conf-tip{display:block}
+.conf-hi{background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)}
+.conf-mid{background:var(--amber-bg);color:var(--amber);border:1px solid rgba(255,176,32,.2)}
+.conf-lo{background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)}
+.conf-tip{display:none;position:absolute;top:100%;right:0;margin-top:6px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:6px 9px;font-size:9px;color:var(--t2);line-height:1.5;width:280px;white-space:normal;z-index:30;box-shadow:0 4px 12px rgba(0,0,0,.5);font-weight:400;letter-spacing:0}
+.conf-tip strong{color:var(--t1);display:block;margin-bottom:3px}
+.conf-tip .cw{margin-top:3px;padding-top:3px;border-top:1px solid var(--border)}
+
 .hdr-right{margin-left:auto;display:flex;align-items:center;gap:10px}
 .hdr-ts{color:var(--t3);font-size:10px}
 .hdr-btn{background:none;border:1px solid var(--border2);color:var(--t3);padding:3px 10px;border-radius:2px;cursor:pointer;font-family:var(--mono);font-size:10px;transition:all .15s}
@@ -227,6 +237,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="hdr-sub" id="hdr-ibit"></div>
   <div class="hdr-sep"></div>
   <div class="hdr-regime" id="hdr-regime">---</div>
+  <div class="hdr-conf" id="hdr-conf" style="display:none"></div>
   <div class="hdr-right">
     <div class="hdr-ts" id="hdr-time"></div>
     <div class="hdr-sep"></div>
@@ -617,6 +628,20 @@ async function loadData(){
     const neg=data.levels.regime==='negative_gamma';
     re.className=`hdr-regime ${neg?'regime-neg':'regime-pos'}`;
     re.textContent=neg?'\u25bc NEG GAMMA':'\u25b2 POS GAMMA';
+    // Positioning confidence badge
+    const conf=data.levels.positioning_confidence;
+    const confEl=document.getElementById('hdr-conf');
+    if(conf!=null){
+      const cc=conf>75?'conf-hi':conf>40?'conf-mid':'conf-lo';
+      const warnings=data.levels.positioning_warnings||[];
+      let tip=`<strong>Positioning Confidence: ${conf}%</strong>`;
+      tip+=`How much to trust GEX behavioral labels (walls as resistance/support).`;
+      if(warnings.length){tip+=warnings.map(w=>`<div class="cw">\u26a0 ${esc(w)}</div>`).join('')}
+      else{tip+=`<div class="cw" style="color:var(--green)">No concerns — standard assumption likely holds</div>`}
+      confEl.className=`hdr-conf ${cc}`;
+      confEl.innerHTML=`${conf}%<div class="conf-tip">${tip}</div>`;
+      confEl.style.display='';
+    }else{confEl.style.display='none'}
     const exps=data.expirations||[];
     if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
     else document.getElementById('hdr-exp').textContent='';
