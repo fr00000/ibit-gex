@@ -837,10 +837,25 @@ def _bg_refresh():
                         print(f"  [bg-refresh] DTE {futures[fut]} error: {e}")
 
         if all_fresh:
-            # Auto-run AI analysis if not already cached for today
-            if not get_cached_analysis('IBIT'):
+            # Auto-run AI analysis if not cached, or re-run if BTC moved >2%
+            cached_analysis = get_cached_analysis('IBIT')
+            should_run = False
+            if not cached_analysis:
+                should_run = True
+            elif cached_analysis.get('_btc_price'):
                 try:
-                    print("  [bg-refresh] All DTEs fresh — running AI analysis...")
+                    current_btc = yf.Ticker("BTC-USD").info.get('regularMarketPrice')
+                    if current_btc:
+                        old_btc = cached_analysis['_btc_price']
+                        pct_move = abs(current_btc - old_btc) / old_btc * 100
+                        if pct_move > 2:
+                            print(f"  [bg-refresh] BTC moved {pct_move:.1f}% since last analysis (${old_btc:,.0f} → ${current_btc:,.0f})")
+                            should_run = True
+                except Exception:
+                    pass
+            if should_run:
+                try:
+                    print("  [bg-refresh] Running AI analysis...")
                     run_analysis('IBIT')
                     print("  [bg-refresh] AI analysis complete and cached")
                 except Exception as e:
@@ -914,8 +929,11 @@ def get_prev_analysis(ticker):
     return None, None
 
 
-def set_cached_analysis(ticker, analysis):
-    """Cache AI analysis for today."""
+def set_cached_analysis(ticker, analysis, btc_price=None):
+    """Cache AI analysis for today, with the BTC price at analysis time."""
+    if btc_price is not None:
+        analysis['_btc_price'] = btc_price
+        analysis['_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
     conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
@@ -1074,7 +1092,13 @@ IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "al
         analysis = json.loads(raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f'Failed to parse LLM response: {e}. Raw: {raw[:500]}')
-    set_cached_analysis(ticker, analysis)
+    # Store BTC price at analysis time for staleness checks
+    btc_price = None
+    for dte in dtes:
+        if dte in results and results[dte].get('btc_spot'):
+            btc_price = results[dte]['btc_spot']
+            break
+    set_cached_analysis(ticker, analysis, btc_price)
     return analysis
 
 
