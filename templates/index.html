@@ -690,6 +690,8 @@ async function runAnalysis(){
 try{initTV()}catch(e){console.warn('TV init:',e)}
 loadData();
 loadAnalysis();
+// Auto-refresh GEX data every 30 min to match backend check interval
+setInterval(()=>{loadData();loadAnalysis()},30*60*1000);
 </script>
 </body>
 </html>
