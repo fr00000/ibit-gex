@@ -315,11 +315,17 @@ function startBtcWs(tf){
     `wss://stream.binance.com:9443/ws/btcusdt@kline_${tf}`,
     `wss://stream.binance.us:9443/ws/btcusdt@kline_${tf}`
   ];
-  let idx=0;
+  let idx=0,retryDelay=1000;
   function connect(){
-    if(idx>=wsUrls.length){console.warn('BTC WebSocket: all sources failed');return}
+    if(idx>=wsUrls.length){
+      // All sources exhausted — retry from the beginning with backoff
+      console.warn(`BTC WebSocket: all sources failed, retrying in ${retryDelay/1000}s`);
+      setTimeout(()=>{idx=0;connect()},retryDelay);
+      retryDelay=Math.min(retryDelay*2,60000);
+      return;
+    }
     const ws=new WebSocket(wsUrls[idx]);
-    ws.onopen=()=>{console.log('BTC WebSocket connected:',wsUrls[idx])};
+    ws.onopen=()=>{console.log('BTC WebSocket connected:',wsUrls[idx]);retryDelay=1000};
     ws.onmessage=e=>{
       try{
         const msg=JSON.parse(e.data);
