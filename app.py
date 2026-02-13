@@ -204,6 +204,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     # Collect options data
     strike_data = {}
+    cached_chains = {}  # exp_str -> chain, reused for expected move
     for exp_str in selected_exps:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         T = max((exp_date - now).days / 365.0, 0.5 / 365)
@@ -211,6 +212,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             chain = ticker.option_chain(exp_str)
         except Exception:
             continue
+        cached_chains[exp_str] = chain
 
         for opt_type, df_chain, sign in [('call', chain.calls, 1), ('put', chain.puts, -1)]:
             for _, row in df_chain.iterrows():
@@ -312,11 +314,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     # OI magnets
     levels['oi_magnets'] = df.nlargest(5, 'total_oi')[['strike', 'total_oi', 'call_oi', 'put_oi']].to_dict('records')
 
-    # Expected move
+    # Expected move (reuse cached chain instead of re-fetching)
     expected_move = None
     try:
         nearest_exp = selected_exps[0]
-        ch = ticker.option_chain(nearest_exp)
+        ch = cached_chains[nearest_exp]
         atm_c = ch.calls.iloc[(ch.calls['strike'] - spot).abs().argsort()[:1]]
         atm_p = ch.puts.iloc[(ch.puts['strike'] - spot).abs().argsort()[:1]]
         straddle = (atm_c['bid'].values[0] + atm_c['ask'].values[0]) / 2 + \
