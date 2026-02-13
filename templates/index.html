@@ -99,7 +99,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .cell-label::before{content:'';display:inline-block;width:6px;height:6px;border-radius:1px}
 .cell-gex .cell-label::before{background:var(--amber)}
 .cell-oi .cell-label::before{background:var(--blue)}
-.cell-flow .cell-label::before{background:var(--blue)}
+.cell-flow .cell-label::before{background:var(--green)}
 .cell canvas{flex:1;min-height:0}
 
 /* RIGHT PANEL */
@@ -500,8 +500,8 @@ function renderOI(data){
 function renderFlowChart(flows){
   if(typeof Chart==='undefined')return;
   const ctx=document.getElementById('flow-chart');
+  if(!flows || !flows.length){if(flowChart){flowChart.destroy();flowChart=null}return}
   if(flowChart)flowChart.destroy();
-  if(!flows.length)return;
   const labels=flows.map(d=>d.date.slice(5));
   const vals=flows.map(d=>(d.flow||0)/1e6);
   const colors=vals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
