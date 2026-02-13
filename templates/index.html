@@ -287,6 +287,7 @@ const fB=n=>`$${Math.round(n).toLocaleString()}`;
 const fO=n=>n.toLocaleString();
 const fP=n=>`${n>=0?'+':''}${n.toFixed(1)}%`;
 const fG=n=>{const a=Math.abs(n);if(a>=1e6)return `${n<0?'-':''}$${(a/1e6).toFixed(1)}M`;if(a>=1e3)return `${n<0?'-':''}$${(a/1e3).toFixed(0)}K`;return `$${Math.round(n)}`};
+const esc=s=>{if(!s)return '';const d=document.createElement('div');d.textContent=s;return d.innerHTML};
 
 function initTV(){
   if(typeof LightweightCharts==='undefined')return;
@@ -464,8 +465,8 @@ function renderSidebar(data){
         dh=`<span class="sl-delta ${cls}">${ar}${Math.abs(sl.oi_delta.delta).toLocaleString()} ${sl.oi_delta.status}</span>`;
       }
       h+=`<div class="sl-row"><div class="sl-top"><span><span class="sl-price">${fB(sl.btc)}</span> ${db(sl.strike)}</span><span class="sl-oi">${fO(sl.total_oi)}${dh}</span></div>`;
-      h+=`<div class="sl-beh">${sl.behavior}</div>`;
-      if(sl.greeks_note)h+=`<div class="sl-greeks">${sl.greeks_note}</div>`;
+      h+=`<div class="sl-beh">${esc(sl.behavior)}</div>`;
+      if(sl.greeks_note)h+=`<div class="sl-greeks">${esc(sl.greeks_note)}</div>`;
       h+=`</div>`;
     });
     h+=`</div>`;
@@ -477,14 +478,14 @@ function renderSidebar(data){
   if(bo.up_score>0){
     const dots=Array.from({length:5},(_,i)=>`<div class="bo-dot ${i<bo.up_score?'bo-dot-g':'bo-dot-e'}"></div>`).join('');
     h+=`<div class="bo-dir bo-up"><div class="bo-hdr"><span class="bo-label" style="color:var(--green)">\u25b2 UP (${bo.up_score})</span><div class="bo-dots">${dots}</div></div>`;
-    bo.up_signals.forEach(s=>{h+=`<div class="bo-sig">\u2022 ${s}</div>`});
+    bo.up_signals.forEach(s=>{h+=`<div class="bo-sig">\u2022 ${esc(s)}</div>`});
     if(bo.up_targets.length)h+=`<div class="bo-tgt">Targets: ${bo.up_targets.map(t=>fB(t.btc)).join(', ')}</div>`;
     h+=`</div>`;
   }
   if(bo.down_score>0){
     const dots=Array.from({length:5},(_,i)=>`<div class="bo-dot ${i<bo.down_score?'bo-dot-r':'bo-dot-e'}"></div>`).join('');
     h+=`<div class="bo-dir bo-dn"><div class="bo-hdr"><span class="bo-label" style="color:var(--red)">\u25bc DN (${bo.down_score})</span><div class="bo-dots">${dots}</div></div>`;
-    bo.down_signals.forEach(s=>{h+=`<div class="bo-sig">\u2022 ${s}</div>`});
+    bo.down_signals.forEach(s=>{h+=`<div class="bo-sig">\u2022 ${esc(s)}</div>`});
     if(bo.down_targets.length)h+=`<div class="bo-tgt">Targets: ${bo.down_targets.map(t=>fB(t.btc)).join(', ')}</div>`;
     h+=`</div>`;
   }
@@ -532,7 +533,7 @@ function renderSidebar(data){
       h+=`</div>`;
     }
 
-    h+=`<div class="ff-note">${ff.regime_note}</div>`;
+    h+=`<div class="ff-note">${esc(ff.regime_note)}</div>`;
     h+=`</div>`;
   }
 
@@ -620,7 +621,7 @@ async function loadData(){
 
   }catch(e){
     console.error(e);
-    document.getElementById('sidebar').innerHTML=`<div class="sec" style="color:var(--red)">Error: ${e.message}<br><br><button class="hdr-btn" onclick="loadData()">RETRY</button></div>`;
+    document.getElementById('sidebar').innerHTML=`<div class="sec" style="color:var(--red)">Error: ${esc(e.message)}<br><br><button class="hdr-btn" onclick="loadData()">RETRY</button></div>`;
   }
   document.getElementById('loading').classList.add('hidden');
 }
@@ -643,7 +644,8 @@ function renderAiPanel(){
 }
 
 function formatAiText(text){
-  return text
+  // Escape HTML first to prevent XSS from LLM output, then apply safe formatting
+  return esc(text)
     .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
     .replace(/\n/g,'<br>');
 }
