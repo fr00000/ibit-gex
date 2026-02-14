@@ -251,6 +251,298 @@ def get_history(conn, ticker, days=10):
     return c.fetchall()
 
 
+def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
+    """Compress 10 days of snapshots into trend signals for AI analysis."""
+    history = get_history(conn, ticker, 10)
+    if not history or len(history) < 2:
+        return None
+
+    # history rows: (date, spot, btc_price, gamma_flip, call_wall, put_wall,
+    #                max_pain, regime, net_gex, total_call_oi, total_put_oi, weighted_net_gex)
+    # Rows are DESC order (newest first)
+    n = len(history)
+
+    # ── Regime streak ──
+    current_regime = history[0][7]
+    streak = 1
+    for i in range(1, n):
+        if history[i][7] == current_regime:
+            streak += 1
+        else:
+            break
+    prior_regime = history[streak][7] if streak < n else None
+    regime_abbrev = ['pos' if h[7] == 'positive_gamma' else 'neg' for h in history]
+
+    regime_streak = {
+        'current_regime': current_regime,
+        'streak_days': streak,
+        'prior_regime': prior_regime,
+        'regime_history': regime_abbrev,
+    }
+
+    # ── Helper: per-share ratio for each row ──
+    def row_bps(h):
+        """btc_per_share for a historical row: spot_ibit / btc_price."""
+        if h[2] and h[2] > 0 and h[1] and h[1] > 0:
+            return h[1] / h[2]
+        return btc_per_share
+
+    # ── Helper: direction classification ──
+    def classify_direction(values_newest_first, current_price_btc):
+        """Classify direction from a list of values (newest first)."""
+        if len(values_newest_first) < 2:
+            return 'stable', 0, None
+        recent = values_newest_first[:min(3, len(values_newest_first))]
+        net_change = recent[0] - recent[-1]
+        threshold = current_price_btc * 0.01 if current_price_btc > 0 else 0
+        if abs(net_change) <= threshold:
+            avg_val = sum(recent) / len(recent)
+            return 'stable', 0, round(avg_val)
+        elif net_change > 0:
+            return 'rising', 0, None
+        else:
+            return 'falling', 0, None
+
+    def consecutive_dir(values_newest_first):
+        """Count consecutive days moving in the same direction (newest first)."""
+        if len(values_newest_first) < 2:
+            return 0
+        first_dir = values_newest_first[0] - values_newest_first[1]
+        if first_dir == 0:
+            return 0
+        count = 1
+        for i in range(1, len(values_newest_first) - 1):
+            diff = values_newest_first[i] - values_newest_first[i + 1]
+            if (diff > 0 and first_dir > 0) or (diff < 0 and first_dir < 0):
+                count += 1
+            else:
+                break
+        return count
+
+    # ── Level migration ──
+    current_bps = btc_per_share
+    level_migration = {}
+    # (field_name, history_index, current_value)
+    level_defs = [
+        ('call_wall', 4, current_levels.get('call_wall', 0)),
+        ('put_wall', 5, current_levels.get('put_wall', 0)),
+        ('gamma_flip', 3, current_levels.get('gamma_flip', 0)),
+    ]
+    for lname, hidx, cur_ibit in level_defs:
+        # Convert each day's value to BTC
+        btc_vals = []
+        for h in history:
+            bps_h = row_bps(h)
+            val = h[hidx]
+            if val and bps_h > 0:
+                btc_vals.append(round(val / bps_h))
+            else:
+                btc_vals.append(None)
+
+        # Filter Nones
+        valid = [v for v in btc_vals if v is not None]
+        cur_btc = round(cur_ibit / current_bps) if current_bps > 0 else 0
+
+        if len(valid) < 2:
+            level_migration[lname] = {
+                'current_btc': cur_btc,
+                'direction': 'stable',
+                'change_3d_btc': None,
+                'change_5d_btc': None,
+                'held_at_btc': cur_btc,
+                'consecutive_direction': 0,
+            }
+            continue
+
+        direction, _, held_at = classify_direction(valid, cur_btc)
+        consec = consecutive_dir(valid)
+
+        change_3d = valid[0] - valid[min(2, len(valid) - 1)] if len(valid) >= 2 else None
+        change_5d = valid[0] - valid[min(4, len(valid) - 1)] if len(valid) >= 5 else None
+
+        level_migration[lname] = {
+            'current_btc': cur_btc,
+            'direction': direction,
+            'change_3d_btc': change_3d,
+            'change_5d_btc': change_5d,
+            'held_at_btc': held_at if direction == 'stable' else None,
+            'consecutive_direction': consec,
+        }
+
+    # ── GEX trend ──
+    def pct_change_nd(values, nd):
+        """Percentage change over nd days (values newest first)."""
+        if len(values) <= nd:
+            return None
+        old = values[nd]
+        if old and old != 0:
+            return round(((values[0] - old) / abs(old)) * 100, 1)
+        return None
+
+    def gex_direction(pct):
+        if pct is None:
+            return 'flat'
+        if pct > 10:
+            return 'building'
+        elif pct < -10:
+            return 'decaying'
+        return 'flat'
+
+    net_gex_vals = [h[8] for h in history if h[8] is not None]
+    w_gex_vals = [h[11] for h in history if h[11] is not None]
+
+    net_gex_3d_pct = pct_change_nd(net_gex_vals, min(3, len(net_gex_vals) - 1)) if len(net_gex_vals) >= 2 else None
+    w_gex_3d_pct = pct_change_nd(w_gex_vals, min(3, len(w_gex_vals) - 1)) if len(w_gex_vals) >= 2 else None
+
+    gex_trend = {
+        'net_gex_direction': gex_direction(net_gex_3d_pct),
+        'net_gex_3d_change_pct': net_gex_3d_pct,
+        'weighted_gex_direction': gex_direction(w_gex_3d_pct),
+        'weighted_gex_3d_change_pct': w_gex_3d_pct,
+    }
+
+    # ── OI trend ──
+    call_oi_vals = [h[9] for h in history if h[9] is not None]
+    put_oi_vals = [h[10] for h in history if h[10] is not None]
+
+    call_3d_pct = pct_change_nd(call_oi_vals, min(3, len(call_oi_vals) - 1)) if len(call_oi_vals) >= 2 else None
+    put_3d_pct = pct_change_nd(put_oi_vals, min(3, len(put_oi_vals) - 1)) if len(put_oi_vals) >= 2 else None
+
+    # PCR trend
+    pcr_vals = []
+    for h in history:
+        if h[9] and h[10] and h[9] > 0:
+            pcr_vals.append(h[10] / h[9])
+    pcr_trend = 'stable'
+    if len(pcr_vals) >= 2:
+        pcr_diff = pcr_vals[0] - pcr_vals[-1]
+        if pcr_diff > 0.05:
+            pcr_trend = 'rising'
+        elif pcr_diff < -0.05:
+            pcr_trend = 'falling'
+
+    oi_trend = {
+        'total_call_oi_direction': gex_direction(call_3d_pct),
+        'total_put_oi_direction': gex_direction(put_3d_pct),
+        'call_oi_3d_change_pct': call_3d_pct,
+        'put_oi_3d_change_pct': put_3d_pct,
+        'pcr_trend': pcr_trend,
+    }
+
+    # ── Range evolution ──
+    cw_btc_vals = []
+    pw_btc_vals = []
+    for h in history:
+        bps_h = row_bps(h)
+        if h[4] and h[5] and bps_h > 0:
+            cw_btc_vals.append(round(h[4] / bps_h))
+            pw_btc_vals.append(round(h[5] / bps_h))
+
+    range_current = cw_btc_vals[0] - pw_btc_vals[0] if cw_btc_vals and pw_btc_vals else None
+    range_3d_ago = (cw_btc_vals[min(2, len(cw_btc_vals) - 1)] - pw_btc_vals[min(2, len(pw_btc_vals) - 1)]) if len(cw_btc_vals) >= 2 else None
+
+    # Range trend
+    range_trend = 'stable'
+    if range_current is not None and range_3d_ago is not None:
+        range_diff = range_current - range_3d_ago
+        threshold = range_current * 0.1 if range_current > 0 else 0
+        if range_diff > threshold:
+            range_trend = 'expanding'
+        elif range_diff < -threshold:
+            range_trend = 'contracting'
+
+    # Range bias
+    range_bias = 'stable'
+    if len(cw_btc_vals) >= 2 and len(pw_btc_vals) >= 2:
+        cw_chg = cw_btc_vals[0] - cw_btc_vals[-1]
+        pw_chg = pw_btc_vals[0] - pw_btc_vals[-1]
+        cw_thresh = cw_btc_vals[0] * 0.01 if cw_btc_vals[0] > 0 else 0
+        pw_thresh = pw_btc_vals[0] * 0.01 if pw_btc_vals[0] > 0 else 0
+        cw_rising = cw_chg > cw_thresh
+        cw_falling = cw_chg < -cw_thresh
+        pw_rising = pw_chg > pw_thresh
+        pw_falling = pw_chg < -pw_thresh
+
+        if cw_rising and pw_rising:
+            range_bias = 'upward_shift'
+        elif cw_falling and pw_falling:
+            range_bias = 'downward_shift'
+        elif cw_rising and pw_falling:
+            range_bias = 'expanding_symmetric'
+        elif cw_falling and pw_rising:
+            range_bias = 'contracting'
+        elif cw_rising and not pw_rising and not pw_falling:
+            range_bias = 'expanding_upward'
+        elif cw_falling and not pw_rising and not pw_falling:
+            range_bias = 'contracting_from_above'
+        elif pw_falling and not cw_rising and not cw_falling:
+            range_bias = 'expanding_downward'
+        elif pw_rising and not cw_rising and not cw_falling:
+            range_bias = 'contracting_from_below'
+
+    range_evolution = {
+        'range_width_current_btc': range_current,
+        'range_width_3d_ago_btc': range_3d_ago,
+        'range_trend': range_trend,
+        'range_bias': range_bias,
+    }
+
+    # ── Narrative ──
+    regime_str = 'Positive gamma' if current_regime == 'positive_gamma' else 'Negative gamma'
+    parts = [f"{regime_str} regime for {streak} day{'s' if streak != 1 else ''}"]
+
+    # Dominant level movement
+    cw_mig = level_migration.get('call_wall', {})
+    pw_mig = level_migration.get('put_wall', {})
+    if cw_mig.get('direction') == 'rising' and pw_mig.get('direction') == 'rising':
+        chg = cw_mig.get('change_5d_btc') or cw_mig.get('change_3d_btc')
+        suffix = f" +${chg:,}" if chg else ""
+        nd = '5d' if cw_mig.get('change_5d_btc') else '3d'
+        parts.append(f"walls migrating upward{suffix} over {nd}")
+    elif cw_mig.get('direction') == 'falling' and pw_mig.get('direction') == 'falling':
+        chg = cw_mig.get('change_5d_btc') or cw_mig.get('change_3d_btc')
+        suffix = f" {chg:,}" if chg else ""
+        nd = '5d' if cw_mig.get('change_5d_btc') else '3d'
+        parts.append(f"walls migrating downward{suffix} over {nd}")
+    elif range_trend == 'contracting':
+        parts.append("range contracting")
+    elif range_trend == 'expanding':
+        parts.append("range expanding")
+    elif cw_mig.get('direction') != 'stable' or pw_mig.get('direction') != 'stable':
+        moves = []
+        if cw_mig.get('direction') == 'rising':
+            moves.append("call wall rising")
+        elif cw_mig.get('direction') == 'falling':
+            moves.append("call wall decaying")
+        if pw_mig.get('direction') == 'rising':
+            moves.append("put wall rising")
+        elif pw_mig.get('direction') == 'falling':
+            moves.append("put wall falling")
+        if moves:
+            parts.append(", ".join(moves))
+
+    # OI context
+    if oi_trend['total_call_oi_direction'] == 'building' and oi_trend['total_put_oi_direction'] == 'building':
+        parts.append("OI building on both sides")
+    elif oi_trend['total_call_oi_direction'] == 'decaying' and oi_trend['total_put_oi_direction'] == 'decaying':
+        parts.append("OI unwinding")
+    elif oi_trend['total_call_oi_direction'] == 'building':
+        parts.append("call OI building")
+    elif oi_trend['total_put_oi_direction'] == 'building':
+        parts.append("put OI building")
+
+    narrative = " — ".join(parts[:3])
+
+    return {
+        'regime_streak': regime_streak,
+        'level_migration': level_migration,
+        'gex_trend': gex_trend,
+        'oi_trend': oi_trend,
+        'range_evolution': range_evolution,
+        'narrative': narrative,
+    }
+
+
 def fetch_etf_flows(ticker_symbol):
     """Calculate daily ETF fund flows from shares outstanding changes."""
     try:
@@ -1757,8 +2049,14 @@ def run_analysis(ticker='IBIT'):
             dte, data = fut.result()
             results[dte] = data
 
+    # Compute history trends (ticker-level, shared across all DTEs)
+    conn = get_db()
+    history_trends = summarize_history_trends(conn, ticker, results[dtes[0]]['btc_per_share'], results[dtes[0]]['levels'])
+    conn.close()
+
     # Build concise summaries (strip chart data to keep prompt small)
     summaries = {}
+    summaries['_history_trends'] = history_trends
     for dte in dtes:
         d = results[dte]
         bps = d['btc_per_share']
@@ -1816,6 +2114,19 @@ def run_analysis(ticker='IBIT'):
                 for sl in d['significant_levels'][:8]
             ],
             'dealer_delta_briefing': d.get('dealer_delta_briefing'),
+            'delta_flip_points': [
+                {
+                    'price_btc': fp['price_btc'],
+                    'distance_pct': round(((fp['price_ibit'] - d['spot']) / d['spot']) * 100, 1),
+                    'from_direction': fp['from_direction'],
+                    'to_direction': fp['to_direction'],
+                }
+                for fp in (d.get('delta_flip_points') or [])
+            ],
+            'key_level_dealer_delta_btc': {
+                name: round(delta * d['btc_per_share']) if delta is not None else None
+                for name, delta in (d.get('dealer_delta_briefing', {}).get('key_level_deltas', {}) or {}).items()
+            } if d.get('dealer_delta_briefing') else None,
         }
 
         # Add day-over-day level changes if previous data exists
@@ -1863,22 +2174,43 @@ ETF fund flows (etf_flows) show daily creation/redemption activity. Positive = i
 
 Weighted GEX (net_gex_w_total) applies DTE-based time weighting: 1/sqrt(DTE/max_DTE). Near-term expirations contribute disproportionately more gamma exposure. This makes levels more responsive to imminent expiry dynamics. Use net_gex_w_total as the primary GEX measure. The level_trajectory field shows whether key levels (call_wall, put_wall, gamma_flip) are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
+Historical Trends (_history_trends): A compressed summary of the last 10 daily snapshots, shared across all timeframes. This is NOT per-DTE — it reflects the ticker's overall positioning evolution.
+- regime_streak: How many days the current gamma regime has held. A streak of 3+ days means the regime is established, not transitional. A streak of 1 means it just flipped — watch for reversion.
+- level_migration: Direction and magnitude of key level movements over 3d and 5d windows. Rising walls with a long streak = strong directional positioning. Stable walls held at a specific price = anchored range. Use consecutive_direction to gauge conviction.
+- gex_trend: Whether overall gamma exposure is building (market adding options, levels strengthening) or decaying (positions unwinding, levels weakening).
+- oi_trend: Call and put OI direction separately. Divergences matter: call OI building + put OI decaying = bullish positioning shift.
+- range_evolution: Whether the tradeable range (call wall to put wall) is expanding, contracting, or shifting directionally. 'Contracting' often precedes a breakout. 'Expanding_symmetric' means both sides being defended.
+- narrative: One-line summary of the dominant trend pattern.
+
+Use history_trends to contextualize today's snapshot. A call wall at $107K means different things if it's been there for 7 days (strong, tested resistance) vs if it jumped there overnight (new, untested). Always mention regime streak length and level migration direction in your analysis.
+
 Dealer Delta Scenario Analysis (dealer_delta_briefing): Pre-computed dealer hedging pressure at hypothetical price levels across the key level grid. 'current_delta' shows dealer positioning at spot. 'flip_summary' identifies where dealer pressure reverses direction. 'acceleration_zone' shows where dealers are most reactive to price moves. Negative dealer delta = dealers must BUY to hedge = supportive (acts as a bid). Positive dealer delta = dealers must SELL = resistive (acts as an offer). Use this to identify price levels where dealer hedging creates natural support or resistance, independent of the GEX profile.
+
+When analyzing dealer delta alongside GEX levels, look for CONVERGENCE and DIVERGENCE:
+- CONVERGENCE (high conviction): Put wall at $98K + dealers net buyers at $98K + level STRENGTHENING = strong support. Trade it.
+- DIVERGENCE (caution): Call wall at $105K but dealers still net buyers at $105K = wall may not hold because dealer hedging flow supports upside through it.
+- ACCELERATION ZONES: Where dealer delta changes fastest (high acceleration), small price moves trigger large hedging flows. These are inflection points — price tends to move quickly through these zones rather than consolidate.
+- DELTA FLIP vs GAMMA FLIP: These are different concepts. Gamma flip = where net GEX crosses zero (regime change). Delta flip = where dealer hedging direction reverses. When they're at different prices, the zone between them is a transition zone with mixed signals.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)
 - Regime summary and implication (1-2 sentences)
-- Key levels in BTC price and their significance relative to spot
+- Historical context: Reference regime streak, level migration trends, and range evolution from _history_trends. Is today's positioning a continuation or a change?
+- Key levels in BTC price with level trajectory status (STRENGTHENING/WEAKENING/STABLE) and dominant expiry if near-term. Example: "Call wall $108,200 (STRENGTHENING, driven by Feb 21 exp — 3 DTE)"
+- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta_btc.
 - Dealer flow direction (charm/vanna implications)
-- Risk assessment
-- Actionable setup (if any clear one exists)
+- Risk assessment — specifically note where dealer delta ACCELERATES (acceleration_zone), as these are prices where moves become self-reinforcing
+- Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
 
 If a previous analysis is provided, use it to:
 - Note whether your prior calls played out or not (e.g. "yesterday's $65K support held as expected" or "prior upside bias was invalidated")
 - Update your thesis based on how positioning evolved
 - Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
-For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes.
+For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
+- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful.
+- Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
+- What is the highest-conviction zone where GEX levels, dealer delta direction, level trajectory, and ETF flows ALL agree?
 
 Keep each analysis to 4-6 bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
