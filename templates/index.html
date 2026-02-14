@@ -598,7 +598,9 @@ function renderSidebar(data){
   if(!bo.up_score&&!bo.down_score)h+=`<div style="font-size:10px;color:var(--t3)">No breakout signals</div>`;
   const bc=bo.bias==='upside'?'var(--green)':bo.bias==='downside'?'var(--red)':'var(--t3)';
   const bt=bo.bias==='upside'?'\u25b2 BIAS: UPSIDE':bo.bias==='downside'?'\u25bc BIAS: DOWNSIDE':'\u2014 BALANCED';
-  h+=`<div class="bias-box" style="color:${bc}">${bt}</div></div>`;
+  h+=`<div class="bias-box" style="color:${bc}">${bt}</div>`;
+  if(bo.em_note)h+=`<div style="font-size:9px;color:var(--amber);margin-top:4px;padding:3px 6px;background:var(--amber-bg);border:1px solid rgba(255,176,32,.15);border-radius:2px">\u26a0 ${esc(bo.em_note)}</div>`;
+  h+=`</div>`;
 
   // Dealer Flow Forecast (Vanna + Charm)
   if(data.flow_forecast){
