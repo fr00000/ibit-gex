@@ -253,6 +253,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="hdr-regime" id="hdr-regime">---</div>
   <div class="hdr-conf" id="hdr-conf" style="display:none"></div>
   <div class="hdr-flow" id="hdr-flow" style="display:none"></div>
+  <div style="font-size:9px;font-weight:600;letter-spacing:.6px;padding:2px 7px;border-radius:2px;background:var(--blue-bg);color:var(--blue);border:1px solid rgba(56,144,255,.15)">DTE WEIGHTED</div>
   <div class="hdr-right">
     <div class="hdr-ts" id="hdr-time"></div>
     <div class="hdr-sep"></div>
@@ -292,7 +293,12 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   </div>
   <div class="bottom" style="background:var(--border)">
     <div class="cell cell-gex">
-      <div class="cell-label">GEX Profile</div>
+      <div class="cell-label">GEX Profile
+        <span style="margin-left:auto;display:flex;gap:2px">
+          <button class="gex-mode-btn active" id="gex-mode-w" onclick="setGexMode('weighted')" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 6px;border-radius:2px;border:1px solid var(--blue);background:var(--blue);color:var(--bg);cursor:pointer">WEIGHTED</button>
+          <button class="gex-mode-btn" id="gex-mode-r" onclick="setGexMode('raw')" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 6px;border-radius:2px;border:1px solid var(--border2);background:none;color:var(--t3);cursor:pointer">RAW</button>
+        </span>
+      </div>
       <canvas id="gex-chart"></canvas>
     </div>
     <div class="cell cell-oi">
@@ -314,6 +320,7 @@ let aiData=null;
 let btcWs=null;
 let currentTicker='IBIT';
 let _loadSeq=0;
+let gexMode='weighted';
 const TICKER_WS={IBIT:'btcusdt',ETHA:'ethusdt'};
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
 const fB=n=>`$${Math.round(n).toLocaleString()}`;
@@ -321,6 +328,32 @@ const fO=n=>n.toLocaleString();
 const fP=n=>`${n>=0?'+':''}${n.toFixed(1)}%`;
 const fG=n=>{const a=Math.abs(n);if(a>=1e6)return `${n<0?'-':''}$${(a/1e6).toFixed(1)}M`;if(a>=1e3)return `${n<0?'-':''}$${(a/1e3).toFixed(0)}K`;return `$${Math.round(n)}`};
 const esc=s=>{if(!s)return '';const d=document.createElement('div');d.textContent=s;return d.innerHTML};
+
+function setGexMode(mode){
+  gexMode=mode;
+  const wBtn=document.getElementById('gex-mode-w'),rBtn=document.getElementById('gex-mode-r');
+  if(mode==='weighted'){
+    wBtn.style.background='var(--blue)';wBtn.style.color='var(--bg)';wBtn.style.borderColor='var(--blue)';
+    rBtn.style.background='none';rBtn.style.color='var(--t3)';rBtn.style.borderColor='var(--border2)';
+  }else{
+    rBtn.style.background='var(--blue)';rBtn.style.color='var(--bg)';rBtn.style.borderColor='var(--blue)';
+    wBtn.style.background='none';wBtn.style.color='var(--t3)';wBtn.style.borderColor='var(--border2)';
+  }
+  if(window._lastData)renderGEX(window._lastData);
+}
+
+function generateExpiryPalette(count){
+  const palette=[];
+  for(let i=0;i<count;i++){
+    const t=count>1?i/(count-1):0;
+    const opacity=1.0-t*0.7; // nearest=1.0, farthest=0.3
+    palette.push({
+      pos:`rgba(0,220,130,${opacity.toFixed(2)})`,
+      neg:`rgba(255,64,96,${opacity.toFixed(2)})`
+    });
+  }
+  return palette;
+}
 
 function switchTicker(tk){
   if(tk===currentTicker)return;
@@ -438,41 +471,94 @@ function renderGEX(data){
   const ctx=document.getElementById('gex-chart');
   if(gexChart)gexChart.destroy();
   const labels=data.gex_chart.map(d=>fB(d.btc));
-  const netVals=data.gex_chart.map(d=>d.net_gex);
-  const activeVals=data.gex_chart.map(d=>d.active_gex!=null?d.active_gex:d.net_gex);
-  // Stale = total - active (the portion of GEX from old OI)
-  const staleVals=netVals.map((v,i)=>v-activeVals[i]);
-  const staleCols=staleVals.map(v=>v>0?'rgba(0,220,130,0.25)':'rgba(255,64,96,0.25)');
-  const activeCols=activeVals.map(v=>v>0?'#00dc82cc':'#ff4060cc');
-  gexChart=new Chart(ctx,{
-    type:'bar',
-    data:{labels,datasets:[
-      {label:'Stale GEX',data:staleVals,backgroundColor:staleCols,borderWidth:0,borderRadius:0,barPercentage:.85},
-      {label:'Active GEX',data:activeVals,backgroundColor:activeCols,borderWidth:0,borderRadius:1,barPercentage:.85}
-    ]},
-    options:{
-      responsive:true,maintainAspectRatio:false,
-      plugins:{
-        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
-        tooltip:{callbacks:{
-          title:i=>i[0].label,
-          afterBody:function(items){
-            const idx=items[0].dataIndex;
-            const d=data.gex_chart[idx];
-            const lines=[`Net GEX: ${fG(d.net_gex)}`];
-            if(d.active_gex!=null)lines.push(`Active GEX: ${fG(d.active_gex)}`);
-            if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
-            return lines;
-          },
-          label:()=>null
-        }}
-      },
-      scales:{
-        x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
-        y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
+
+  if(gexMode==='raw'){
+    // Raw mode: Active + Stale bars using raw net_gex (original behavior)
+    const netVals=data.gex_chart.map(d=>d.net_gex);
+    const activeVals=data.gex_chart.map(d=>d.active_gex!=null?d.active_gex:d.net_gex);
+    const staleVals=netVals.map((v,i)=>v-activeVals[i]);
+    const staleCols=staleVals.map(v=>v>0?'rgba(0,220,130,0.25)':'rgba(255,64,96,0.25)');
+    const activeCols=activeVals.map(v=>v>0?'#00dc82cc':'#ff4060cc');
+    gexChart=new Chart(ctx,{
+      type:'bar',
+      data:{labels,datasets:[
+        {label:'Stale GEX',data:staleVals,backgroundColor:staleCols,borderWidth:0,borderRadius:0,barPercentage:.85},
+        {label:'Active GEX',data:activeVals,backgroundColor:activeCols,borderWidth:0,borderRadius:1,barPercentage:.85}
+      ]},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{
+          legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
+          tooltip:{callbacks:{
+            title:i=>i[0].label,
+            afterBody:function(items){
+              const idx=items[0].dataIndex;
+              const d=data.gex_chart[idx];
+              const lines=[`Net GEX (raw): ${fG(d.net_gex)}`];
+              if(d.active_gex!=null)lines.push(`Active GEX: ${fG(d.active_gex)}`);
+              if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
+              return lines;
+            },
+            label:()=>null
+          }}
+        },
+        scales:{
+          x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+          y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
+        }
       }
+    });
+  }else{
+    // Weighted mode: Stacked bar chart by expiry
+    const meta=data.expiry_meta||[];
+    const exps=meta.map(m=>m.exp);
+    const palette=generateExpiryPalette(exps.length||1);
+    const datasets=[];
+    exps.forEach((exp,ei)=>{
+      const dteLabel=meta[ei]?`${meta[ei].dte}d`:'';
+      const vals=data.gex_chart.map(d=>{
+        const eb=d.expiry_breakdown||{};
+        return eb[exp]?eb[exp].net_gex_w:0;
+      });
+      const cols=vals.map(v=>v>=0?palette[ei].pos:palette[ei].neg);
+      datasets.push({
+        label:`${dteLabel} (${exp.slice(5)})`,
+        data:vals,backgroundColor:cols,borderWidth:0,borderRadius:ei===0?1:0,barPercentage:.85
+      });
+    });
+    // Fallback if no expiry breakdown available
+    if(datasets.length===0){
+      const wVals=data.gex_chart.map(d=>d.net_gex_w!=null?d.net_gex_w:d.net_gex);
+      const wCols=wVals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
+      datasets.push({label:'Weighted GEX',data:wVals,backgroundColor:wCols,borderWidth:0,borderRadius:1,barPercentage:.85});
     }
-  });
+    gexChart=new Chart(ctx,{
+      type:'bar',
+      data:{labels,datasets},
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{
+          legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
+          tooltip:{callbacks:{
+            title:i=>i[0].label,
+            afterBody:function(items){
+              const idx=items[0].dataIndex;
+              const d=data.gex_chart[idx];
+              const lines=[`Net GEX (W): ${fG(d.net_gex_w||d.net_gex)}`];
+              lines.push(`Net GEX (raw): ${fG(d.net_gex)}`);
+              if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
+              return lines;
+            },
+            label:()=>null
+          }}
+        },
+        scales:{
+          x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+          y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
+        }
+      }
+    });
+  }
 }
 
 function renderOI(data){
@@ -555,8 +641,17 @@ function renderSidebar(data){
 
   // Key Levels
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--blue)"></span>Key Levels</div>`;
-  [{n:'Call Wall',s:lv.call_wall,c:'var(--green)'},{n:'Gamma Flip',s:lv.gamma_flip,c:'var(--amber)'},{n:'Max Pain',s:lv.max_pain,c:'var(--purple)'},{n:'Put Wall',s:lv.put_wall,c:'var(--red)'}].forEach(k=>{
-    h+=`<div class="kl-row"><span class="kl-name" style="color:${k.c}">${k.n}</span><div class="kl-vals"><span class="kl-btc">${b(k.s)}</span><span class="kl-ibit">$${k.s.toFixed(2)}</span>${db(k.s)}</div></div>`;
+  const traj=lv.level_trajectory||{};
+  [{n:'Call Wall',s:lv.call_wall,c:'var(--green)',tk:'call_wall'},{n:'Gamma Flip',s:lv.gamma_flip,c:'var(--amber)',tk:'gamma_flip'},{n:'Max Pain',s:lv.max_pain,c:'var(--purple)',tk:null},{n:'Put Wall',s:lv.put_wall,c:'var(--red)',tk:'put_wall'}].forEach(k=>{
+    let badge='';
+    if(k.tk&&traj[k.tk]){
+      const t=traj[k.tk];
+      const sc=t.status==='STRENGTHENING'?'sld-b':t.status==='WEAKENING'?'sld-d':'sld-s';
+      const ar=t.status==='STRENGTHENING'?'\u2191':t.status==='WEAKENING'?'\u2193':'\u2194';
+      badge=`<span class="sl-delta ${sc}" style="margin-left:4px">${ar}${t.status}</span>`;
+      if(t.dominant_expiry_dte!=null)badge+=`<span style="font-size:8px;color:var(--t3);margin-left:3px">${t.dominant_expiry_dte}d</span>`;
+    }
+    h+=`<div class="kl-row"><span class="kl-name" style="color:${k.c}">${k.n}${badge}</span><div class="kl-vals"><span class="kl-btc">${b(k.s)}</span><span class="kl-ibit">$${k.s.toFixed(2)}</span>${db(k.s)}</div></div>`;
   });
   h+=`</div>`;
 
@@ -684,7 +779,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position</div>`;
-  [['Net GEX',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
+  [['Net GEX (W)',fG(lv.net_gex_w_total||lv.net_gex_total)],['Net GEX (raw)',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;
