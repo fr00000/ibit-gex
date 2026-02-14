@@ -586,8 +586,18 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     # Derive levels
     levels = {}
-    levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
-    levels['put_wall'] = float(df.loc[df['put_gex'].idxmin(), 'strike'])
+    # Call wall: highest call GEX at or above spot (resistance)
+    calls_above = df[df['strike'] >= spot]
+    if not calls_above.empty:
+        levels['call_wall'] = float(calls_above.loc[calls_above['call_gex'].idxmax(), 'strike'])
+    else:
+        levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
+    # Put wall: most negative put GEX at or below spot (support)
+    puts_below = df[df['strike'] <= spot]
+    if not puts_below.empty:
+        levels['put_wall'] = float(puts_below.loc[puts_below['put_gex'].idxmin(), 'strike'])
+    else:
+        levels['put_wall'] = float(df.loc[df['put_gex'].idxmin(), 'strike'])
 
     # Gamma flip nearest to spot
     df_s = df.sort_values('strike')
@@ -1036,13 +1046,13 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
                 elif chg > 15:
                     up_signals.append(f"Put wall BUILDING: OI up +{chg:.0f}%")
 
-    # Expected move > range
-    if expected_move:
+    # Expected move vs range (non-directional — tracked separately)
+    em_note = None
+    if expected_move and cw > pw:
         em_width = expected_move['pct'] * 2
         range_width = ((cw - pw) / spot) * 100
-        if em_width > range_width:
-            up_signals.append(f"Expected move ({em_width:.1f}%) > range ({range_width:.1f}%)")
-            down_signals.append(f"Expected move ({em_width:.1f}%) > range ({range_width:.1f}%)")
+        if range_width > 0.5 and em_width > range_width:
+            em_note = f"Expected move ({em_width:.1f}%) > range ({range_width:.1f}%) — breakout likely"
 
     # Neg gamma near wall
     if regime == 'negative_gamma':
@@ -1107,6 +1117,7 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
                           'total_oi': int(t['total_oi']),
                           'net_gex': float(t['net_gex'])} for t in down_targets],
         'bias': bias,
+        'em_note': em_note,
     }
 
 
