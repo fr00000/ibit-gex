@@ -787,6 +787,23 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     # Dealer flow forecast (vanna + charm)
     flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
 
+    # Dealer delta scenario analysis
+    dealer_delta_profile = None
+    dealer_delta_briefing = None
+    delta_flip_points = []
+    try:
+        scenario_result = compute_dealer_delta_scenarios(
+            cached_chains, spot, levels, expected_move,
+            rfr, ref_per_share, is_crypto
+        )
+        dealer_delta_profile = scenario_result['profile']
+        delta_flip_points = scenario_result['flip_points']
+        dealer_delta_briefing = generate_dealer_delta_briefing(
+            scenario_result, spot, levels, ref_per_share, is_crypto
+        )
+    except Exception as e:
+        print(f"  [delta-scenario] Failed: {e}")
+
     # Save to DB
     conn = get_db()
     save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
@@ -874,6 +891,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         'etf_flows': etf_flows,
         'oi_changes': oi_changes,
         'flow_forecast': flow_forecast,
+        'dealer_delta_profile': dealer_delta_profile,
+        'dealer_delta_briefing': dealer_delta_briefing,
+        'delta_flip_points': delta_flip_points,
         'history': history_data,
         'expirations': selected_exps,
         'expiry_meta': expiry_meta,
@@ -977,6 +997,217 @@ def compute_flow_forecast(df, spot, levels, is_crypto):
             'notional': float(overnight_total * spot),
         },
         'regime_note': regime_note,
+    }
+
+
+def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, rfr, ref_per_share, is_crypto):
+    """Pre-compute dealer delta at hypothetical prices across the key level grid."""
+    cw = levels.get('call_wall', spot * 1.05)
+    pw = levels.get('put_wall', spot * 0.95)
+    gf = levels.get('gamma_flip', spot)
+    mp = levels.get('max_pain', spot)
+
+    # Build price grid
+    grid_prices = set()
+    grid_prices.update([cw, pw, gf, mp, spot])
+
+    if expected_move:
+        if expected_move.get('upper'):
+            grid_prices.add(expected_move['upper'])
+        if expected_move.get('lower'):
+            grid_prices.add(expected_move['lower'])
+
+    for s in levels.get('resistance', []):
+        grid_prices.add(s)
+    for s in levels.get('support', []):
+        grid_prices.add(s)
+
+    # 0.5% increments between put_wall and call_wall
+    step = spot * 0.005
+    if step > 0:
+        p = pw
+        while p <= cw:
+            grid_prices.add(p)
+            p += step
+
+    # Extend ±2% beyond walls
+    lo_ext = pw * 0.98
+    hi_ext = cw * 1.02
+    p = lo_ext
+    while p <= hi_ext:
+        grid_prices.add(p)
+        p += step
+
+    # Filter to reasonable range, deduplicate, sort
+    lo_bound = spot * 0.85
+    hi_bound = spot * 1.15
+    grid_prices = sorted([p for p in grid_prices if lo_bound <= p <= hi_bound])
+
+    # Cap grid to max 80 points
+    if len(grid_prices) > 80:
+        indices = np.linspace(0, len(grid_prices) - 1, 80, dtype=int)
+        grid_prices = [grid_prices[i] for i in indices]
+        # Ensure spot is in grid
+        if spot not in grid_prices:
+            grid_prices.append(spot)
+            grid_prices.sort()
+
+    now = datetime.now(timezone.utc)
+
+    # Compute dealer delta at each grid price
+    profile = []
+    for S_hyp in grid_prices:
+        net_dd = 0.0
+        call_dd = 0.0
+        put_dd = 0.0
+        for exp_str, chain in cached_chains.items():
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            T = max((exp_date - now).days / 365.0, 0.5 / 365)
+            for opt_type, df_chain, in [('call', chain.calls), ('put', chain.puts)]:
+                for _, row in df_chain.iterrows():
+                    strike = row['strike']
+                    if strike < spot * (1 - STRIKE_RANGE_PCT) or strike > spot * (1 + STRIKE_RANGE_PCT):
+                        continue
+                    oi = row.get('openInterest', 0)
+                    if pd.isna(oi) or oi == 0:
+                        continue
+                    oi = int(oi)
+                    iv = row.get('impliedVolatility', 0)
+                    if pd.isna(iv) or iv <= 0:
+                        continue
+                    delta = bs_delta(S_hyp, strike, T, rfr, iv, opt_type)
+                    dd = -delta * oi * 100
+                    net_dd += dd
+                    if opt_type == 'call':
+                        call_dd += dd
+                    else:
+                        put_dd += dd
+
+        profile.append({
+            'price_ibit': float(S_hyp),
+            'price_btc': float(S_hyp / ref_per_share) if is_crypto else float(S_hyp),
+            'net_dealer_delta': float(net_dd),
+            'call_dealer_delta': float(call_dd),
+            'put_dealer_delta': float(put_dd),
+        })
+
+    # Delta flip detection
+    flip_points = []
+    for i in range(len(profile) - 1):
+        d1 = profile[i]['net_dealer_delta']
+        d2 = profile[i + 1]['net_dealer_delta']
+        p1 = profile[i]['price_ibit']
+        p2 = profile[i + 1]['price_ibit']
+        if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
+            if (d2 - d1) != 0:
+                flip = p1 + (p2 - p1) * (-d1) / (d2 - d1)
+                from_dir = 'BUY' if d1 < 0 else 'SELL'
+                to_dir = 'SELL' if d1 < 0 else 'BUY'
+                flip_points.append({
+                    'price_ibit': float(flip),
+                    'price_btc': float(flip / ref_per_share) if is_crypto else float(flip),
+                    'from_direction': from_dir,
+                    'to_direction': to_dir,
+                })
+
+    # Hedging acceleration (rate of change of delta)
+    for i in range(len(profile)):
+        if i == 0 or i == len(profile) - 1:
+            profile[i]['acceleration'] = 0.0
+            profile[i]['accel_class'] = 'LOW'
+            continue
+        dp = profile[i + 1]['price_ibit'] - profile[i - 1]['price_ibit']
+        if dp > 0:
+            dd_change = abs(profile[i + 1]['net_dealer_delta'] - profile[i - 1]['net_dealer_delta'])
+            accel = dd_change / dp
+        else:
+            accel = 0.0
+        profile[i]['acceleration'] = float(accel)
+        if accel > 50000:
+            profile[i]['accel_class'] = 'HIGH'
+        elif accel > 10000:
+            profile[i]['accel_class'] = 'MODERATE'
+        else:
+            profile[i]['accel_class'] = 'LOW'
+
+    # Max acceleration price
+    max_accel_idx = max(range(len(profile)), key=lambda i: profile[i]['acceleration']) if profile else 0
+    max_accel_price = profile[max_accel_idx]['price_ibit'] if profile else spot
+
+    # Key level deltas
+    key_level_deltas = {}
+    for name, strike in [('call_wall', cw), ('put_wall', pw), ('gamma_flip', gf), ('max_pain', mp)]:
+        closest = min(profile, key=lambda p: abs(p['price_ibit'] - strike)) if profile else None
+        key_level_deltas[name] = closest['net_dealer_delta'] if closest else None
+
+    return {
+        'profile': profile,
+        'flip_points': flip_points,
+        'max_acceleration_price': float(max_accel_price),
+        'key_level_deltas': key_level_deltas,
+    }
+
+
+def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_crypto):
+    """Generate plain English briefing from dealer delta scenario analysis."""
+    profile = scenarios.get('profile', [])
+    flip_points = scenarios.get('flip_points', [])
+    key_level_deltas = scenarios.get('key_level_deltas', {})
+
+    if not profile:
+        return None
+
+    # Current delta (closest to spot)
+    spot_entry = min(profile, key=lambda p: abs(p['price_ibit'] - spot))
+    cur_delta = spot_entry['net_dealer_delta']
+    if cur_delta < 0:
+        current_delta = f"Dealers are net SHORT {abs(cur_delta/1e6):.1f}M shares — must BUY on dips (supportive)"
+    else:
+        current_delta = f"Dealers are net LONG {abs(cur_delta/1e6):.1f}M shares — must SELL on rallies (resistive)"
+
+    # Flip summary
+    if flip_points:
+        fp = flip_points[0]
+        price_str = f"${fp['price_btc']:,.0f}" if is_crypto else f"${fp['price_ibit']:.2f}"
+        flip_summary = f"Dealer pressure flips from {fp['from_direction'].lower()}ing to {fp['to_direction'].lower()}ing at {price_str}"
+    else:
+        direction = "buyers" if cur_delta < 0 else "sellers"
+        flip_summary = f"No flip — dealers are net {direction} across entire range"
+
+    # Acceleration zone
+    max_accel_price = scenarios.get('max_acceleration_price', spot)
+    accel_btc = max_accel_price / ref_per_share if is_crypto else max_accel_price
+    price_str = f"${accel_btc:,.0f}" if is_crypto else f"${max_accel_price:.2f}"
+    acceleration_zone = f"Heaviest rebalancing pressure near {price_str} — dealers most reactive here"
+
+    # Range bias
+    lo_entry = profile[0]
+    hi_entry = profile[-1]
+    lo_price = f"${lo_entry['price_btc']:,.0f}" if is_crypto else f"${lo_entry['price_ibit']:.2f}"
+    hi_price = f"${hi_entry['price_btc']:,.0f}" if is_crypto else f"${hi_entry['price_ibit']:.2f}"
+    lo_dir = "buying" if lo_entry['net_dealer_delta'] < 0 else "selling"
+    hi_dir = "selling" if hi_entry['net_dealer_delta'] > 0 else "buying"
+    range_bias = f"Below {lo_price}: dealer {lo_dir} pressure. Above {hi_price}: dealer {hi_dir} pressure."
+
+    # Morning take
+    parts = []
+    if cur_delta < 0:
+        parts.append(f"Dealers are net short {abs(cur_delta/1e6):.1f}M shares at spot, creating a bid under the market")
+    else:
+        parts.append(f"Dealers are net long {abs(cur_delta/1e6):.1f}M shares at spot, creating selling pressure")
+    if flip_points:
+        fp = flip_points[0]
+        dist_pct = ((fp['price_ibit'] - spot) / spot) * 100
+        parts.append(f"pressure flips {dist_pct:+.1f}% from here")
+    morning_take = "; ".join(parts) + "."
+
+    return {
+        'current_delta': current_delta,
+        'flip_summary': flip_summary,
+        'acceleration_zone': acceleration_zone,
+        'range_bias': range_bias,
+        'morning_take': morning_take,
+        'key_level_deltas': key_level_deltas,
     }
 
 
@@ -1584,6 +1815,7 @@ def run_analysis(ticker='IBIT'):
                 {k: v for k, v in sl.items() if k != 'greeks_note'}
                 for sl in d['significant_levels'][:8]
             ],
+            'dealer_delta_briefing': d.get('dealer_delta_briefing'),
         }
 
         # Add day-over-day level changes if previous data exists
@@ -1630,6 +1862,8 @@ Positioning confidence (positioning_confidence, 0-100%) indicates how much to tr
 ETF fund flows (etf_flows) show daily creation/redemption activity. Positive = institutional inflows, negative = outflows. A streak of 3+ days in one direction is significant. Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
 
 Weighted GEX (net_gex_w_total) applies DTE-based time weighting: 1/sqrt(DTE/max_DTE). Near-term expirations contribute disproportionately more gamma exposure. This makes levels more responsive to imminent expiry dynamics. Use net_gex_w_total as the primary GEX measure. The level_trajectory field shows whether key levels (call_wall, put_wall, gamma_flip) are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
+
+Dealer Delta Scenario Analysis (dealer_delta_briefing): Pre-computed dealer hedging pressure at hypothetical price levels across the key level grid. 'current_delta' shows dealer positioning at spot. 'flip_summary' identifies where dealer pressure reverses direction. 'acceleration_zone' shows where dealers are most reactive to price moves. Negative dealer delta = dealers must BUY to hedge = supportive (acts as a bid). Positive dealer delta = dealers must SELL = resistive (acts as an offer). Use this to identify price levels where dealer hedging creates natural support or resistance, independent of the GEX profile.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)
