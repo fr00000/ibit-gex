@@ -13,6 +13,7 @@ Usage:
 """
 
 import json
+import math
 import os
 import argparse
 import sqlite3
@@ -127,6 +128,12 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
     return charm
 
 
+def dte_weight(dte_days, max_dte):
+    """Weight by gamma's natural time scaling: 1/sqrt(T), normalized to max DTE window."""
+    dte_clamped = max(dte_days, 0.25)  # expiration day floor (~6 hours)
+    return 1.0 / math.sqrt(dte_clamped / max(max_dte, 1))
+
+
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
@@ -187,6 +194,11 @@ def init_db():
         daily_flow_shares REAL, daily_flow_dollars REAL,
         UNIQUE(date, ticker)
     )''')
+    # Migrate: add weighted_net_gex column to existing tables
+    for table in ('snapshots', 'strike_history'):
+        cols = [row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()]
+        if 'weighted_net_gex' not in cols:
+            c.execute(f'ALTER TABLE {table} ADD COLUMN weighted_net_gex REAL')
     conn.commit()
     conn.close()
 
@@ -205,11 +217,11 @@ def get_prev_strikes(conn, ticker):
     if not row:
         return None, {}
     prev_date = row[0]
-    c.execute('SELECT strike, call_oi, put_oi, total_oi, net_gex FROM strike_history WHERE date=? AND ticker=?',
+    c.execute('SELECT strike, call_oi, put_oi, total_oi, net_gex, weighted_net_gex FROM strike_history WHERE date=? AND ticker=?',
               (prev_date, ticker))
     strikes = {}
     for r in c.fetchall():
-        strikes[r[0]] = {'call_oi': r[1], 'put_oi': r[2], 'total_oi': r[3], 'net_gex': r[4]}
+        strikes[r[0]] = {'call_oi': r[1], 'put_oi': r[2], 'total_oi': r[3], 'net_gex': r[4], 'weighted_net_gex': r[5]}
     return prev_date, strikes
 
 
@@ -217,23 +229,24 @@ def save_snapshot(conn, ticker, spot, btc_price, levels, df):
     date_str = datetime.now().strftime('%Y-%m-%d')
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO snapshots
-        (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (date_str, ticker, spot, btc_price, levels.get('gamma_flip'), levels.get('call_wall'),
          levels.get('put_wall'), levels.get('max_pain'), levels.get('regime'),
-         levels.get('net_gex_total'), levels.get('total_call_oi'), levels.get('total_put_oi')))
+         levels.get('net_gex_total'), levels.get('total_call_oi'), levels.get('total_put_oi'),
+         levels.get('net_gex_w_total')))
     for _, row in df.iterrows():
-        c.execute('''INSERT OR REPLACE INTO strike_history (date,ticker,strike,call_oi,put_oi,total_oi,net_gex)
-            VALUES (?,?,?,?,?,?,?)''',
+        c.execute('''INSERT OR REPLACE INTO strike_history (date,ticker,strike,call_oi,put_oi,total_oi,net_gex,weighted_net_gex)
+            VALUES (?,?,?,?,?,?,?,?)''',
             (date_str, ticker, row['strike'], int(row['call_oi']), int(row['put_oi']),
-             int(row['total_oi']), row['net_gex']))
+             int(row['total_oi']), row['net_gex'], row['net_gex_w']))
     conn.commit()
 
 
 def get_history(conn, ticker, days=10):
     c = conn.cursor()
     c.execute('''SELECT date, spot, btc_price, gamma_flip, call_wall, put_wall,
-                        max_pain, regime, net_gex, total_call_oi, total_put_oi
+                        max_pain, regime, net_gex, total_call_oi, total_put_oi, weighted_net_gex
                  FROM snapshots WHERE ticker=? ORDER BY date DESC LIMIT ?''', (ticker, days))
     return c.fetchall()
 
@@ -498,6 +511,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     for exp_str in selected_exps:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         T = max((exp_date - now).days / 365.0, 0.5 / 365)
+        dte_days = max((exp_date - now).days, 0)
+        w = dte_weight(dte_days, max_dte)
         try:
             chain = ticker.option_chain(exp_str)
         except Exception:
@@ -522,6 +537,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
                 vanna = bs_vanna(spot, strike, T, rfr, iv)
                 charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
+                gex_w = gex * w
                 dealer_delta = -delta * oi * 100
                 # Dealer vanna exposure: how dealer delta changes with IV
                 dealer_vanna = -sign * vanna * oi * 100 * spot * 0.01
@@ -536,20 +552,34 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
                 if strike not in strike_data:
                     strike_data[strike] = {'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
+                                           'call_gex_w': 0, 'put_gex_w': 0,
                                            'call_delta': 0, 'put_delta': 0,
                                            'call_vanna': 0, 'put_vanna': 0,
                                            'call_charm': 0, 'put_charm': 0,
-                                           'call_volume': 0, 'put_volume': 0}
+                                           'call_volume': 0, 'put_volume': 0,
+                                           'expiry_gex': {}}
                 strike_data[strike][f'{opt_type}_oi'] += oi
                 strike_data[strike][f'{opt_type}_gex'] += gex
+                strike_data[strike][f'{opt_type}_gex_w'] += gex_w
                 strike_data[strike][f'{opt_type}_volume'] += vol
                 strike_data[strike][f'{opt_type}_delta'] += dealer_delta
                 strike_data[strike][f'{opt_type}_vanna'] += dealer_vanna
                 strike_data[strike][f'{opt_type}_charm'] += dealer_charm
+                # Per-expiry breakdown
+                if exp_str not in strike_data[strike]['expiry_gex']:
+                    strike_data[strike]['expiry_gex'][exp_str] = {
+                        'call_gex_w': 0, 'put_gex_w': 0, 'dte': dte_days, 'weight': round(w, 2)
+                    }
+                strike_data[strike]['expiry_gex'][exp_str][f'{opt_type}_gex_w'] += gex_w
 
     # Build dataframe
     rows = []
     for strike, d in sorted(strike_data.items()):
+        # Compute net_gex_w for each expiry entry
+        expiry_gex = {}
+        for exp_str, eg in d.get('expiry_gex', {}).items():
+            eg['net_gex_w'] = eg['call_gex_w'] + eg['put_gex_w']
+            expiry_gex[exp_str] = eg
         rows.append({
             'strike': strike,
             'btc_price': strike / ref_per_share if is_crypto else strike,
@@ -557,6 +587,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'total_oi': d['call_oi'] + d['put_oi'],
             'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
             'net_gex': d['call_gex'] + d['put_gex'],
+            'call_gex_w': d['call_gex_w'], 'put_gex_w': d['put_gex_w'],
+            'net_gex_w': d['call_gex_w'] + d['put_gex_w'],
             'net_dealer_delta': d['call_delta'] + d['put_delta'],
             'net_vanna': d['call_vanna'] + d['put_vanna'],
             'net_charm': d['call_charm'] + d['put_charm'],
@@ -564,6 +596,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
             'call_volume': d['call_volume'], 'put_volume': d['put_volume'],
             'total_volume': d['call_volume'] + d['put_volume'],
+            'expiry_gex': expiry_gex,
         })
     df = pd.DataFrame(rows)
 
@@ -581,29 +614,29 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             ratio = min(delta_oi / total_oi, 1.0)
         else:
             ratio = 1.0  # no history = all new
-        active_gex_values.append(row['net_gex'] * ratio)
+        active_gex_values.append(row['net_gex_w'] * ratio)
     df['active_gex'] = active_gex_values
 
     # Derive levels
     levels = {}
-    # Call wall: highest call GEX at or above spot (resistance)
+    # Call wall: highest call GEX (weighted) at or above spot (resistance)
     calls_above = df[df['strike'] >= spot]
     if not calls_above.empty:
-        levels['call_wall'] = float(calls_above.loc[calls_above['call_gex'].idxmax(), 'strike'])
+        levels['call_wall'] = float(calls_above.loc[calls_above['call_gex_w'].idxmax(), 'strike'])
     else:
-        levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
-    # Put wall: most negative put GEX at or below spot (support)
+        levels['call_wall'] = float(df.loc[df['call_gex_w'].idxmax(), 'strike'])
+    # Put wall: most negative put GEX (weighted) at or below spot (support)
     puts_below = df[df['strike'] <= spot]
     if not puts_below.empty:
-        levels['put_wall'] = float(puts_below.loc[puts_below['put_gex'].idxmin(), 'strike'])
+        levels['put_wall'] = float(puts_below.loc[puts_below['put_gex_w'].idxmin(), 'strike'])
     else:
-        levels['put_wall'] = float(df.loc[df['put_gex'].idxmin(), 'strike'])
+        levels['put_wall'] = float(df.loc[df['put_gex_w'].idxmin(), 'strike'])
 
-    # Gamma flip nearest to spot
+    # Gamma flip nearest to spot (using weighted GEX)
     df_s = df.sort_values('strike')
     all_flips = []
     for i in range(len(df_s) - 1):
-        g1, g2 = df_s.iloc[i]['net_gex'], df_s.iloc[i + 1]['net_gex']
+        g1, g2 = df_s.iloc[i]['net_gex_w'], df_s.iloc[i + 1]['net_gex_w']
         s1, s2 = df_s.iloc[i]['strike'], df_s.iloc[i + 1]['strike']
         if (g1 < 0 and g2 > 0) or (g1 > 0 and g2 < 0):
             if (g2 - g1) != 0:
@@ -623,13 +656,14 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     total_pain = (call_pain + put_pain).sum(axis=1)
     levels['max_pain'] = float(strikes_arr[np.argmin(total_pain)])
 
-    # Regime
+    # Regime (using weighted GEX)
     near_spot = df[(df['strike'] >= spot * 0.98) & (df['strike'] <= spot * 1.02)]
-    local_gex = near_spot['net_gex'].sum() if not near_spot.empty else 0
+    local_gex = near_spot['net_gex_w'].sum() if not near_spot.empty else 0
     levels['regime'] = 'positive_gamma' if local_gex > 0 else 'negative_gamma'
 
     # Totals
     levels['net_gex_total'] = float(df['net_gex'].sum())
+    levels['net_gex_w_total'] = float(df['net_gex_w'].sum())
     levels['net_dealer_delta'] = float(df['net_dealer_delta'].sum())
     levels['net_vanna'] = float(df['net_vanna'].sum())
     levels['net_charm'] = float(df['net_charm'].sum())
@@ -687,9 +721,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     levels['positioning_confidence'] = max(0, min(100, pos_conf))
     levels['positioning_warnings'] = pos_warnings
 
-    # Resistance / support
-    levels['resistance'] = df[df['net_gex'] > 0].nlargest(3, 'net_gex')['strike'].tolist()
-    levels['support'] = df[df['net_gex'] < 0].nsmallest(3, 'net_gex')['strike'].tolist()
+    # Resistance / support (weighted GEX)
+    levels['resistance'] = df[df['net_gex_w'] > 0].nlargest(3, 'net_gex_w')['strike'].tolist()
+    levels['support'] = df[df['net_gex_w'] < 0].nsmallest(3, 'net_gex_w')['strike'].tolist()
 
     # OI magnets
     levels['oi_magnets'] = df.nlargest(5, 'total_oi')[['strike', 'total_oi', 'call_oi', 'put_oi']].to_dict('records')
@@ -714,6 +748,35 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         }
     except Exception:
         pass
+
+    # Level strength trajectory
+    level_trajectory = {}
+    for lname, lstrike in [('call_wall', levels['call_wall']), ('put_wall', levels['put_wall']), ('gamma_flip', levels['gamma_flip'])]:
+        traj = {'status': 'STABLE', 'change_pct': 0.0, 'dominant_expiry': None, 'dominant_expiry_dte': None}
+        # Current weighted GEX at this strike
+        strike_rows = df[df['strike'] == lstrike]
+        current_w = float(strike_rows['net_gex_w'].sum()) if not strike_rows.empty else 0
+        # Previous weighted GEX (fallback to raw for pre-migration)
+        if prev_strikes and lstrike in prev_strikes:
+            prev_w = prev_strikes[lstrike].get('weighted_net_gex')
+            if prev_w is None:
+                prev_w = prev_strikes[lstrike].get('net_gex', 0)
+            if prev_w and prev_w != 0:
+                change_pct = ((current_w - prev_w) / abs(prev_w)) * 100
+                traj['change_pct'] = round(change_pct, 1)
+                if change_pct > 10:
+                    traj['status'] = 'STRENGTHENING'
+                elif change_pct < -10:
+                    traj['status'] = 'WEAKENING'
+        # Dominant expiry: which expiration contributes most weighted GEX
+        if not strike_rows.empty:
+            expiry_gex = strike_rows.iloc[0].get('expiry_gex', {})
+            if isinstance(expiry_gex, dict) and expiry_gex:
+                best_exp = max(expiry_gex.items(), key=lambda x: abs(x[1].get('net_gex_w', 0)))
+                traj['dominant_expiry'] = best_exp[0]
+                traj['dominant_expiry_dte'] = best_exp[1].get('dte')
+        level_trajectory[lname] = traj
+    levels['level_trajectory'] = level_trajectory
 
     # Breakout signals (prev_strikes already available from early fetch)
     breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share, etf_flows)
@@ -749,10 +812,21 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     # Build response
     gex_chart_data = []
     for _, row in df[(df['strike'] >= spot * 0.82) & (df['strike'] <= spot * 1.22)].iterrows():
+        # Per-expiry breakdown for stacked chart
+        expiry_gex = row.get('expiry_gex', {})
+        expiry_breakdown = {}
+        if isinstance(expiry_gex, dict):
+            for exp_str, eg in expiry_gex.items():
+                expiry_breakdown[exp_str] = {
+                    'net_gex_w': eg.get('net_gex_w', 0),
+                    'dte': eg.get('dte'),
+                    'weight': eg.get('weight'),
+                }
         gex_chart_data.append({
             'strike': float(row['strike']),
             'btc': float(row['strike'] / ref_per_share) if is_crypto else float(row['strike']),
             'net_gex': float(row['net_gex']),
+            'net_gex_w': float(row['net_gex_w']),
             'active_gex': float(row['active_gex']),
             'net_vanna': float(row['net_vanna']),
             'net_charm': float(row['net_charm']),
@@ -762,6 +836,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'call_volume': int(row['call_volume']),
             'put_volume': int(row['put_volume']),
             'total_volume': int(row['total_volume']),
+            'expiry_breakdown': expiry_breakdown,
         })
 
     history_data = []
@@ -771,7 +846,16 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
             'gamma_flip': h[3], 'call_wall': h[4], 'put_wall': h[5],
             'max_pain': h[6], 'regime': h[7], 'net_gex': h[8],
             'total_call_oi': h[9], 'total_put_oi': h[10],
+            'weighted_net_gex': h[11] if len(h) > 11 else None,
         })
+
+    # Expiry metadata for frontend legend/palette
+    expiry_meta = []
+    for exp_str in selected_exps:
+        exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        dte_days = max((exp_date - now).days, 0)
+        expiry_meta.append({'exp': exp_str, 'dte': dte_days, 'weight': round(dte_weight(dte_days, max_dte), 2)})
+    expiry_meta.sort(key=lambda x: x['dte'])
 
     return {
         'ticker': ticker_symbol,
@@ -792,6 +876,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         'flow_forecast': flow_forecast,
         'history': history_data,
         'expirations': selected_exps,
+        'expiry_meta': expiry_meta,
     }
 
 
@@ -937,13 +1022,13 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
         if dist_pct > 25:
             continue
 
-        net_gex = row['net_gex']
+        net_gex_w = row['net_gex_w']
         call_oi, put_oi, total_oi = int(row['call_oi']), int(row['put_oi']), int(row['total_oi'])
         is_major = total_oi > oi_90
 
-        if put_oi > call_oi * 1.5 and net_gex < 0:
+        if put_oi > call_oi * 1.5 and net_gex_w < 0:
             ltype = 'put_wall'
-        elif call_oi > put_oi * 1.5 and net_gex > 0:
+        elif call_oi > put_oi * 1.5 and net_gex_w > 0:
             ltype = 'call_wall'
         elif total_oi > oi_90:
             ltype = 'oi_magnet'
@@ -993,7 +1078,8 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
             'btc': float(strike / ref_per_share) if is_crypto else float(strike),
             'type': ltype,
             'call_oi': call_oi, 'put_oi': put_oi, 'total_oi': total_oi,
-            'net_gex': float(net_gex),
+            'net_gex': float(row['net_gex']),
+            'net_gex_w': float(net_gex_w),
             'net_vanna': float(row['net_vanna']) if 'net_vanna' in row else 0.0,
             'net_charm': float(row['net_charm']) if 'net_charm' in row else 0.0,
             'dist_pct': float(((strike - spot) / spot) * 100),
@@ -1015,9 +1101,9 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
 
     up_signals, down_signals = [], []
 
-    # Wall asymmetry
-    cw_gex = float(df[df['strike'] == cw]['call_gex'].sum()) if cw in df['strike'].values else 0
-    pw_gex = float(abs(df[df['strike'] == pw]['put_gex'].sum())) if pw in df['strike'].values else 0
+    # Wall asymmetry (weighted)
+    cw_gex = float(df[df['strike'] == cw]['call_gex_w'].sum()) if cw in df['strike'].values else 0
+    pw_gex = float(abs(df[df['strike'] == pw]['put_gex_w'].sum())) if pw in df['strike'].values else 0
     if pw_gex > 0 and cw_gex > 0:
         ratio = cw_gex / pw_gex
         if ratio < 0.5:
@@ -1090,11 +1176,11 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         elif etf_flows['avg_flow_5d'] < -100_000_000:
             down_signals.append(f"5d avg outflow ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M — sustained selling pressure")
 
-    # Targets
-    up_targets = df[(df['strike'] > cw) & (df['net_gex'] > 0)].nlargest(2, 'net_gex')[
-        ['strike', 'total_oi', 'net_gex']].to_dict('records')
-    down_targets = df[(df['strike'] < pw) & (df['net_gex'] < 0)].nsmallest(2, 'net_gex')[
-        ['strike', 'total_oi', 'net_gex']].to_dict('records')
+    # Targets (weighted)
+    up_targets = df[(df['strike'] > cw) & (df['net_gex_w'] > 0)].nlargest(2, 'net_gex_w')[
+        ['strike', 'total_oi', 'net_gex_w']].to_dict('records')
+    down_targets = df[(df['strike'] < pw) & (df['net_gex_w'] < 0)].nsmallest(2, 'net_gex_w')[
+        ['strike', 'total_oi', 'net_gex_w']].to_dict('records')
 
     up_score = len(up_signals)
     down_score = len(down_signals)
@@ -1111,11 +1197,11 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         'up_targets': [{'strike': float(t['strike']),
                         'btc': float(t['strike'] / ref_per_share),
                         'total_oi': int(t['total_oi']),
-                        'net_gex': float(t['net_gex'])} for t in up_targets],
+                        'net_gex': float(t['net_gex_w'])} for t in up_targets],
         'down_targets': [{'strike': float(t['strike']),
                           'btc': float(t['strike'] / ref_per_share),
                           'total_oi': int(t['total_oi']),
-                          'net_gex': float(t['net_gex'])} for t in down_targets],
+                          'net_gex': float(t['net_gex_w'])} for t in down_targets],
         'bias': bias,
         'em_note': em_note,
     }
@@ -1460,6 +1546,8 @@ def run_analysis(ticker='IBIT'):
                 'support': [round(s / bps) for s in lvl.get('support', [])],
             },
             'active_gex_total': lvl.get('active_gex_total', 0),
+            'net_gex_w_total': lvl.get('net_gex_w_total', 0),
+            'level_trajectory': lvl.get('level_trajectory', {}),
             'active_call_wall_btc': round(lvl.get('active_call_wall', lvl['call_wall']) / bps),
             'active_put_wall_btc': round(lvl.get('active_put_wall', lvl['put_wall']) / bps),
             'positioning_confidence': lvl.get('positioning_confidence', 100),
@@ -1540,6 +1628,8 @@ Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new 
 Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
 
 ETF fund flows (etf_flows) show daily creation/redemption activity. Positive = institutional inflows, negative = outflows. A streak of 3+ days in one direction is significant. Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
+
+Weighted GEX (net_gex_w_total) applies DTE-based time weighting: 1/sqrt(DTE/max_DTE). Near-term expirations contribute disproportionately more gamma exposure. This makes levels more responsive to imminent expiry dynamics. Use net_gex_w_total as the primary GEX measure. The level_trajectory field shows whether key levels (call_wall, put_wall, gamma_flip) are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
 For each timeframe, provide:
 - What changed overnight and why it matters (if changes_vs_prev available)
