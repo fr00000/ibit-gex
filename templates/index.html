@@ -1300,7 +1300,7 @@ function renderOutlook(data){
         // Max pain
         {label:'Max Pain',data:maxPain,borderColor:'rgba(136,146,164,0.4)',borderWidth:1,borderDash:[3,4],pointRadius:2,pointBackgroundColor:'rgba(136,146,164,0.5)',fill:false,tension:0,order:4},
         // Spot reference
-        {label:'Spot',data:wins.map(()=>spot),borderColor:'rgba(220,224,232,0.3)',borderWidth:1,borderDash:[2,2],pointRadius:0,fill:false,tension:0,order:6},
+        {label:'Spot',data:wins.map(()=>spot),borderColor:'rgba(255,255,255,0.45)',borderWidth:1.5,borderDash:[3,3],pointRadius:0,fill:false,tension:0,order:6},
         // Venue agreement diamonds
         {label:'Venue Agree',data:venueAgree,borderColor:'rgba(0,220,130,0.9)',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:wins.map(w=>w.venue_agree?5:0),pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
       ]
@@ -1371,6 +1371,19 @@ function renderOutlook(data){
           c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.04)':'rgba(0,220,130,0.04)';
           c.fillRect(xc-half,top,half*2,bottom-top);
         });
+      }
+    },{
+      id:'spotLabel',
+      afterDatasetsDraw(chart){
+        const{ctx:c,chartArea:{left},scales:{y}}=chart;
+        const yPx=y.getPixelForValue(spot);
+        if(yPx==null||!isFinite(yPx))return;
+        c.save();
+        c.font='bold 9px IBM Plex Mono';
+        c.fillStyle='rgba(255,255,255,0.7)';
+        c.textBaseline='bottom';
+        c.fillText('SPOT '+fB(spot),left+4,yPx-3);
+        c.restore();
       }
     }]
   });
