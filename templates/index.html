@@ -306,9 +306,9 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div style="position:absolute;top:4px;right:4px;z-index:10;display:flex;align-items:center;gap:3px">
       <label style="color:var(--t3);font-size:9px">TF</label>
       <select id="tf-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:9px;cursor:pointer">
-        <option value="15m" selected>15m</option>
+        <option value="15m">15m</option>
         <option value="1h">1h</option>
-        <option value="4h">4h</option>
+        <option value="4h" selected>4h</option>
         <option value="1d">1d</option>
       </select>
     </div>
@@ -422,6 +422,7 @@ function setSource(val){
   }
 }
 
+let overlayMin=null,overlayMax=null;
 function updateChartOverlay(data){
   try{
     if(!tvSeries)return;
@@ -443,6 +444,18 @@ function updateChartOverlay(data){
       support=(data.levels.support||[]).map(s=>s/bps);
       resistance=(data.levels.resistance||[]).map(r=>r/bps);
     }
+    // Collect all level prices to compute visible range
+    const allLevels=[cw,pw,gf,mp,...support,...resistance];
+    if(data.expected_move){
+      allLevels.push(data.expected_move.upper_btc,data.expected_move.lower_btc);
+    }
+    if(currentSource!=='deribit'&&data.delta_flip_points){
+      data.delta_flip_points.forEach(fp=>allLevels.push(fp.price_btc));
+    }
+    const valid=allLevels.filter(v=>v&&isFinite(v));
+    overlayMin=valid.length?Math.min(...valid):null;
+    overlayMax=valid.length?Math.max(...valid):null;
+
     addLine(cw,'#00dc82','Call Wall',1,2);
     addLine(pw,'#ff4060','Put Wall',1,2);
     addLine(gf,'#ffb020','\u03b3 Flip',2,2);
@@ -492,14 +505,22 @@ function initTV(){
     layout:{background:{color:'#06080c'},textColor:'#4a5568',fontFamily:'IBM Plex Mono',fontSize:10},
     grid:{vertLines:{color:'#111620'},horzLines:{color:'#111620'}},
     crosshair:{mode:0,vertLine:{color:'#3890ff',width:1,style:2},horzLine:{color:'#3890ff',width:1,style:2}},
-    rightPriceScale:{borderColor:'#1c2230',scaleMargins:{top:0.02,bottom:0.02}},
+    rightPriceScale:{borderColor:'#1c2230',scaleMargins:{top:0.1,bottom:0.1}},
     timeScale:{borderColor:'#1c2230',timeVisible:true,secondsVisible:false},
     handleScroll:true,handleScale:true
   });
   tvSeries=tvChart.addCandlestickSeries({
     upColor:'#00dc82',downColor:'#ff4060',
     borderUpColor:'#00dc82',borderDownColor:'#ff4060',
-    wickUpColor:'#00dc8266',wickDownColor:'#ff406066'
+    wickUpColor:'#00dc8266',wickDownColor:'#ff406066',
+    autoscaleInfoProvider:orig=>{
+      const res=orig();
+      if(overlayMin!==null&&overlayMax!==null&&res&&res.priceRange){
+        res.priceRange.minValue=Math.min(res.priceRange.minValue,overlayMin);
+        res.priceRange.maxValue=Math.max(res.priceRange.maxValue,overlayMax);
+      }
+      return res;
+    }
   });
   new ResizeObserver(()=>tvChart.applyOptions({width:c.clientWidth,height:c.clientHeight})).observe(c);
 }
