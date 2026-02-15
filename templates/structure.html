@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEX Structure</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #06080c;
+  --bg2: #0b0e14;
+  --bg3: #10141c;
+  --border: #1c2230;
+  --border2: #262e3e;
+  --t1: #dce0e8;
+  --t2: #8892a4;
+  --t3: #4a5568;
+  --green: #00dc82;
+  --red: #ff4060;
+  --amber: #ffb020;
+  --blue: #3890ff;
+  --purple: #a78bfa;
+  --mono: 'IBM Plex Mono', 'Consolas', monospace;
+  --sans: 'Outfit', system-ui, sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden}
+body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px;line-height:1.4;display:flex;flex-direction:column}
+.hdr{height:36px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 12px;gap:16px;flex-shrink:0}
+.hdr-logo{font-family:var(--sans);font-weight:800;font-size:13px;letter-spacing:-.3px;color:var(--t2)}
+.hdr-sep{width:1px;height:18px;background:var(--border2)}
+.range-btn{background:var(--bg3);color:var(--t3);border:1px solid var(--border2);border-radius:2px;padding:2px 8px;font-family:var(--mono);font-size:10px;cursor:pointer}
+.range-btn.active{color:var(--t1);border-color:var(--t2)}
+.chart-wrap{flex:1;padding:12px;position:relative}
+canvas{width:100%!important;height:100%!important}
+.legend{display:flex;gap:16px;padding:6px 12px;background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;align-items:center;justify-content:center}
+.leg-item{display:flex;align-items:center;gap:4px;font-size:9px;color:var(--t3)}
+.leg-swatch{width:20px;height:8px;border-radius:1px}
+.empty-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px;text-align:center;padding:40px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <a href="/" style="color:var(--t3);font-size:10px;text-decoration:none">&larr; Dashboard</a>
+  <div class="hdr-sep"></div>
+  <span class="hdr-logo">GEX Structure</span>
+  <div style="flex:1"></div>
+  <button class="range-btn" onclick="load(7)" id="btn-7">7d</button>
+  <button class="range-btn active" onclick="load(30)" id="btn-30">30d</button>
+  <button class="range-btn" onclick="load(90)" id="btn-90">90d</button>
+</div>
+<div class="chart-wrap">
+  <canvas id="chart"></canvas>
+  <div class="empty-msg" id="empty" style="display:none">Collecting data &mdash; structure chart populates after the first few days of predictions.</div>
+</div>
+<div class="legend">
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(0,220,130,0.25)"></div>0-3d</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(56,144,255,0.25)"></div>4-7d</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(56,144,255,0.15)"></div>8-14d</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(168,139,250,0.15)"></div>15-30d</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(168,139,250,0.08)"></div>31-45d</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:var(--t1);height:2px"></div>Spot</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:var(--amber);height:1px;border-top:1px dashed var(--amber)"></div>&gamma; Flip</div>
+</div>
+<script>
+let chart = null;
+let currentDays = 30;
+
+const WINDOWS = [
+  {key:'31-45', label:'31-45d', bg:'rgba(168,139,250,0.04)', border:'rgba(168,139,250,0.15)'},
+  {key:'15-30', label:'15-30d', bg:'rgba(168,139,250,0.06)', border:'rgba(168,139,250,0.25)'},
+  {key:'8-14',  label:'8-14d',  bg:'rgba(56,144,255,0.08)',  border:'rgba(56,144,255,0.3)'},
+  {key:'4-7',   label:'4-7d',   bg:'rgba(56,144,255,0.12)',  border:'rgba(56,144,255,0.4)'},
+  {key:'0-3',   label:'0-3d',   bg:'rgba(0,220,130,0.15)',   border:'rgba(0,220,130,0.5)'},
+];
+
+function load(days) {
+  currentDays = days;
+  document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('btn-' + days).classList.add('active');
+  fetch('/api/structure?ticker=IBIT&days=' + days)
+    .then(r => r.json())
+    .then(render)
+    .catch(e => console.error('Structure fetch failed:', e));
+}
+
+function render(data) {
+  const dates = Object.keys(data).sort();
+  const emptyEl = document.getElementById('empty');
+  const canvas = document.getElementById('chart');
+
+  if (dates.length === 0) {
+    emptyEl.style.display = 'flex';
+    canvas.style.display = 'none';
+    if (chart) { chart.destroy(); chart = null; }
+    return;
+  }
+  emptyEl.style.display = 'none';
+  canvas.style.display = 'block';
+
+  // Detect expiry rollovers (>5% jump in 0-3d call wall)
+  const expirySet = new Set();
+  for (let i = 1; i < dates.length; i++) {
+    const prev = data[dates[i-1]]?.windows?.['0-3'];
+    const curr = data[dates[i]]?.windows?.['0-3'];
+    if (prev && curr && prev.call_wall && curr.call_wall) {
+      const jump = Math.abs(curr.call_wall - prev.call_wall) / prev.call_wall;
+      if (jump > 0.05) expirySet.add(dates[i]);
+    }
+  }
+
+  const datasets = [];
+
+  // Bands: widest first (31-45d) to narrowest (0-3d)
+  for (const w of WINDOWS) {
+    // Call wall (top line)
+    datasets.push({
+      label: w.label + ' CW',
+      data: dates.map(d => data[d]?.windows?.[w.key]?.call_wall || null),
+      borderColor: w.border,
+      borderWidth: 1,
+      pointRadius: 0,
+      fill: false,
+      spanGaps: true,
+      tension: 0.2,
+    });
+    // Put wall (bottom line, fill up to previous dataset = call wall)
+    datasets.push({
+      label: w.label + ' PW',
+      data: dates.map(d => data[d]?.windows?.[w.key]?.put_wall || null),
+      borderColor: w.border,
+      borderWidth: 1,
+      pointRadius: 0,
+      fill: '-1',
+      backgroundColor: w.bg,
+      spanGaps: true,
+      tension: 0.2,
+    });
+  }
+
+  // Gamma flip (0-3d) — dashed amber
+  datasets.push({
+    label: 'Gamma Flip',
+    data: dates.map(d => data[d]?.windows?.['0-3']?.gamma_flip || null),
+    borderColor: 'rgba(255,176,32,0.6)',
+    borderWidth: 1.5,
+    borderDash: [4, 3],
+    pointRadius: 0,
+    fill: false,
+    spanGaps: true,
+    tension: 0.2,
+  });
+
+  // Spot — solid white
+  datasets.push({
+    label: 'Spot',
+    data: dates.map(d => data[d]?.spot || null),
+    borderColor: 'rgba(220,224,232,0.9)',
+    borderWidth: 2,
+    pointRadius: 2,
+    pointBackgroundColor: 'rgba(220,224,232,0.9)',
+    fill: false,
+    spanGaps: true,
+    tension: 0.2,
+  });
+
+  // Store data ref for tooltip
+  window._structData = data;
+  window._structDates = dates;
+
+  if (chart) chart.destroy();
+
+  chart = new Chart(document.getElementById('chart'), {
+    type: 'line',
+    data: { labels: dates, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: 'rgba(11,14,20,0.95)',
+          borderColor: 'rgba(28,34,48,1)',
+          borderWidth: 1,
+          titleFont: { family: "'IBM Plex Mono', monospace", size: 11 },
+          bodyFont: { family: "'IBM Plex Mono', monospace", size: 10 },
+          padding: 10,
+          filter: () => false,  // hide default items
+          callbacks: {
+            title: function(items) {
+              return items[0]?.label || '';
+            },
+            afterBody: function(items) {
+              const date = items[0]?.label;
+              if (!date || !window._structData[date]) return '';
+              const d = window._structData[date];
+              const lines = [];
+              const fB = v => '$' + Math.round(v).toLocaleString();
+              lines.push('Spot: ' + fB(d.spot));
+              const order = ['0-3','4-7','8-14','15-30','31-45'];
+              for (const k of order) {
+                const w = d.windows?.[k];
+                if (!w) continue;
+                let line = k.padEnd(6) + fB(w.put_wall) + ' \u2014 ' + fB(w.call_wall);
+                const regime = w.regime === 'negative_gamma' ? ' (neg \u03B3)' : ' (pos \u03B3)';
+                line += regime;
+                if (w.venue_agree) line += ' \u2713';
+                lines.push(line);
+              }
+              const gf = d.windows?.['0-3']?.gamma_flip;
+              if (gf) lines.push('\u03B3 flip: ' + fB(gf));
+              return lines.join('\n');
+            },
+            label: () => null,
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(28,34,48,0.5)' },
+          ticks: {
+            color: function(ctx) {
+              const date = window._structDates?.[ctx.index];
+              return expirySet.has(date) ? '#ffb020' : '#4a5568';
+            },
+            font: { size: 10, family: "'IBM Plex Mono'" },
+            maxRotation: 0,
+            callback: function(val, idx) {
+              const d = this.getLabelForValue(val);
+              return d ? d.slice(5) : '';  // show MM-DD only
+            },
+          },
+        },
+        y: {
+          grid: { color: 'rgba(28,34,48,0.5)' },
+          ticks: {
+            color: '#4a5568',
+            font: { size: 10, family: "'IBM Plex Mono'" },
+            callback: v => '$' + (v/1000).toFixed(0) + 'K',
+          },
+        },
+      },
+    },
+  });
+}
+
+load(30);
+</script>
+</body>
+</html>
