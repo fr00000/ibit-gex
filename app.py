@@ -1757,10 +1757,15 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
     # Current delta (closest to spot)
     spot_entry = min(profile, key=lambda p: abs(p['price_ibit'] - spot))
     cur_delta = spot_entry['net_dealer_delta']
-    if cur_delta < 0:
-        current_delta = f"Dealers are net SHORT {abs(cur_delta/1e6):.1f}M shares — must BUY on dips (supportive)"
+    cur_abs = abs(cur_delta)
+    if cur_abs >= 1e6:
+        cur_str = f"~${cur_abs/1e6:.0f}M notional"
     else:
-        current_delta = f"Dealers are net LONG {abs(cur_delta/1e6):.1f}M shares — must SELL on rallies (resistive)"
+        cur_str = f"~${cur_abs/1e3:.0f}K notional"
+    if cur_delta < 0:
+        current_delta = f"Dealers are net SHORT {cur_str} — must BUY on dips (supportive)"
+    else:
+        current_delta = f"Dealers are net LONG {cur_str} — must SELL on rallies (resistive)"
 
     # Flip summary
     if flip_points:
@@ -2475,8 +2480,8 @@ def run_analysis(ticker='IBIT', save=True):
                 }
                 for fp in (d.get('delta_flip_points') or [])
             ],
-            'key_level_dealer_delta_btc': {
-                name: round(delta * d['btc_per_share']) if delta is not None else None
+            'key_level_dealer_delta': {
+                name: round(delta) if delta is not None else None
                 for name, delta in (d.get('dealer_delta_briefing', {}).get('key_level_deltas', {}) or {}).items()
             } if d.get('dealer_delta_briefing') else None,
         }
@@ -2588,7 +2593,7 @@ For each timeframe, provide:
 - Regime summary and implication (1-2 sentences)
 - Historical context: Reference regime streak, level migration trends, and range evolution from _history_trends. Is today's positioning a continuation or a change?
 - Key levels in BTC price with level trajectory status (STRENGTHENING/WEAKENING/STABLE) and dominant expiry if near-term. Example: "Call wall $108,200 (STRENGTHENING, driven by Feb 21 exp — 3 DTE)"
-- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta_btc.
+- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta (dollar notional).
 - Dealer flow direction (charm/vanna implications)
 - Risk assessment — specifically note where dealer delta ACCELERATES (acceleration_zone), as these are prices where moves become self-reinforcing
 - Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
