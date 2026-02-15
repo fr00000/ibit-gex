@@ -702,14 +702,13 @@ function renderDealerDelta(data){
           label:i=>{
             const v=i.raw;
             const dir=v<0?'BUY':'SELL';
-            const notional=Math.abs(v)*window._lastData.spot;
-            return `Dealers ${dir} ${fG(notional)}`;
+            return `Dealers ${dir} ${fG(Math.abs(v))}`;
           }
         }}
       },
       scales:{
         x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:10,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
-        y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>{const n=Math.abs(v)*(window._lastData?window._lastData.spot:1);return `${v<0?'-':''}${fG(n)}`}},grid:{color:'#111620'},border:{color:'#1c2230'}}
+        y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${v<0?'-':''}${fG(Math.abs(v))}`},grid:{color:'#111620'},border:{color:'#1c2230'}}
       }
     }
   });
@@ -881,11 +880,11 @@ function renderSidebar(data){
     h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--purple)"></span>Dealer Hedging Pressure</div>`;
 
     // Current delta
-    const curDelta=data.levels.net_dealer_delta;
+    const curDelta=useLv.net_dealer_delta;
     const curDir=curDelta<0?'ff-buy':'ff-sell';
     const curLabel=curDelta<0?'BUYING':'SELLING';
     h+=`<div class="ff-box"><div class="ff-hdr">Current Position</div>`;
-    h+=`<div class="ff-row"><span class="ffl">At spot</span><span class="ff-dir ${curDir}">${curLabel} ${fG(Math.abs(curDelta*data.spot))}</span></div>`;
+    h+=`<div class="ff-row"><span class="ffl">At spot</span><span class="ff-dir ${curDir}">${curLabel} ${fG(Math.abs(curDelta))}</span></div>`;
     h+=`</div>`;
 
     // Delta flip points
@@ -910,7 +909,7 @@ function renderSidebar(data){
           const dir=delta<0?'ff-buy':'ff-sell';
           const label=delta<0?'BUY':'SELL';
           const btcStr=fB(strike/bps);
-          h+=`<div class="ff-row"><span class="ffl">${name} ${btcStr}</span><span class="ff-dir ${dir}">${label} ${fG(Math.abs(delta*data.spot))}</span></div>`;
+          h+=`<div class="ff-row"><span class="ffl">${name} ${btcStr}</span><span class="ff-dir ${dir}">${label} ${fG(Math.abs(delta))}</span></div>`;
         }
       });
       h+=`</div>`;
@@ -964,7 +963,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position${srcLabel}</div>`;
-  [['Net GEX',fG(useLv.net_gex_total)],['Active GEX',fG(useLv.active_gex_total||0)],['Dealer \u0394',fG((useLv.net_dealer_delta||0)*data.spot)],['Net Vanna',fG(useLv.net_vanna||0)],['Net Charm',fG(useLv.net_charm||0)+'/day'],['P/C',(useLv.pcr||0).toFixed(2)],['Call OI',fO(useLv.total_call_oi||0)],['Put OI',fO(useLv.total_put_oi||0)]].forEach(([l,v])=>{
+  [['Net GEX',fG(useLv.net_gex_total)],['Active GEX',fG(useLv.active_gex_total||0)],['Dealer \u0394',fG(useLv.net_dealer_delta||0)],['Net Vanna',fG(useLv.net_vanna||0)],['Net Charm',fG(useLv.net_charm||0)+'/day'],['P/C',(useLv.pcr||0).toFixed(2)],['Call OI',fO(useLv.total_call_oi||0)],['Put OI',fO(useLv.total_put_oi||0)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;
