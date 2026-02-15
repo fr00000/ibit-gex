@@ -559,14 +559,24 @@ function renderFlowChart(flows){
   if(!flows || !flows.length){if(flowChart){flowChart.destroy();flowChart=null}return}
   if(flowChart)flowChart.destroy();
   const labels=flows.map(d=>d.date.slice(5));
-  const vals=flows.map(d=>(d.flow||0)/1e6);
-  const colors=vals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
+  const totalVals=flows.map(d=>(d.total_flow!=null?(d.total_flow/1e6):(d.flow||0)/1e6));
+  const ibitVals=flows.map(d=>(d.flow||0)/1e6);
+  const totalColors=totalVals.map(v=>v>=0?'#00dc8266':'#ff406066');
+  const ibitColors=ibitVals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
+  const hasTotal=flows.some(d=>d.total_flow!=null);
+  const datasets=[];
+  if(hasTotal){
+    datasets.push({label:'Total BTC ETF ($M)',data:totalVals,backgroundColor:totalColors,borderWidth:0,borderRadius:1,barPercentage:.95,order:2});
+    datasets.push({label:'IBIT ($M)',data:ibitVals,backgroundColor:ibitColors,borderWidth:0,borderRadius:1,barPercentage:.5,order:1});
+  }else{
+    datasets.push({label:'IBIT ($M)',data:ibitVals,backgroundColor:ibitColors,borderWidth:0,borderRadius:1,barPercentage:.85});
+  }
   flowChart=new Chart(ctx,{
     type:'bar',
-    data:{labels,datasets:[{label:'Flow ($M)',data:vals,backgroundColor:colors,borderWidth:0,borderRadius:1,barPercentage:.85}]},
+    data:{labels,datasets},
     options:{
       responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false},tooltip:{callbacks:{label:i=>`${i.raw>=0?'+':''}${i.raw.toFixed(1)}M`}}},
+      plugins:{legend:{display:hasTotal,labels:{color:'#8896a6',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,padding:4}},tooltip:{callbacks:{label:i=>`${i.dataset.label}: ${i.raw>=0?'+':''}${i.raw.toFixed(1)}M`}}},
       scales:{
         x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:10,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
         y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${v>=0?'+':''}${v.toFixed(0)}M`},grid:{color:'#111620'},border:{color:'#1c2230'}}
@@ -826,7 +836,8 @@ function renderSidebar(data){
 
     h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--blue)"></span>ETF Fund Flows</div>`;
     h+=`<div class="ff-box"><div class="ff-hdr">Daily Flow</div>`;
-    h+=`<div class="ff-row"><span class="ffl">Today</span><span class="ff-dir ${dirCls}">${isIn?'+':'-'}$${amt.toFixed(0)}M ${fl.direction.toUpperCase()}</span></div>`;
+    h+=`<div class="ff-row"><span class="ffl">IBIT</span><span class="ff-dir ${dirCls}">${isIn?'+':'-'}$${amt.toFixed(0)}M ${fl.direction.toUpperCase()}</span></div>`;
+    if(fl.total_btc_etf_flow!=null){const tf=fl.total_btc_etf_flow/1e6;const tfIn=tf>=0;h+=`<div class="ff-row"><span class="ffl">All BTC ETFs</span><span class="ff-dir ${tfIn?'ff-buy':'ff-sell'}">${tfIn?'+':''}$${Math.abs(tf).toFixed(0)}M</span></div>`;}
     h+=`<div class="ff-row"><span class="ffl">Impact</span><span class="ffv">${fl.strength}</span></div>`;
     h+=`</div>`;
     h+=`<div class="ff-box"><div class="ff-hdr">5-Day Momentum</div>`;

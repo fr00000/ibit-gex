@@ -15,11 +15,13 @@ Usage:
 import json
 import math
 import os
+import re
 import argparse
 import sqlite3
 import threading
 import time
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -204,6 +206,10 @@ def init_db():
         cols = [row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()]
         if 'weighted_net_gex' not in cols:
             c.execute(f'ALTER TABLE {table} ADD COLUMN weighted_net_gex REAL')
+    # Migrate: add total_btc_etf_flow column to etf_flows
+    cols = [row[1] for row in c.execute('PRAGMA table_info(etf_flows)').fetchall()]
+    if 'total_btc_etf_flow' not in cols:
+        c.execute('ALTER TABLE etf_flows ADD COLUMN total_btc_etf_flow REAL')
     conn.commit()
     conn.close()
 
@@ -543,131 +549,187 @@ def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
     }
 
 
-def fetch_etf_flows(ticker_symbol):
-    """Calculate daily ETF fund flows from shares outstanding changes."""
+class _FarsideTableParser(HTMLParser):
+    """Parse the Farside Investors BTC ETF flow HTML table."""
+    def __init__(self):
+        super().__init__()
+        self.headers = []
+        self.rows = []
+        self._current_row = []
+        self._current_cell = ''
+        self._in_cell = False
+        self._in_thead = False
+
+    def handle_starttag(self, tag, attrs):
+        cls = dict(attrs).get('class', '')
+        if tag == 'table' and 'etf' in cls:
+            self._in_thead = False
+        if tag == 'thead':
+            self._in_thead = True
+        if tag in ('td', 'th'):
+            self._in_cell = True
+            self._current_cell = ''
+
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th') and self._in_cell:
+            self._in_cell = False
+            text = self._current_cell.strip()
+            self._current_row.append(text)
+        if tag == 'thead':
+            self._in_thead = False
+        if tag == 'tr' and self._current_row:
+            if self._in_thead or (self._current_row and not self.headers):
+                self.headers = self._current_row
+            else:
+                self.rows.append(self._current_row)
+            self._current_row = []
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._current_cell += data
+
+
+def _parse_farside_value(text):
+    """Parse a Farside flow cell: '1,113.7' -> 1113.7, '(157.6)' -> -157.6, '-' -> 0."""
+    text = text.strip()
+    if not text or text == '-':
+        return 0.0
+    text = text.replace(',', '')
+    m = re.match(r'^\((.+)\)$', text)
+    if m:
+        return -float(m.group(1))
     try:
-        info = yf.Ticker(ticker_symbol).info
-        shares = info.get('sharesOutstanding')
-        aum = info.get('totalAssets')
-        nav = info.get('navPrice') or info.get('regularMarketPrice')
-        # Derive shares from AUM/NAV if sharesOutstanding not available
-        if not shares and aum and nav:
-            shares = aum / nav
-        if not shares or not nav:
-            return None
+        return float(text)
+    except ValueError:
+        return 0.0
 
-        conn = get_db()
-        try:
-            c = conn.cursor()
-            today = datetime.now().strftime('%Y-%m-%d')
 
-            # Get previous day's data
-            c.execute('SELECT date, shares_outstanding, aum, nav FROM etf_flows WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
-                      (ticker_symbol, today))
-            prev = c.fetchone()
+# Farside page cache: at most 1 fetch per hour
+_farside_cache = {'html': None, 'time': 0}
+_farside_lock = threading.Lock()
+FARSIDE_URL = 'https://farside.co.uk/bitcoin-etf-flow-all-data/'
+FARSIDE_CACHE_SECONDS = 3600
 
-            # Calculate daily flow
-            daily_flow_shares = 0.0
-            daily_flow_dollars = 0.0
-            if prev and prev[1]:
-                daily_flow_shares = shares - prev[1]
-                daily_flow_dollars = daily_flow_shares * nav
 
-            # Store today's snapshot
-            c.execute('INSERT OR REPLACE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
-                      (today, ticker_symbol, shares, aum, nav, daily_flow_shares, daily_flow_dollars))
-            conn.commit()
-
-            # Compute 5-day flow streak and momentum (real data only, not backfill estimates)
-            c.execute('SELECT daily_flow_shares, daily_flow_dollars FROM etf_flows WHERE ticker=? AND shares_outstanding IS NOT NULL ORDER BY date DESC LIMIT 5',
-                      (ticker_symbol,))
-            history = c.fetchall()
-        finally:
-            conn.close()
-
-        streak = 0
-        if history:
-            direction = 1 if history[0][0] >= 0 else -1
-            for h in history:
-                if (h[0] >= 0) == (direction > 0):
-                    streak += 1
-                else:
-                    break
-            streak *= direction
-
-        avg_flow_5d = sum(h[1] for h in history) / len(history) if history else 0
-
-        # Categorize strength by dollar amount
-        abs_flow = abs(daily_flow_dollars)
-        if abs_flow < 10_000_000:
-            strength = 'negligible'
-        elif abs_flow < 50_000_000:
-            strength = 'minor'
-        elif abs_flow < 200_000_000:
-            strength = 'moderate'
+def fetch_farside_flows():
+    """Fetch BTC spot ETF daily flows from Farside Investors.
+    Parses the full history page, stores all rows in the DB, and returns
+    today's IBIT flow summary dict (same shape as old fetch_etf_flows)."""
+    with _farside_lock:
+        now = time.time()
+        if _farside_cache['html'] and (now - _farside_cache['time']) < FARSIDE_CACHE_SECONDS:
+            html = _farside_cache['html']
         else:
-            strength = 'strong'
+            try:
+                req = urllib.request.Request(FARSIDE_URL, headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    html = resp.read().decode('utf-8')
+                _farside_cache['html'] = html
+                _farside_cache['time'] = now
+                print(f"  [farside] Fetched {len(html)//1024}KB from Farside")
+            except Exception as e:
+                print(f"  [farside] Fetch failed: {e}")
+                html = _farside_cache.get('html')
+                if not html:
+                    return None
 
-        return {
-            'daily_flow_shares': float(daily_flow_shares),
-            'daily_flow_dollars': float(daily_flow_dollars),
-            'direction': 'inflow' if daily_flow_shares >= 0 else 'outflow',
-            'strength': strength,
-            'streak': int(streak),          # positive = N consecutive inflow days, negative = outflow
-            'avg_flow_5d': float(avg_flow_5d),
-            'shares_outstanding': float(shares),
-        }
-    except Exception as e:
-        print(f"  [etf-flows] Failed for {ticker_symbol}: {e}")
+    # Parse the table
+    parser = _FarsideTableParser()
+    parser.feed(html)
+
+    if not parser.headers or len(parser.headers) < 13:
+        print(f"  [farside] Bad table structure: {len(parser.headers)} headers")
         return None
 
-
-
-def backfill_etf_flows(ticker_symbol, days=90):
-    """Backfill ETF flow history from Yahoo Finance historical data.
-    Uses a volume-based heuristic — estimates only, for chart visualization.
-    Real flow calculations use actual shares outstanding deltas (fetch_etf_flows)."""
+    # Find column indices
+    header_names = [h.strip() for h in parser.headers]
     try:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM etf_flows WHERE ticker=?', (ticker_symbol,))
-        existing = c.fetchone()[0]
-        conn.close()
-        if existing >= 5:
-            return  # already have history
+        ibit_col = header_names.index('IBIT')
+        total_col = header_names.index('Total')
+    except ValueError:
+        print(f"  [farside] Missing IBIT or Total column in headers: {header_names}")
+        return None
 
-        tk = yf.Ticker(ticker_symbol)
-        hist = tk.history(period=f'{days}d')
-        if hist.empty:
-            return
-
-        info = tk.info
-        current_nav = info.get('navPrice') or info.get('regularMarketPrice')
-        if not current_nav:
-            return
-
-        conn = get_db()
+    # Parse all valid date rows and store in DB
+    conn = get_db()
+    c = conn.cursor()
+    # Clear old Yahoo-era rows (total_btc_etf_flow IS NULL) on first Farside load
+    c.execute('DELETE FROM etf_flows WHERE ticker=? AND total_btc_etf_flow IS NULL', ('IBIT',))
+    inserted = 0
+    for row in parser.rows:
+        if len(row) < max(ibit_col, total_col) + 1:
+            continue
+        date_str_raw = row[0].strip()
+        # Skip summary rows (Total, Average, Maximum, Minimum)
         try:
-            c = conn.cursor()
-            for date_idx, row in hist.iterrows():
-                date_str = date_idx.strftime('%Y-%m-%d')
-                nav = float(row['Close'])
-                volume = float(row.get('Volume', 0))
-                open_p = float(row['Open'])
-                close_p = float(row['Close'])
-                direction = 1 if close_p >= open_p else -1
-                # Rough proxy: ~15% of volume is creation/redemption
-                estimated_flow = direction * volume * nav * 0.15
+            dt = datetime.strptime(date_str_raw, "%d %b %Y")
+            date_str = dt.strftime('%Y-%m-%d')
+        except ValueError:
+            continue
 
-                # shares_outstanding=NULL marks this as an estimate (not real data)
-                c.execute('INSERT OR IGNORE INTO etf_flows (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars) VALUES (?,?,?,?,?,?,?)',
-                          (date_str, ticker_symbol, None, None, nav, 0, estimated_flow))
-            conn.commit()
-        finally:
-            conn.close()
-        print(f"  [etf-flows] Backfilled {len(hist)} days for {ticker_symbol}")
-    except Exception as e:
-        print(f"  [etf-flows] Backfill failed for {ticker_symbol}: {e}")
+        ibit_flow = _parse_farside_value(row[ibit_col]) * 1_000_000
+        total_flow = _parse_farside_value(row[total_col]) * 1_000_000
+
+        c.execute('''INSERT OR REPLACE INTO etf_flows
+            (date, ticker, shares_outstanding, aum, nav, daily_flow_shares, daily_flow_dollars, total_btc_etf_flow)
+            VALUES (?,?,?,?,?,?,?,?)''',
+            (date_str, 'IBIT', None, None, None, 0, ibit_flow, total_flow))
+        inserted += 1
+    conn.commit()
+
+    # Read back recent data for streak/momentum calculation
+    c.execute('SELECT date, daily_flow_dollars, total_btc_etf_flow FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 5',
+              ('IBIT',))
+    history = c.fetchall()
+    conn.close()
+
+    if inserted > 0:
+        print(f"  [farside] Stored {inserted} days of IBIT flow data")
+
+    if not history:
+        return None
+
+    # Today's flow
+    daily_flow_dollars = history[0][1] or 0.0
+    total_btc_etf_flow = history[0][2] or 0.0
+
+    # Streak: consecutive same-direction days
+    streak = 0
+    direction = 1 if daily_flow_dollars >= 0 else -1
+    for h in history:
+        flow = h[1] or 0.0
+        if (flow >= 0) == (direction > 0):
+            streak += 1
+        else:
+            break
+    streak *= direction
+
+    # 5-day average
+    avg_flow_5d = sum((h[1] or 0.0) for h in history) / len(history)
+
+    # Strength
+    abs_flow = abs(daily_flow_dollars)
+    if abs_flow < 10_000_000:
+        strength = 'negligible'
+    elif abs_flow < 50_000_000:
+        strength = 'minor'
+    elif abs_flow < 200_000_000:
+        strength = 'moderate'
+    else:
+        strength = 'strong'
+
+    return {
+        'daily_flow_shares': 0,
+        'daily_flow_dollars': float(daily_flow_dollars),
+        'direction': 'inflow' if daily_flow_dollars >= 0 else 'outflow',
+        'strength': strength,
+        'streak': int(streak),
+        'avg_flow_5d': float(avg_flow_5d),
+        'shares_outstanding': None,
+        'total_btc_etf_flow': float(total_btc_etf_flow),
+    }
 
 
 # ── CANDLES ─────────────────────────────────────────────────────────────────
@@ -804,7 +866,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
     conn.close()
 
-    etf_flows = fetch_etf_flows(ticker_symbol) if is_crypto else None
+    etf_flows = fetch_farside_flows() if is_crypto else None
 
     # Collect options data
     strike_data = {}
@@ -1823,12 +1885,11 @@ REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
     pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
-    # Phase 0: Backfill ETF flow history (estimates for chart, real data accumulates daily)
-    for tk in TICKER_CONFIG:
-        try:
-            backfill_etf_flows(tk, days=90)
-        except Exception as e:
-            print(f"  [bg-refresh] ETF flow backfill {tk} error: {e}")
+    # Phase 0: Fetch Farside ETF flow data (full history on first run)
+    try:
+        fetch_farside_flows()
+    except Exception as e:
+        print(f"  [bg-refresh] Farside flow fetch error: {e}")
 
     # Phase 1: Backfill candles for all tickers
     for tk, cfg in TICKER_CONFIG.items():
@@ -1858,12 +1919,11 @@ def _bg_refresh():
                         print(f"  [bg-refresh] Candle update {symbol}/{tf} error: {e}")
             last_candle_update = now
 
-        # ETF flow snapshots for all tickers
-        for tk in TICKER_CONFIG:
-            try:
-                fetch_etf_flows(tk)
-            except Exception as e:
-                print(f"  [bg-refresh] ETF flow {tk} error: {e}")
+        # Refresh Farside ETF flow data
+        try:
+            fetch_farside_flows()
+        except Exception as e:
+            print(f"  [bg-refresh] Farside flow error: {e}")
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
@@ -1952,11 +2012,11 @@ def api_flows():
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT date, daily_flow_dollars, shares_outstanding, aum, nav FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 30', (ticker,))
+    c.execute('SELECT date, daily_flow_dollars, shares_outstanding, aum, nav, total_btc_etf_flow FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT 30', (ticker,))
     rows = c.fetchall()
     conn.close()
     rows.reverse()
-    data = [{'date': r[0], 'flow': r[1], 'shares': r[2], 'aum': r[3], 'nav': r[4]} for r in rows]
+    data = [{'date': r[0], 'flow': r[1], 'shares': r[2], 'aum': r[3], 'nav': r[4], 'total_flow': r[5]} for r in rows]
     return Response(json.dumps(data), mimetype='application/json')
 
 
@@ -2117,6 +2177,7 @@ def run_analysis(ticker='IBIT'):
             'oi_changes': d['oi_changes'],
             'etf_flows': {
                 'daily_flow_millions': round(d['etf_flows']['daily_flow_dollars'] / 1e6, 1),
+                'total_btc_etf_flow_millions': round(d['etf_flows'].get('total_btc_etf_flow', 0) / 1e6, 1),
                 'direction': d['etf_flows']['direction'],
                 'strength': d['etf_flows']['strength'],
                 'streak': d['etf_flows']['streak'],
@@ -2183,7 +2244,7 @@ Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new 
 
 Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
 
-ETF fund flows (etf_flows) show daily creation/redemption activity. Positive = institutional inflows, negative = outflows. A streak of 3+ days in one direction is significant. Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
+ETF fund flows (etf_flows) show daily creation/redemption activity from Farside Investors. 'daily_flow_millions' is IBIT-specific flow; 'total_btc_etf_flow_millions' is the total across ALL BTC spot ETFs (IBIT, FBTC, ARKB, GBTC, etc.). Positive = inflows, negative = outflows. A streak of 3+ days in one direction is significant. IMPORTANT: Distinguish between IBIT-specific outflows and total BTC ETF outflows. If IBIT has outflows but total BTC ETFs have inflows, that's fund rotation (not bearish). If ALL BTC ETFs have outflows, that's genuine institutional exit (bearish). Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
