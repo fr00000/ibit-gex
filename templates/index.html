@@ -359,9 +359,14 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <canvas id="delta-chart"></canvas>
   </div>
   <div class="cell cell-structure">
-    <div class="cell-label">Structure <span style="font-size:7px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:3px">30d wall evolution</span></div>
+    <div class="cell-label">
+      <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Walls</span>
+      <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heatmap</span>
+      <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heatmap</span>
+    </div>
     <canvas id="structure-chart"></canvas>
-    <div style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+    <canvas id="heatmap-chart" style="display:none"></canvas>
+    <div id="struct-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(0,220,130,0.12);border:1px solid rgba(0,220,130,0.55);border-radius:1px"></span>0-3d</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(0,180,220,0.10);border:1px solid rgba(0,180,220,0.45);border-radius:1px"></span>4-7d</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(56,144,255,0.08);border:1px solid rgba(56,144,255,0.35);border-radius:1px"></span>8-14d</span>
@@ -370,6 +375,11 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:2px;background:rgba(220,224,232,0.9)"></span>Spot</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.6)"></span>&gamma; Flip</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>Venue agree</span>
+    </div>
+    <div id="heat-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+      <span id="heat-legend-oi" style="display:none;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:40px;height:6px;background:linear-gradient(to right,rgba(56,144,255,0.05),rgba(56,144,255,0.40));border-radius:1px"></span>OI density (low &rarr; high)</span>
+      <span id="heat-legend-gex" style="display:none;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:40px;height:6px;background:linear-gradient(to right,rgba(255,64,96,0.35),rgba(56,56,56,0.1),rgba(0,220,130,0.35));border-radius:1px"></span>GEX (put &rarr; call)</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:2px;background:rgba(220,224,232,0.9)"></span>Spot</span>
     </div>
   </div>
   <div class="cell cell-flow">
@@ -1402,12 +1412,125 @@ const STRUCT_WINDOWS=[
   {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
 ];
 
+let structView='walls';
+let heatmapData=null;
+function setStructView(view){
+  structView=view;
+  document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
+  const isWalls=view==='walls';
+  document.getElementById('structure-chart').style.display=isWalls?'':'none';
+  document.getElementById('heatmap-chart').style.display=isWalls?'none':'';
+  document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
+  document.getElementById('heat-legend').style.display=isWalls?'none':'flex';
+  document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
+  document.getElementById('heat-legend-gex').style.display=view==='heatmap-gex'?'flex':'none';
+  if(!isWalls) loadHeatmap();
+}
+async function loadHeatmap(){
+  try{
+    if(!heatmapData){
+      const r=await fetch(`/api/structure/heatmap?ticker=${currentTicker}&days=30`);
+      heatmapData=await r.json();
+    }
+    renderHeatmap();
+  }catch(e){console.warn('Heatmap:',e)}
+}
+function renderHeatmap(){
+  if(!heatmapData||!heatmapData.dates||!heatmapData.dates.length)return;
+  const canvas=document.getElementById('heatmap-chart');
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=canvas.clientWidth*dpr;canvas.height=canvas.clientHeight*dpr;
+  ctx.scale(dpr,dpr);
+  const W=canvas.clientWidth,H=canvas.clientHeight;
+  const mode=structView==='heatmap-gex'?'gex':'oi';
+  const dates=heatmapData.dates;
+  const buckets=heatmapData.buckets;
+  const bucketSize=heatmapData.bucket_size||1000;
+  if(!dates.length||!buckets.length)return;
+
+  // Focus on buckets near spot (±20%)
+  const spot=window._lastData?window._lastData.btc_spot:buckets[Math.floor(buckets.length/2)];
+  const lo=spot*0.8,hi=spot*1.2;
+  const visBuckets=buckets.filter(b=>b>=lo&&b<=hi);
+  if(!visBuckets.length)return;
+
+  const pad={top:12,right:45,bottom:18,left:8};
+  const plotW=W-pad.left-pad.right;
+  const plotH=H-pad.top-pad.bottom;
+  const cellW=plotW/dates.length;
+  const cellH=plotH/visBuckets.length;
+
+  // Find max value for normalization
+  let maxVal=0;
+  for(const date of dates){
+    const cells=heatmapData.data[date]||[];
+    for(const cell of cells){
+      const v=mode==='oi'?cell.total_oi:Math.abs(cell.net_gex);
+      if(v>maxVal)maxVal=v;
+    }
+  }
+  if(maxVal===0)return;
+
+  // Clear
+  ctx.fillStyle='#06080c';ctx.fillRect(0,0,W,H);
+
+  // Draw cells
+  for(let di=0;di<dates.length;di++){
+    const cells=heatmapData.data[dates[di]]||[];
+    const cellMap={};
+    for(const cell of cells)cellMap[cell.price]=cell;
+    const x=pad.left+di*cellW;
+    for(let bi=0;bi<visBuckets.length;bi++){
+      const b=visBuckets[visBuckets.length-1-bi];
+      const cell=cellMap[b];
+      if(!cell)continue;
+      const y=pad.top+bi*cellH;
+      if(mode==='oi'){
+        const intensity=Math.min(cell.total_oi/maxVal,1);
+        const alpha=0.05+intensity*0.45;
+        ctx.fillStyle=`rgba(56,144,255,${alpha})`;
+      }else{
+        const intensity=Math.min(Math.abs(cell.net_gex)/maxVal,1);
+        const alpha=0.05+intensity*0.45;
+        ctx.fillStyle=cell.net_gex>=0?`rgba(0,220,130,${alpha})`:`rgba(255,64,96,${alpha})`;
+      }
+      ctx.fillRect(x,y,cellW-0.5,cellH-0.5);
+    }
+  }
+
+  // Draw spot line
+  if(spot>=visBuckets[0]&&spot<=visBuckets[visBuckets.length-1]){
+    const spotFrac=1-(spot-visBuckets[0])/(visBuckets[visBuckets.length-1]-visBuckets[0]);
+    const spotY=pad.top+spotFrac*plotH;
+    ctx.save();ctx.setLineDash([3,3]);ctx.strokeStyle='rgba(255,255,255,0.5)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(pad.left,spotY);ctx.lineTo(pad.left+plotW,spotY);ctx.stroke();ctx.restore();
+  }
+
+  // X-axis labels (dates)
+  ctx.fillStyle='#4a5568';ctx.font='8px IBM Plex Mono';ctx.textAlign='center';ctx.textBaseline='top';
+  const xStep=Math.max(1,Math.floor(dates.length/6));
+  for(let i=0;i<dates.length;i+=xStep){
+    ctx.fillText(dates[i].slice(5),pad.left+i*cellW+cellW/2,H-pad.bottom+4);
+  }
+
+  // Y-axis labels (prices)
+  ctx.textAlign='left';ctx.textBaseline='middle';
+  const yStep=Math.max(1,Math.floor(visBuckets.length/6));
+  for(let i=0;i<visBuckets.length;i+=yStep){
+    const b=visBuckets[visBuckets.length-1-i];
+    const y=pad.top+i*cellH+cellH/2;
+    ctx.fillText(fB(b),pad.left+plotW+3,y);
+  }
+}
+
 async function loadStructure(){
   try{
     const r=await fetch(`/api/structure?ticker=${currentTicker}&days=30`);
     const d=await r.json();
     renderStructure(d);
   }catch(e){console.warn('Structure:',e)}
+  heatmapData=null; // invalidate cache on refresh
 }
 
 function renderStructure(data){
