@@ -32,11 +32,11 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .hdr-sep{width:1px;height:18px;background:var(--border2)}
 .range-btn{background:var(--bg3);color:var(--t3);border:1px solid var(--border2);border-radius:2px;padding:2px 8px;font-family:var(--mono);font-size:10px;cursor:pointer}
 .range-btn.active{color:var(--t1);border-color:var(--t2)}
-.chart-wrap{flex:1;padding:12px;position:relative}
+.chart-wrap{flex:1;min-height:0;padding:12px;position:relative}
 canvas{width:100%!important;height:100%!important}
-.legend{display:flex;gap:16px;padding:6px 12px;background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;align-items:center;justify-content:center}
-.leg-item{display:flex;align-items:center;gap:4px;font-size:9px;color:var(--t3)}
-.leg-swatch{width:20px;height:8px;border-radius:1px}
+.legend{display:flex;gap:16px;padding:8px 12px;background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;align-items:center;justify-content:center;flex-wrap:wrap}
+.leg-item{display:flex;align-items:center;gap:5px;font-size:10px;color:#8892a4}
+.leg-swatch{width:20px;height:10px;border-radius:1px}
 .empty-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px;text-align:center;padding:40px}
 </style>
 </head>
@@ -49,35 +49,46 @@ canvas{width:100%!important;height:100%!important}
   <button class="range-btn" onclick="load(7)" id="btn-7">7d</button>
   <button class="range-btn active" onclick="load(30)" id="btn-30">30d</button>
   <button class="range-btn" onclick="load(90)" id="btn-90">90d</button>
+  <div class="hdr-sep"></div>
+  <button class="range-btn" onclick="toggleFocus()" id="btn-focus">Focus</button>
 </div>
 <div class="chart-wrap">
   <canvas id="chart"></canvas>
   <div class="empty-msg" id="empty" style="display:none">Collecting data &mdash; structure chart populates after the first few days of predictions.</div>
 </div>
 <div class="legend">
-  <div class="leg-item"><div class="leg-swatch" style="background:rgba(0,220,130,0.25)"></div>0-3d</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:rgba(56,144,255,0.25)"></div>4-7d</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:rgba(56,144,255,0.15)"></div>8-14d</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:rgba(168,139,250,0.15)"></div>15-30d</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:rgba(168,139,250,0.08)"></div>31-45d</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:var(--t1);height:2px"></div>Spot</div>
-  <div class="leg-item"><div class="leg-swatch" style="background:var(--amber);height:1px;border-top:1px dashed var(--amber)"></div>&gamma; Flip</div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(0,220,130,0.12);border:1.5px solid rgba(0,220,130,0.55)"></div><span>0-3d</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(0,180,220,0.10);border:1.5px solid rgba(0,180,220,0.45)"></div><span>4-7d</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(56,144,255,0.08);border:1.5px solid rgba(56,144,255,0.35)"></div><span>8-14d</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(255,176,32,0.06);border:1.5px solid rgba(255,176,32,0.25)"></div><span>15-30d</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:rgba(168,139,250,0.06);border:1.5px solid rgba(168,139,250,0.25)"></div><span>31-45d</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:var(--t1);height:2px;border:none"></div><span>Spot</span></div>
+  <div class="leg-item"><div class="leg-swatch" style="background:none;height:0;border-top:1.5px dashed rgba(255,176,32,0.6);border-left:none;border-right:none;border-bottom:none"></div><span>&gamma; Flip</span></div>
+  <div class="leg-item"><span style="color:rgba(0,220,130,0.9);font-size:12px">&#9670;</span><span>Venue agree</span></div>
 </div>
 <script>
 let chart = null;
 let currentDays = 30;
+let focusMode = false;
+let latestSpot = null;
 
 const WINDOWS = [
-  {key:'31-45', label:'31-45d', bg:'rgba(168,139,250,0.04)', border:'rgba(168,139,250,0.15)'},
-  {key:'15-30', label:'15-30d', bg:'rgba(168,139,250,0.06)', border:'rgba(168,139,250,0.25)'},
-  {key:'8-14',  label:'8-14d',  bg:'rgba(56,144,255,0.08)',  border:'rgba(56,144,255,0.3)'},
-  {key:'4-7',   label:'4-7d',   bg:'rgba(56,144,255,0.12)',  border:'rgba(56,144,255,0.4)'},
-  {key:'0-3',   label:'0-3d',   bg:'rgba(0,220,130,0.15)',   border:'rgba(0,220,130,0.5)'},
+  {key:'31-45', label:'31-45d', bg:'rgba(168,139,250,0.06)', border:'rgba(168,139,250,0.25)', bw: 1},
+  {key:'15-30', label:'15-30d', bg:'rgba(255,176,32,0.06)',  border:'rgba(255,176,32,0.25)',  bw: 1},
+  {key:'8-14',  label:'8-14d',  bg:'rgba(56,144,255,0.08)',  border:'rgba(56,144,255,0.35)',  bw: 1.5},
+  {key:'4-7',   label:'4-7d',   bg:'rgba(0,180,220,0.10)',   border:'rgba(0,180,220,0.45)',   bw: 1.5},
+  {key:'0-3',   label:'0-3d',   bg:'rgba(0,220,130,0.12)',   border:'rgba(0,220,130,0.55)',   bw: 2},
 ];
+
+function toggleFocus() {
+  focusMode = !focusMode;
+  document.getElementById('btn-focus').classList.toggle('active', focusMode);
+  load(currentDays);
+}
 
 function load(days) {
   currentDays = days;
-  document.querySelectorAll('.range-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.range-btn:not(#btn-focus)').forEach(b => b.classList.remove('active'));
   document.getElementById('btn-' + days).classList.add('active');
   fetch('/api/structure?ticker=IBIT&days=' + days)
     .then(r => r.json())
@@ -99,6 +110,9 @@ function render(data) {
   emptyEl.style.display = 'none';
   canvas.style.display = 'block';
 
+  // Extract latest spot for focus mode
+  latestSpot = data[dates[dates.length - 1]]?.spot || null;
+
   // Detect expiry rollovers (>5% jump in 0-3d call wall)
   const expirySet = new Set();
   for (let i = 1; i < dates.length; i++) {
@@ -119,23 +133,23 @@ function render(data) {
       label: w.label + ' CW',
       data: dates.map(d => data[d]?.windows?.[w.key]?.call_wall || null),
       borderColor: w.border,
-      borderWidth: 1,
+      borderWidth: w.bw,
       pointRadius: 0,
       fill: false,
       spanGaps: true,
-      tension: 0.2,
+      tension: 0,
     });
     // Put wall (bottom line, fill up to previous dataset = call wall)
     datasets.push({
       label: w.label + ' PW',
       data: dates.map(d => data[d]?.windows?.[w.key]?.put_wall || null),
       borderColor: w.border,
-      borderWidth: 1,
+      borderWidth: w.bw,
       pointRadius: 0,
       fill: '-1',
       backgroundColor: w.bg,
       spanGaps: true,
-      tension: 0.2,
+      tension: 0,
     });
   }
 
@@ -149,7 +163,7 @@ function render(data) {
     pointRadius: 0,
     fill: false,
     spanGaps: true,
-    tension: 0.2,
+    tension: 0,
   });
 
   // Spot — solid white
@@ -157,13 +171,50 @@ function render(data) {
     label: 'Spot',
     data: dates.map(d => data[d]?.spot || null),
     borderColor: 'rgba(220,224,232,0.9)',
-    borderWidth: 2,
+    borderWidth: 2.5,
     pointRadius: 2,
     pointBackgroundColor: 'rgba(220,224,232,0.9)',
     fill: false,
     spanGaps: true,
-    tension: 0.2,
+    tension: 0,
   });
+
+  // Venue agreement markers on 0-3d walls
+  const hasAgree = dates.some(d => data[d]?.windows?.['0-3']?.venue_agree);
+  if (hasAgree) {
+    datasets.push({
+      label: 'Venue agree (CW)',
+      data: dates.map(d => {
+        const w = data[d]?.windows?.['0-3'];
+        return (w && w.venue_agree) ? w.call_wall : null;
+      }),
+      borderColor: 'transparent',
+      backgroundColor: 'rgba(0,220,130,0.9)',
+      pointRadius: 4,
+      pointStyle: 'rectRot',
+      pointBorderColor: 'rgba(0,220,130,1)',
+      pointBorderWidth: 1,
+      showLine: false,
+      fill: false,
+      spanGaps: false,
+    });
+    datasets.push({
+      label: 'Venue agree (PW)',
+      data: dates.map(d => {
+        const w = data[d]?.windows?.['0-3'];
+        return (w && w.venue_agree) ? w.put_wall : null;
+      }),
+      borderColor: 'transparent',
+      backgroundColor: 'rgba(0,220,130,0.9)',
+      pointRadius: 4,
+      pointStyle: 'rectRot',
+      pointBorderColor: 'rgba(0,220,130,1)',
+      pointBorderWidth: 1,
+      showLine: false,
+      fill: false,
+      spanGaps: false,
+    });
+  }
 
   // Store data ref for tooltip
   window._structData = data;
@@ -227,13 +278,18 @@ function render(data) {
             },
             font: { size: 10, family: "'IBM Plex Mono'" },
             maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 15,
             callback: function(val, idx) {
               const d = this.getLabelForValue(val);
-              return d ? d.slice(5) : '';  // show MM-DD only
+              return d ? d.slice(5) : '';  // MM-DD format
             },
           },
         },
         y: {
+          grace: focusMode ? '0%' : '5%',
+          min: focusMode && latestSpot ? latestSpot * 0.85 : undefined,
+          max: focusMode && latestSpot ? latestSpot * 1.15 : undefined,
           grid: { color: 'rgba(28,34,48,0.5)' },
           ticks: {
             color: '#4a5568',
