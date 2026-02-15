@@ -2493,6 +2493,8 @@ def run_analysis(ticker='IBIT', save=True):
                     'put_wall_btc': round(ibit_lvl['put_wall'] / bps),
                     'gamma_flip_btc': round(ibit_lvl['gamma_flip'] / bps),
                     'regime': ibit_lvl.get('regime'),
+                    'net_vanna': ibit_lvl.get('net_vanna', 0),
+                    'net_charm': ibit_lvl.get('net_charm', 0),
                 },
                 'deribit': {
                     'oi_btc': d.get('deribit_oi_btc', 0),
@@ -2501,6 +2503,8 @@ def run_analysis(ticker='IBIT', save=True):
                     'put_wall_btc': round(deribit_lvl.get('put_wall', 0)) if deribit_lvl else None,
                     'gamma_flip_btc': round(deribit_lvl.get('gamma_flip', 0)) if deribit_lvl else None,
                     'regime': deribit_lvl.get('regime') if deribit_lvl else None,
+                    'net_vanna': deribit_lvl.get('net_vanna', 0) if deribit_lvl else 0,
+                    'net_charm': deribit_lvl.get('net_charm', 0) if deribit_lvl else 0,
                 },
             }
 
@@ -2557,6 +2561,7 @@ venue_breakdown (when present) shows per-venue positioning. Use it to identify d
 - If Deribit has a big wall that IBIT doesn't → crypto-native positioning that TradFi hasn't hedged around; watch for convergence
 - If gamma flips differ between venues → note which venue is in positive vs negative gamma territory
 Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
+venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
 Note: significant_levels and breakout are derived from IBIT options data only. flow_forecast uses combined IBIT + Deribit data. Dealer delta scenarios include both IBIT and Deribit contributions.
 
