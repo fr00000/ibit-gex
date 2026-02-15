@@ -604,6 +604,50 @@ def _parse_farside_value(text):
         return 0.0
 
 
+def _compute_ibit_freshness():
+    """Compute hours since last US options market close (Mon-Fri 4:15 PM ET)."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo('America/New_York')
+    now_et = datetime.now(et)
+
+    candidate = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+
+    if now_et.weekday() < 5:  # Mon-Fri
+        if now_et >= candidate:
+            last_close = candidate
+        else:
+            days_back = 1 if now_et.weekday() > 0 else 3
+            last_close = candidate - timedelta(days=days_back)
+    else:
+        days_back = now_et.weekday() - 4
+        last_close = candidate - timedelta(days=days_back)
+
+    age_hours = (now_et - last_close).total_seconds() / 3600
+    as_of_str = last_close.strftime('%Y-%m-%d %H:%M ET')
+    in_market = (now_et.weekday() < 5 and
+                 now_et.replace(hour=9, minute=30) <= now_et <= candidate)
+
+    return {
+        'age_hours': round(age_hours, 1),
+        'as_of': as_of_str,
+        'in_market_hours': in_market,
+    }
+
+
+def _compute_deribit_freshness():
+    """Compute minutes since last Deribit data fetch."""
+    with _deribit_lock:
+        cache_time = _deribit_cache.get('time', 0)
+    if cache_time == 0:
+        return {'age_minutes': None, 'as_of': None}
+    age_min = (time.time() - cache_time) / 60
+    as_of_str = datetime.fromtimestamp(cache_time).strftime('%Y-%m-%d %H:%M UTC')
+    return {
+        'age_minutes': round(age_min, 0),
+        'as_of': as_of_str,
+    }
+
+
 # Farside page cache: at most 1 fetch per hour
 _farside_cache = {'html': None, 'time': 0}
 _farside_lock = threading.Lock()
@@ -1487,6 +1531,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                                 for k, v in combined_levels_btc.items()} if combined_levels_btc else None,
         'deribit_levels_btc': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                                for k, v in deribit_levels_btc.items()} if deribit_levels_btc else None,
+        'data_freshness': {
+            'ibit': _compute_ibit_freshness(),
+            'deribit': _compute_deribit_freshness() if deribit_available else {'age_minutes': None, 'as_of': None},
+        },
     }
 
 
@@ -2484,6 +2532,7 @@ def run_analysis(ticker='IBIT', save=True):
                 name: round(delta) if delta is not None else None
                 for name, delta in (d.get('dealer_delta_briefing', {}).get('key_level_deltas', {}) or {}).items()
             } if d.get('dealer_delta_briefing') else None,
+            'data_freshness': d.get('data_freshness'),
         }
 
         # Per-venue breakdown for divergence analysis
@@ -2564,6 +2613,10 @@ venue_breakdown (when present) shows per-venue positioning. Use it to identify d
 - If Deribit has a big wall that IBIT doesn't → crypto-native positioning that TradFi hasn't hedged around; watch for convergence
 - If gamma flips differ between venues → note which venue is in positive vs negative gamma territory
 Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
+
+DATA FRESHNESS:
+data_freshness shows how stale each venue's data is. IBIT options data updates once per day at US market close (4:15 PM ET) — age_hours tells you how many hours since that last close. Deribit data is near real-time (cached up to 60 minutes) — age_minutes tells you minutes since last fetch. If IBIT age_hours > 16 (e.g., weekend or overnight), note that IBIT levels may be stale while Deribit reflects current positioning. If in_market_hours is true, IBIT data is from the current or most recent session and is fresh. On weekends, IBIT data can be 40+ hours old — Deribit levels become more reliable for current positioning.
+
 venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
 Note: significant_levels and breakout are derived from IBIT options data only. flow_forecast uses combined IBIT + Deribit data. Dealer delta scenarios include both IBIT and Deribit contributions.
