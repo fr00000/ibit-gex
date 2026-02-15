@@ -707,6 +707,8 @@ function renderOI(data){
   const ctx=document.getElementById('oi-chart');
   if(oiChart)oiChart.destroy();
   const labels=data.gex_chart.map(d=>fB(d.btc));
+  const oiSpotBtc=data.btc_spot||0;
+  const oiSpotIdx=data.gex_chart.reduce((best,d,i)=>Math.abs(d.btc-oiSpotBtc)<Math.abs(data.gex_chart[best].btc-oiSpotBtc)?i:best,0);
   oiChart=new Chart(ctx,{
     type:'bar',
     data:{labels,datasets:[
@@ -720,7 +722,13 @@ function renderOI(data){
         x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
         y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${(v/1000).toFixed(0)}K`},grid:{color:'#111620'},border:{color:'#1c2230'}}
       }
-    }
+    },
+    plugins:[{id:'spotLine',afterDatasetsDraw(chart){
+      const meta=chart.getDatasetMeta(0);if(!meta.data[oiSpotIdx])return;
+      const x=meta.data[oiSpotIdx].x,{top,bottom}=chart.chartArea,c=chart.ctx;
+      c.save();c.setLineDash([3,3]);c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=1;
+      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();c.restore();
+    }}]
   });
 }
 
