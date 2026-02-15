@@ -212,6 +212,61 @@ def init_db():
     cols = [row[1] for row in c.execute('PRAGMA table_info(etf_flows)').fetchall()]
     if 'total_btc_etf_flow' not in cols:
         c.execute('ALTER TABLE etf_flows ADD COLUMN total_btc_etf_flow REAL')
+    c.execute('''CREATE TABLE IF NOT EXISTS predictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        analysis_date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        expiry_date TEXT NOT NULL,
+        dte INTEGER NOT NULL,
+        dte_window TEXT NOT NULL,
+        spot_btc REAL,
+        call_wall_btc REAL,
+        put_wall_btc REAL,
+        gamma_flip_btc REAL,
+        max_pain_btc REAL,
+        regime TEXT,
+        net_gex REAL,
+        net_dealer_delta REAL,
+        dealer_delta_direction TEXT,
+        charm_direction TEXT,
+        charm_notional REAL,
+        charm_strength TEXT,
+        vanna_strength TEXT,
+        overnight_direction TEXT,
+        overnight_notional REAL,
+        deribit_available INTEGER DEFAULT 0,
+        ibit_call_wall_btc REAL,
+        ibit_put_wall_btc REAL,
+        deribit_call_wall_btc REAL,
+        deribit_put_wall_btc REAL,
+        venue_walls_agree INTEGER,
+        em_upper_btc REAL,
+        em_lower_btc REAL,
+        ai_bottom_line TEXT,
+        scored INTEGER DEFAULT 0,
+        scored_date TEXT,
+        btc_high_on_expiry REAL,
+        btc_low_on_expiry REAL,
+        btc_close_on_expiry REAL,
+        btc_high_in_window REAL,
+        btc_low_in_window REAL,
+        call_wall_held INTEGER,
+        put_wall_held INTEGER,
+        range_held INTEGER,
+        em_held INTEGER,
+        regime_correct INTEGER,
+        charm_correct INTEGER,
+        venue_agree_held INTEGER,
+        max_breach_call_pct REAL,
+        max_breach_put_pct REAL,
+        realized_range_pct REAL,
+        call_wall_error_pct REAL,
+        put_wall_error_pct REAL,
+        UNIQUE(analysis_date, ticker, expiry_date)
+    )''')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_pred_expiry ON predictions(expiry_date, scored)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_pred_dte ON predictions(dte, scored)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_pred_ticker ON predictions(ticker, scored)')
     conn.commit()
     conn.close()
 
@@ -2282,6 +2337,42 @@ def _bg_refresh():
                     except Exception as e:
                         print(f"  [bg-refresh] {tk} AI analysis error: {e}")
 
+            # 6 AM ET anchor: IBIT OI is from last close, Deribit is live,
+            # prediction is forward-looking for the trading day.
+            try:
+                from zoneinfo import ZoneInfo
+                now_et = datetime.now(ZoneInfo('America/New_York'))
+                if now_et.hour == 6 and now_et.minute < 30:
+                    conn = get_db()
+                    c = conn.cursor()
+                    already_saved = c.execute(
+                        'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
+                        (today, tk)).fetchone()
+                    if not already_saved:
+                        # Gather results for all DTE windows
+                        pred_results = {}
+                        for label, min_d, max_d in DTE_WINDOWS:
+                            _, cached = get_latest_cache(tk, max_d)
+                            if cached:
+                                pred_results[label] = cached
+                        cached_analysis = get_cached_analysis(tk)
+                        if pred_results:
+                            save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
+                            print(f"  [predictions] Saved {tk} predictions (6 AM ET snapshot)")
+                    conn.close()
+            except Exception as e:
+                print(f"  [predictions] Save failed for {tk}: {e}")
+
+        # Score any expired predictions
+        try:
+            conn = get_db()
+            scored = score_expired_predictions(conn)
+            if scored:
+                print(f"  [predictions] Scored {scored} expired predictions")
+            conn.close()
+        except Exception as e:
+            print(f"  [predictions] Scoring failed: {e}")
+
         # Sleep 5 min (candle update cadence), but also covers GEX re-check
         time.sleep(300)
 
@@ -2296,6 +2387,115 @@ def start_bg_refresh():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/structure')
+def structure_page():
+    return render_template('structure.html')
+
+
+@app.route('/api/structure')
+def api_structure():
+    conn = get_db()
+    c = conn.cursor()
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    days = int(request.args.get('days', 30))
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    rows = c.execute('''
+        SELECT p.analysis_date, p.dte_window, p.spot_btc, p.call_wall_btc, p.put_wall_btc,
+               p.gamma_flip_btc, p.regime, p.venue_walls_agree,
+               p.deribit_call_wall_btc, p.deribit_put_wall_btc,
+               p.ibit_call_wall_btc, p.ibit_put_wall_btc
+        FROM predictions p
+        INNER JOIN (
+            SELECT analysis_date, dte_window, MIN(dte) as min_dte
+            FROM predictions WHERE ticker=? AND analysis_date >= ?
+            GROUP BY analysis_date, dte_window
+        ) g ON p.analysis_date = g.analysis_date AND p.dte_window = g.dte_window AND p.dte = g.min_dte
+        WHERE p.ticker=? AND p.analysis_date >= ?
+        ORDER BY p.analysis_date, p.dte_window
+    ''', (ticker, cutoff, ticker, cutoff)).fetchall()
+
+    # Layer 0: snapshots (oldest data, single-window only)
+    data = {}
+    snap_rows = c.execute('''SELECT date, spot, btc_price, call_wall, put_wall, gamma_flip, regime
+                             FROM snapshots WHERE ticker=? AND date >= ? ORDER BY date''',
+                          (ticker, cutoff)).fetchall()
+    for date, spot_ibit, btc_p, cw_ibit, pw_ibit, gf_ibit, regime in snap_rows:
+        bps = btc_p / spot_ibit if spot_ibit else 1
+        data[date] = {'spot': btc_p, 'windows': {
+            '0-3': {
+                'call_wall': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'put_wall': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'gamma_flip': gf_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'regime': regime, 'venue_agree': False,
+                'deribit_cw': None, 'deribit_pw': None,
+                'ibit_cw': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'ibit_pw': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
+            }
+        }}
+
+    # Layer 1: data_cache (per-DTE-window, overwrites snapshots)
+    dte_to_window = {3: '0-3', 7: '4-7', 14: '8-14', 30: '15-30', 45: '31-45'}
+    cache_rows = c.execute('''SELECT date, dte, data_json FROM data_cache
+                              WHERE ticker=? AND date >= ? ORDER BY date, dte''',
+                           (ticker, cutoff)).fetchall()
+    for date, dte, data_json_str in cache_rows:
+        d = json.loads(data_json_str)
+        window = dte_to_window.get(dte)
+        if not window:
+            continue
+        bps = d.get('btc_per_share', 1)
+        lvl = d.get('levels', {})
+        combined = d.get('combined_levels_btc') or {}
+        deribit = d.get('deribit_levels_btc') or {}
+
+        if combined:
+            cw = combined.get('call_wall')
+            pw = combined.get('put_wall')
+            gf = combined.get('gamma_flip')
+            regime = combined.get('regime', lvl.get('regime'))
+        else:
+            cw = lvl.get('call_wall', 0) / bps if bps else None
+            pw = lvl.get('put_wall', 0) / bps if bps else None
+            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            regime = lvl.get('regime')
+
+        ibit_cw = lvl.get('call_wall', 0) / bps if bps else None
+        ibit_pw = lvl.get('put_wall', 0) / bps if bps else None
+        deribit_cw = deribit.get('call_wall')
+        deribit_pw = deribit.get('put_wall')
+        venue_agree = False
+        if deribit_cw and ibit_cw and ibit_cw > 0:
+            venue_agree = abs(deribit_cw - ibit_cw) / ibit_cw < 0.03
+
+        if date not in data:
+            data[date] = {'spot': d.get('btc_spot'), 'windows': {}}
+        data[date]['windows'][window] = {
+            'call_wall': cw, 'put_wall': pw,
+            'gamma_flip': gf, 'regime': regime,
+            'venue_agree': venue_agree,
+            'deribit_cw': deribit_cw, 'deribit_pw': deribit_pw,
+            'ibit_cw': ibit_cw, 'ibit_pw': ibit_pw,
+        }
+
+    # Override layer: predictions (higher fidelity, takes priority)
+    for r in rows:
+        date = r[0]
+        if date not in data:
+            data[date] = {'spot': r[2], 'windows': {}}
+        data[date]['windows'][r[1]] = {
+            'call_wall': r[3], 'put_wall': r[4],
+            'gamma_flip': r[5], 'regime': r[6],
+            'venue_agree': bool(r[7]),
+            'deribit_cw': r[8], 'deribit_pw': r[9],
+            'ibit_cw': r[10], 'ibit_pw': r[11],
+        }
+
+    conn.close()
+    return Response(json.dumps(data), mimetype='application/json')
 
 
 @app.route('/api/candles')
@@ -2400,6 +2600,237 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
               (today, ticker, json.dumps(analysis)))
     conn.commit()
     conn.close()
+
+
+def save_predictions(ticker, dtes, results, analysis_text=None):
+    """Save structured predictions for each expiry date in each DTE window."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    conn = get_db()
+    c = conn.cursor()
+
+    for label, min_d, max_d in dtes:
+        d = results.get(label)
+        if not d:
+            continue
+
+        window_key = f"{min_d}-{max_d}"
+        bps = d['btc_per_share']
+        lvl = d.get('levels', {})
+        combined_lvl = d.get('combined_levels_btc') or {}
+        deribit_lvl = d.get('deribit_levels_btc') or {}
+        flow = d.get('flow_forecast', {})
+        em = d.get('expected_move') or {}
+        deribit_avail = d.get('deribit_available', False)
+
+        # Use combined levels when available, else IBIT-only converted to BTC
+        if deribit_avail and combined_lvl:
+            cw_btc = combined_lvl.get('call_wall')
+            pw_btc = combined_lvl.get('put_wall')
+            gf_btc = combined_lvl.get('gamma_flip')
+            mp_btc = combined_lvl.get('max_pain')
+            regime = combined_lvl.get('regime', lvl.get('regime'))
+            net_gex = combined_lvl.get('net_gex_total', 0)
+        else:
+            cw_btc = lvl.get('call_wall', 0) / bps if bps else None
+            pw_btc = lvl.get('put_wall', 0) / bps if bps else None
+            gf_btc = lvl.get('gamma_flip', 0) / bps if bps else None
+            mp_btc = lvl.get('max_pain', 0) / bps if bps else None
+            regime = lvl.get('regime')
+            net_gex = lvl.get('net_gex_total', 0)
+
+        # Per-venue walls in BTC
+        ibit_cw = lvl.get('call_wall', 0) / bps if bps else None
+        ibit_pw = lvl.get('put_wall', 0) / bps if bps else None
+        deribit_cw = deribit_lvl.get('call_wall') if deribit_lvl else None
+        deribit_pw = deribit_lvl.get('put_wall') if deribit_lvl else None
+
+        # Venue wall agreement: call walls within 3%
+        walls_agree = 0
+        if deribit_cw and ibit_cw and deribit_cw > 0 and ibit_cw > 0:
+            cw_diff = abs(deribit_cw - ibit_cw) / ibit_cw
+            pw_diff = abs(deribit_pw - ibit_pw) / ibit_pw if (ibit_pw and deribit_pw) else 1
+            walls_agree = 1 if (cw_diff < 0.03 and pw_diff < 0.03) else 0
+
+        # Dealer delta (numeric value from levels, not the narrative string)
+        net_dd = lvl.get('net_dealer_delta')
+        if deribit_avail and combined_lvl:
+            net_dd = combined_lvl.get('net_dealer_delta', net_dd)
+        dd_dir = 'short' if (net_dd is not None and net_dd < 0) else 'long' if net_dd is not None else None
+
+        # Flow forecast fields
+        charm = flow.get('charm', {})
+        overnight = flow.get('overnight', {})
+        vanna = flow.get('vanna', {})
+
+        # AI bottom line (extract from analysis text if available)
+        ai_bl = None
+        if analysis_text and isinstance(analysis_text, dict):
+            text_key = f"{min_d}-{max_d}d"
+            text = analysis_text.get(text_key, '')
+            if 'BOTTOM LINE:' in text:
+                bl_start = text.index('BOTTOM LINE:')
+                bl_end = text.find('\n', bl_start)
+                ai_bl = text[bl_start:bl_end].strip() if bl_end > 0 else text[bl_start:bl_start + 300]
+
+        # Save one row per expiry date in this window
+        expirations = d.get('expirations', [])
+        if not expirations:
+            continue
+
+        spot_btc = d.get('btc_spot')
+
+        for exp_date_str in expirations:
+            try:
+                exp_date = datetime.strptime(exp_date_str, '%Y-%m-%d')
+                analysis_dt = datetime.strptime(today, '%Y-%m-%d')
+                dte = (exp_date - analysis_dt).days
+            except (ValueError, TypeError):
+                continue
+
+            if dte < 0:
+                continue
+
+            c.execute('''INSERT OR REPLACE INTO predictions (
+                analysis_date, ticker, expiry_date, dte, dte_window,
+                spot_btc, call_wall_btc, put_wall_btc, gamma_flip_btc, max_pain_btc,
+                regime, net_gex, net_dealer_delta, dealer_delta_direction,
+                charm_direction, charm_notional, charm_strength,
+                vanna_strength, overnight_direction, overnight_notional,
+                deribit_available, ibit_call_wall_btc, ibit_put_wall_btc,
+                deribit_call_wall_btc, deribit_put_wall_btc, venue_walls_agree,
+                em_upper_btc, em_lower_btc,
+                ai_bottom_line
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+                today, ticker, exp_date_str, dte, window_key,
+                spot_btc, cw_btc, pw_btc, gf_btc, mp_btc,
+                regime, net_gex, net_dd, dd_dir,
+                charm.get('direction'), charm.get('net_notional'), charm.get('strength'),
+                vanna.get('strength'), overnight.get('direction'), overnight.get('net_notional'),
+                1 if deribit_avail else 0, ibit_cw, ibit_pw,
+                deribit_cw, deribit_pw, walls_agree,
+                em.get('upper_btc'), em.get('lower_btc'),
+                ai_bl,
+            ))
+    conn.commit()
+    conn.close()
+
+
+def score_expired_predictions(conn):
+    """Score predictions whose expiry date has passed."""
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    c.execute('''SELECT DISTINCT expiry_date FROM predictions
+                 WHERE scored=0 AND expiry_date < ?''', (today,))
+    expired_dates = [r[0] for r in c.fetchall()]
+
+    if not expired_dates:
+        return 0
+
+    scored_count = 0
+    for exp_date in expired_dates:
+        exp_ts = int(datetime.strptime(exp_date, '%Y-%m-%d').timestamp())
+        exp_candle = c.execute('''SELECT high, low, close FROM btc_candles
+                                  WHERE symbol='BTCUSDT' AND tf='1d'
+                                  AND time >= ? AND time < ?
+                                  ORDER BY time LIMIT 1''',
+                               (exp_ts, exp_ts + 86400)).fetchone()
+
+        if not exp_candle:
+            continue  # no candle data yet
+
+        exp_high, exp_low, exp_close = exp_candle
+
+        preds = c.execute('''SELECT id, analysis_date, spot_btc, call_wall_btc, put_wall_btc,
+                                    gamma_flip_btc, regime, em_upper_btc, em_lower_btc,
+                                    charm_direction, venue_walls_agree, deribit_available
+                             FROM predictions
+                             WHERE expiry_date=? AND scored=0''', (exp_date,)).fetchall()
+
+        for row in preds:
+            (pred_id, analysis_date, spot_btc, cw, pw, gf, regime, em_up, em_lo,
+             charm_dir, venue_agree, deribit_avail) = row
+
+            if not spot_btc:
+                continue
+
+            analysis_ts = int(datetime.strptime(analysis_date, '%Y-%m-%d').timestamp())
+            window_candles = c.execute('''SELECT high, low FROM btc_candles
+                                         WHERE symbol='BTCUSDT' AND tf='1d'
+                                         AND time >= ? AND time <= ?''',
+                                      (analysis_ts, exp_ts + 86400)).fetchall()
+
+            if not window_candles:
+                continue
+
+            win_high = max(r[0] for r in window_candles)
+            win_low = min(r[1] for r in window_candles)
+
+            # Binary scores
+            call_wall_held = 1 if (cw and win_high <= cw) else 0 if cw else None
+            put_wall_held = 1 if (pw and win_low >= pw) else 0 if pw else None
+            range_held = 1 if (call_wall_held == 1 and put_wall_held == 1) else (
+                0 if (call_wall_held is not None and put_wall_held is not None) else None)
+
+            em_held = None
+            if em_up and em_lo:
+                em_held = 1 if (exp_high <= em_up and exp_low >= em_lo) else 0
+
+            # Regime: positive gamma -> tight range, negative -> wide range
+            realized_range_pct = (win_high - win_low) / spot_btc * 100
+            dte_days = max((datetime.strptime(exp_date, '%Y-%m-%d') -
+                           datetime.strptime(analysis_date, '%Y-%m-%d')).days, 1)
+            daily_range = realized_range_pct / dte_days
+            # NOTE: thresholds are initial guesses — tune with real data
+            if regime == 'positive_gamma':
+                regime_correct = 1 if daily_range < 2.0 else 0
+            elif regime == 'negative_gamma':
+                regime_correct = 1 if daily_range > 1.0 else 0
+            else:
+                regime_correct = None
+
+            # Charm: did next session open in predicted direction?
+            next_day = c.execute('''SELECT open FROM btc_candles
+                                    WHERE symbol='BTCUSDT' AND tf='1d'
+                                    AND time > ? ORDER BY time LIMIT 1''',
+                                 (analysis_ts,)).fetchone()
+            charm_correct = None
+            if next_day and charm_dir and spot_btc:
+                next_open = next_day[0]
+                if charm_dir == 'buy':
+                    charm_correct = 1 if next_open > spot_btc else 0
+                else:
+                    charm_correct = 1 if next_open < spot_btc else 0
+
+            # Breach and error metrics
+            max_breach_call = ((win_high - cw) / cw * 100) if (cw and win_high > cw) else 0
+            max_breach_put = ((pw - win_low) / pw * 100) if (pw and win_low < pw) else 0
+            call_wall_error = ((win_high - cw) / spot_btc * 100) if cw else None
+            put_wall_error = ((pw - win_low) / spot_btc * 100) if pw else None
+
+            venue_agree_held = range_held if venue_agree else None
+
+            c.execute('''UPDATE predictions SET
+                scored=1, scored_date=?,
+                btc_high_on_expiry=?, btc_low_on_expiry=?, btc_close_on_expiry=?,
+                btc_high_in_window=?, btc_low_in_window=?,
+                call_wall_held=?, put_wall_held=?, range_held=?, em_held=?,
+                regime_correct=?, charm_correct=?, venue_agree_held=?,
+                max_breach_call_pct=?, max_breach_put_pct=?, realized_range_pct=?,
+                call_wall_error_pct=?, put_wall_error_pct=?
+                WHERE id=?''', (
+                today, exp_high, exp_low, exp_close,
+                win_high, win_low,
+                call_wall_held, put_wall_held, range_held, em_held,
+                regime_correct, charm_correct, venue_agree_held,
+                max_breach_call, max_breach_put, realized_range_pct,
+                call_wall_error, put_wall_error,
+                pred_id,
+            ))
+            scored_count += 1
+
+    conn.commit()
+    return scored_count
 
 
 def run_analysis(ticker='IBIT', save=True):
@@ -2598,6 +3029,36 @@ def run_analysis(ticker='IBIT', save=True):
                 'pcr_change': round(ibit_lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
             }
 
+    # Prediction accuracy feedback (if enough data exists)
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        accuracy = {}
+        dte_acc_buckets = [('0-1', 0, 1), ('2-3', 2, 3), ('4-7', 4, 7),
+                           ('8-14', 8, 14), ('15-30', 15, 30), ('31-45', 31, 45)]
+        for bucket_name, min_dte_b, max_dte_b in dte_acc_buckets:
+            row = c.execute('''SELECT COUNT(*), SUM(call_wall_held), SUM(put_wall_held),
+                                      SUM(range_held), SUM(regime_correct),
+                                      SUM(CASE WHEN venue_walls_agree=1 THEN range_held END),
+                                      SUM(venue_walls_agree)
+                               FROM predictions WHERE ticker=? AND dte >= ? AND dte <= ? AND scored=1''',
+                            (ticker, min_dte_b, max_dte_b)).fetchone()
+            total = row[0] or 0
+            if total >= 5:
+                accuracy[bucket_name] = {
+                    'n': total,
+                    'call_wall_held_pct': round((row[1] or 0) / total * 100),
+                    'put_wall_held_pct': round((row[2] or 0) / total * 100),
+                    'range_held_pct': round((row[3] or 0) / total * 100),
+                    'regime_correct_pct': round((row[4] or 0) / total * 100),
+                    'venue_agree_held_pct': round((row[5] or 0) / max(row[6] or 1, 1) * 100) if row[6] else None,
+                }
+        if accuracy:
+            summaries['_prediction_accuracy'] = accuracy
+        conn.close()
+    except Exception as e:
+        print(f"  [predictions] Accuracy query failed: {e}")
+
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
     asset = cfg['asset_label']
@@ -2634,6 +3095,15 @@ data_freshness shows how stale each venue's data is. IBIT options data updates o
 
 venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
+PREDICTION ACCURACY (when present):
+_prediction_accuracy shows historical hit rates grouped by DTE at prediction time (0-1, 2-3, 4-7, 8-14, 15-30, 31-45 days before expiry). This is a convergence curve showing when predictions become trustworthy.
+Use this to calibrate confidence:
+- If 0-1 DTE call walls held 85% of the time, state levels with conviction.
+- If 15-30 DTE range_held is only 40%, hedge language: "structural range, but expect migration before expiry."
+- If venue_agree_held_pct is materially higher than overall range_held_pct, emphasize venue convergence as a high-conviction signal.
+- If regime_correct_pct is high at short DTE but low at long DTE, trust regime calls more for imminent expirations.
+Don't cite exact percentages — use qualitative language like "historically reliable", "mixed track record", "strong signal" calibrated to actual hit rates.
+
 Note: significant_levels and breakout are derived from IBIT options data only. flow_forecast uses combined IBIT + Deribit data. Dealer delta scenarios include both IBIT and Deribit contributions.
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
@@ -2667,21 +3137,45 @@ For each timeframe, provide:
 - Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
 
 If a previous analysis is provided, use it to:
-- Note whether your prior calls played out or not (e.g. "yesterday's $65K support held as expected" or "prior upside bias was invalidated")
+- Check prior calls factually: state what was predicted, what happened, right or wrong. Never use self-congratulatory language like "proved prescient", "correctly called", "nailed it". Just: "Prior put wall $68,216 — not tested. Prior call wall $71,807 — held, spot reversed at $70,305."
 - Update your thesis based on how positioning evolved
 - Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
 For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
-- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful.
+- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful. If a delta flip DISAPPEARS in a longer window, that's a structural shift — call it out.
 - Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
 - What is the highest-conviction zone where GEX levels, dealer delta direction, level trajectory, and ETF flows ALL agree?
+- What happens when near-term walls expire? Identify which longer-dated levels take over and how the range changes. If 0-3d walls expire Monday, the Tuesday range is defined by 4-7d levels — state those explicitly.
+
+Structure the cross-timeframe TRADE PLAN as:
+1. PRIMARY SETUP: The single highest-conviction trade. Entry zone, target, stop, timeframe. 2-3 lines max.
+2. INVALIDATION: What kills the setup and what to do (cut, reverse, go flat). 1-2 lines.
+3. SCENARIOS (if useful): Alternate paths with specific trigger levels. Upside/downside/vol scenarios.
+
+Keep the PRIMARY SETUP scannable — a trader should get the trade in 5 seconds of reading. Scenarios are optional context for those who want depth.
 
 ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:** followed by the single most actionable takeaway in one sentence. This should answer "what do I do today?" — include direction (long/short/flat), the key price levels to watch, and the setup trigger. Examples:
 - "**BOTTOM LINE:** Fade rallies into $71,728 call wall, buy dips at $68,141 put wall — tight $3,500 range with positive gamma and dealer selling confirms both walls."
 - "**BOTTOM LINE:** Stay flat — gamma just flipped negative, dealer delta flipping at $104K means neither wall is reliable until positioning stabilizes."
 - "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short ~$33M notional creating a bid, but charm selling into $72.8M headwind caps upside speed."
 
-After the bottom line, provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+After the bottom line, state the EDGE in one sentence: why this setup has positive expected value. Reference the specific structural factor — venue convergence, regime history, dealer delta asymmetry, level trajectory — that makes this more than a coin flip. Example: "Edge: both venues agree on $68K put wall (HIGH CONVICTION) and positive gamma regime historically means-reverts within range."
+
+Then provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+
+ANALYSIS QUALITY RULES — follow these strictly:
+
+PRIOR CALLS: Be factual, not self-congratulatory. State prediction, outcome, right/wrong. No "proved prescient" or "correctly anticipated."
+
+FABRICATED NUMBERS: Never assign numerical confidence percentages to regime calls or level strength unless derived from actual data fields (like positioning_confidence). If net GEX is near zero, say "marginal positive gamma — net GEX near zero, regime could flip with small OI changes." Don't invent "50% confidence" or similar.
+
+OI CHANGES vs EXPIRY MECHANICS: When OI drops coincide with recent expirations, explicitly note this: "OI dropped 95% — primarily from Feb 14 expiry rolling off, not active position unwinding." OI changes are only a positioning signal when they occur BETWEEN expirations, not across them. Check the dominant_expiry field to identify expiry-driven OI decay.
+
+VANNA/VOL-CRUSH: Don't aggregate vanna or vol-crush notional across DTE windows — each window's vol sensitivity is independent. A vol crush in 31-45d options doesn't affect your 0-3d range trade. When discussing vol scenarios, specify which window and whether it's relevant to the trade timeframe. The 0-3d analysis should reference 0-3d vol sensitivity, not a sum across all windows.
+
+LARGE NUMBERS: When dealer delta or flow numbers exceed $500M, contextualize them. $2.14B dealer long across 31-45d is distributed across ~15 days of expiries — the per-day flow impact is ~$140M, not $2.14B. Compare to BTC daily volume (~$30-40B) when useful. Frame magnitudes relative to the relevant timeframe.
+
+BOTTOM LINE PRECISION: The bottom line must reference exact structural levels (gamma flip, delta flip, call/put wall), not spot price. "Hold longs above $70,372 gamma flip" not "Hold longs above $69,294" (that's just where spot happens to be). The reader needs to know which level to defend, not where price currently is.
 
 DTE windows are NON-OVERLAPPING. Each timeframe shows distinct option positioning:
 - 0-3d: Immediate expirations. Highest gamma, strongest near-term hedging pressure. These are today's actionable levels.
@@ -2785,6 +3279,128 @@ def api_analysis_save():
         return Response(json.dumps({'status': 'saved'}), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
+
+
+@app.route('/api/accuracy')
+def api_accuracy():
+    """Return prediction accuracy statistics."""
+    conn = get_db()
+    c = conn.cursor()
+    ticker = request.args.get('ticker', 'IBIT').upper()
+
+    # Convergence: accuracy by DTE bucket
+    dte_buckets = [
+        ('0-1', 0, 1), ('2-3', 2, 3), ('4-7', 4, 7),
+        ('8-14', 8, 14), ('15-30', 15, 30), ('31-45', 31, 45),
+    ]
+    convergence = {}
+    for bucket_name, min_dte, max_dte in dte_buckets:
+        row = c.execute('''SELECT
+            COUNT(*) as total,
+            SUM(call_wall_held) as cw_held,
+            SUM(put_wall_held) as pw_held,
+            SUM(range_held) as range_held,
+            SUM(em_held) as em_held,
+            SUM(regime_correct) as regime_ok,
+            SUM(charm_correct) as charm_ok,
+            SUM(CASE WHEN venue_walls_agree=1 THEN range_held END) as agree_held,
+            SUM(venue_walls_agree) as agree_total,
+            SUM(CASE WHEN venue_walls_agree=0 AND deribit_available=1 THEN range_held END) as disagree_held,
+            SUM(CASE WHEN venue_walls_agree=0 AND deribit_available=1 THEN 1 END) as disagree_total,
+            AVG(max_breach_call_pct) as avg_call_breach,
+            AVG(max_breach_put_pct) as avg_put_breach,
+            AVG(realized_range_pct) as avg_range,
+            AVG(call_wall_error_pct) as avg_cw_error,
+            AVG(put_wall_error_pct) as avg_pw_error
+        FROM predictions
+        WHERE ticker=? AND dte >= ? AND dte <= ? AND scored=1''',
+        (ticker, min_dte, max_dte)).fetchone()
+
+        total = row[0] or 0
+        if total == 0:
+            convergence[bucket_name] = {'total': 0}
+            continue
+
+        def pct(n, d): return round((n or 0) / d * 100, 1) if d else None
+
+        convergence[bucket_name] = {
+            'total': total,
+            'call_wall_held_pct': pct(row[1], total),
+            'put_wall_held_pct': pct(row[2], total),
+            'range_held_pct': pct(row[3], total),
+            'em_held_pct': pct(row[4], total),
+            'regime_correct_pct': pct(row[5], total),
+            'charm_correct_pct': pct(row[6], total),
+            'venue_agree_held_pct': pct(row[7], row[8]),
+            'venue_disagree_held_pct': pct(row[9], row[10]),
+            'avg_call_breach_pct': round(row[11] or 0, 2),
+            'avg_put_breach_pct': round(row[12] or 0, 2),
+            'avg_realized_range_pct': round(row[13] or 0, 2),
+            'avg_call_wall_error_pct': round(row[14] or 0, 2),
+            'avg_put_wall_error_pct': round(row[15] or 0, 2),
+        }
+
+    # Per-expiry history: track level migration for recent expiries
+    recent_expiries = c.execute('''SELECT DISTINCT expiry_date FROM predictions
+                                   WHERE ticker=? AND scored=1
+                                   ORDER BY expiry_date DESC LIMIT 10''', (ticker,)).fetchall()
+
+    expiry_convergence = []
+    for (exp_date,) in recent_expiries:
+        rows = c.execute('''SELECT analysis_date, dte, call_wall_btc, put_wall_btc,
+                                   gamma_flip_btc, regime, spot_btc,
+                                   call_wall_held, put_wall_held, range_held,
+                                   btc_close_on_expiry, venue_walls_agree
+                            FROM predictions
+                            WHERE ticker=? AND expiry_date=? AND scored=1
+                            ORDER BY dte DESC''', (ticker, exp_date)).fetchall()
+
+        snapshots = []
+        for r in rows:
+            snapshots.append({
+                'analysis_date': r[0], 'dte': r[1],
+                'call_wall': r[2], 'put_wall': r[3],
+                'gamma_flip': r[4], 'regime': r[5], 'spot': r[6],
+                'call_wall_held': bool(r[7]) if r[7] is not None else None,
+                'put_wall_held': bool(r[8]) if r[8] is not None else None,
+                'range_held': bool(r[9]) if r[9] is not None else None,
+                'btc_close': r[10], 'venue_agree': bool(r[11]),
+            })
+
+        expiry_convergence.append({
+            'expiry_date': exp_date,
+            'btc_close': rows[0][10] if rows else None,
+            'snapshots': snapshots,
+        })
+
+    # Recent individual predictions
+    recent = []
+    for row in c.execute('''SELECT analysis_date, expiry_date, dte, dte_window,
+                                   spot_btc, call_wall_btc, put_wall_btc,
+                                   regime, btc_close_on_expiry,
+                                   range_held, regime_correct,
+                                   venue_walls_agree, venue_agree_held, ai_bottom_line
+                            FROM predictions
+                            WHERE ticker=? AND scored=1
+                            ORDER BY expiry_date DESC, dte ASC LIMIT 50''', (ticker,)):
+        recent.append({
+            'analysis_date': row[0], 'expiry_date': row[1],
+            'dte': row[2], 'window': row[3],
+            'spot': row[4], 'call_wall': row[5], 'put_wall': row[6],
+            'regime': row[7], 'btc_close': row[8],
+            'range_held': bool(row[9]) if row[9] is not None else None,
+            'regime_correct': bool(row[10]) if row[10] is not None else None,
+            'venue_agree': bool(row[11]),
+            'venue_agree_held': bool(row[12]) if row[12] is not None else None,
+            'ai_bottom_line': row[13],
+        })
+
+    conn.close()
+    return Response(json.dumps({
+        'convergence': convergence,
+        'expiry_history': expiry_convergence,
+        'recent': recent,
+    }), mimetype='application/json')
 
 
 if __name__ == '__main__':
