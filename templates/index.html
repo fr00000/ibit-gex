@@ -1345,9 +1345,14 @@ function renderOutlook(data){
   });
 }
 
-// Structure chart (simplified 14d wall evolution)
-const STRUCT_WINDOWS=['0-3','4-7','8-14','15-30','31-45'];
-const STRUCT_COLORS=['#ff4060','#ff8040','#ffb020','#00dc82','#4090ff'];
+// Structure chart (simplified 14d wall evolution) — matches /structure page style
+const STRUCT_WINDOWS=[
+  {key:'31-45',label:'31-45d',bg:'rgba(168,139,250,0.06)',border:'rgba(168,139,250,0.25)',bw:1},
+  {key:'15-30',label:'15-30d',bg:'rgba(255,176,32,0.06)', border:'rgba(255,176,32,0.25)', bw:1},
+  {key:'8-14', label:'8-14d', bg:'rgba(56,144,255,0.08)', border:'rgba(56,144,255,0.35)', bw:1.5},
+  {key:'4-7',  label:'4-7d',  bg:'rgba(0,180,220,0.10)',  border:'rgba(0,180,220,0.45)',  bw:1.5},
+  {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
+];
 
 async function loadStructure(){
   try{
@@ -1360,70 +1365,60 @@ async function loadStructure(){
 function renderStructure(data){
   const dates=Object.keys(data).sort();
   if(!dates.length)return;
-  const labels=dates.map(d=>d.slice(5));// MM-DD
-  const spot=dates.map(d=>data[d].spot);
-
-  // Build datasets: for each window, call wall line + put wall line with fill between
+  const labels=dates.map(d=>d.slice(5));
   const datasets=[];
-  STRUCT_WINDOWS.forEach((w,i)=>{
-    const col=STRUCT_COLORS[i];
-    const cw=dates.map(d=>{const win=data[d].windows&&data[d].windows[w];return win?win.call_wall:null});
-    const pw=dates.map(d=>{const win=data[d].windows&&data[d].windows[w];return win?win.put_wall:null});
-    const gf=dates.map(d=>{const win=data[d].windows&&data[d].windows[w];return win?win.gamma_flip:null});
-    // Put wall (lower bound)
+
+  // Bands: widest first (31-45d) to narrowest (0-3d) — fill between CW and PW
+  for(const w of STRUCT_WINDOWS){
     datasets.push({
-      label:w+' PW',
-      data:pw,
-      borderColor:col+'99',
-      backgroundColor:'transparent',
-      borderWidth:1,
-      borderDash:[3,3],
-      pointRadius:0,
-      tension:0.3,
-      order:10+i,
+      label:w.label+' CW',
+      data:dates.map(d=>data[d]?.windows?.[w.key]?.call_wall||null),
+      borderColor:w.border,borderWidth:w.bw,pointRadius:0,
+      fill:false,spanGaps:true,tension:0,
     });
-    // Call wall (upper bound, fill down to put wall)
     datasets.push({
-      label:w+' CW',
-      data:cw,
-      borderColor:col,
-      backgroundColor:col+'18',
-      borderWidth:1.5,
-      pointRadius:0,
-      tension:0.3,
-      fill:'-1',
-      order:10+i,
+      label:w.label+' PW',
+      data:dates.map(d=>data[d]?.windows?.[w.key]?.put_wall||null),
+      borderColor:w.border,borderWidth:w.bw,pointRadius:0,
+      fill:'-1',backgroundColor:w.bg,spanGaps:true,tension:0,
     });
+  }
+
+  // Gamma flip (0-3d) — dashed amber
+  datasets.push({
+    label:'γ Flip',
+    data:dates.map(d=>data[d]?.windows?.['0-3']?.gamma_flip||null),
+    borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[4,3],
+    pointRadius:0,fill:false,spanGaps:true,tension:0,
   });
-  // Spot line
+
+  // Spot — solid white
   datasets.push({
     label:'Spot',
-    data:spot,
-    borderColor:'#ffffff',
-    borderWidth:2,
-    pointRadius:0,
-    tension:0.3,
-    order:1,
+    data:dates.map(d=>data[d]?.spot||null),
+    borderColor:'rgba(220,224,232,0.9)',borderWidth:2.5,
+    pointRadius:2,pointBackgroundColor:'rgba(220,224,232,0.9)',
+    fill:false,spanGaps:true,tension:0,
   });
 
-  // Venue agreement markers
-  const agreeData=dates.map((d,idx)=>{
-    const wins=data[d].windows||{};
-    for(const w of STRUCT_WINDOWS){
-      if(wins[w]&&wins[w].venue_agree)return spot[idx];
-    }
-    return null;
-  });
-  datasets.push({
-    label:'Agreement',
-    data:agreeData,
-    borderColor:'transparent',
-    backgroundColor:'#ffd700',
-    pointStyle:'diamond',
-    pointRadius:agreeData.map(v=>v!==null?4:0),
-    showLine:false,
-    order:0,
-  });
+  // Venue agreement markers on 0-3d call wall and put wall
+  const hasAgree=dates.some(d=>data[d]?.windows?.['0-3']?.venue_agree);
+  if(hasAgree){
+    datasets.push({
+      label:'Venue agree',
+      data:dates.map(d=>{const w=data[d]?.windows?.['0-3'];return(w&&w.venue_agree)?w.call_wall:null}),
+      borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
+      pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
+      showLine:false,fill:false,spanGaps:false,
+    });
+    datasets.push({
+      label:'Venue agree',
+      data:dates.map(d=>{const w=data[d]?.windows?.['0-3'];return(w&&w.venue_agree)?w.put_wall:null}),
+      borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
+      pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
+      showLine:false,fill:false,spanGaps:false,
+    });
+  }
 
   const ctx=document.getElementById('structure-chart');
   if(structureChart){structureChart.destroy()}
@@ -1431,23 +1426,37 @@ function renderStructure(data){
     type:'line',
     data:{labels,datasets},
     options:{
-      responsive:true,maintainAspectRatio:false,
-      animation:false,
+      responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{mode:'index',intersect:false},
       scales:{
-        x:{ticks:{color:'#888',font:{size:8},maxRotation:0,maxTicksLimit:7},grid:{color:'#ffffff08'}},
-        y:{ticks:{color:'#888',font:{size:9},callback:v=>'$'+Math.round(v/1000)+'K'},grid:{color:'#ffffff08'}}
+        x:{grid:{color:'rgba(28,34,48,0.5)'},ticks:{color:'#4a5568',font:{size:8},maxRotation:0,autoSkip:true,maxTicksLimit:7}},
+        y:{grace:'5%',grid:{color:'rgba(28,34,48,0.5)'},ticks:{color:'#4a5568',font:{size:9},callback:v=>'$'+(v/1000).toFixed(0)+'K'}}
       },
       plugins:{
         legend:{display:false},
         tooltip:{
-          backgroundColor:'#1a1a2eee',
-          titleFont:{size:10},bodyFont:{size:9},
+          backgroundColor:'rgba(11,14,20,0.95)',borderColor:'rgba(28,34,48,1)',borderWidth:1,
+          titleFont:{size:10},bodyFont:{size:9},padding:8,
+          filter:()=>false,
           callbacks:{
-            label:function(ctx){
-              if(ctx.raw===null)return null;
-              return ctx.dataset.label+': $'+Math.round(ctx.raw).toLocaleString();
-            }
+            afterBody:function(items){
+              const date=dates[items[0]?.dataIndex];
+              if(!date||!data[date])return'';
+              const d=data[date];const lines=[];
+              const fB=v=>'$'+Math.round(v).toLocaleString();
+              lines.push('Spot: '+fB(d.spot));
+              for(const w of STRUCT_WINDOWS){
+                const win=d.windows?.[w.key];if(!win)continue;
+                let l=w.key.padEnd(6)+fB(win.put_wall)+' — '+fB(win.call_wall);
+                l+=win.regime==='negative_gamma'?' (neg γ)':' (pos γ)';
+                if(win.venue_agree)l+=' ✓';
+                lines.push(l);
+              }
+              const gf=d.windows?.['0-3']?.gamma_flip;
+              if(gf)lines.push('γ flip: '+fB(gf));
+              return lines.join('\n');
+            },
+            label:()=>null,
           }
         }
       }
