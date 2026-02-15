@@ -1103,11 +1103,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 # Dealer vanna exposure: how dealer delta changes with IV
                 # Vanna is identical for calls/puts (put-call parity), and dealers
                 # are short both, so no sign flip per option type.
-                dealer_vanna = -vanna * oi * 100 * spot * 0.01
+                dealer_vanna = -vanna * oi * 100 * spot * 0.01  # dollar notional (vanna * n * S * 0.01)
                 # Dealer charm exposure: how dealer hedge changes overnight
                 # bs_charm returns holder's dΔ/dT; dealer is short, so negate.
                 # Positive dealer_charm = dealers BUY delta (bullish overnight).
-                dealer_charm = -charm * oi * 100 / 365.0
+                dealer_charm = -charm * oi * 100 / 365.0 * spot  # dollar notional
 
                 vol = row.get('volume', 0)
                 if pd.isna(vol):
@@ -1207,8 +1207,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     # Contract multiplier = 1 BTC (not 100 shares)
                     gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
                     dealer_delta = -delta * oi * 1
-                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01
-                    dealer_charm = -charm * oi * 1 / 365.0
+                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
+                    dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
 
                     deribit_oi_btc += oi
 
@@ -1491,47 +1491,46 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
 
 def compute_flow_forecast(df, spot, levels, is_crypto):
-    """Compute dealer flow forecasts from vanna and charm exposures."""
+    """Compute dealer flow forecasts from vanna and charm exposures.
+    net_vanna and net_charm in df are already in dollar notional."""
     net_vanna = float(df['net_vanna'].sum())
     net_charm = float(df['net_charm'].sum())
     regime = levels['regime']
 
-    # Charm: overnight dealer rebalancing
+    # Charm: overnight dealer rebalancing (dollar notional)
     # Positive net charm = dealers need to BUY delta tomorrow (bullish flow)
     # Negative net charm = dealers need to SELL delta tomorrow (bearish flow)
-    charm_delta_shares = net_charm  # shares dealers need to trade
-    charm_delta_notional = charm_delta_shares * spot  # dollar notional (shares × IBIT price)
     charm_direction = 'buy' if net_charm > 0 else 'sell'
     charm_magnitude = abs(net_charm)
 
-    # Categorize charm impact
-    if charm_magnitude < 1000:
+    # Categorize charm impact (dollar notional thresholds)
+    if charm_magnitude < 50_000:
         charm_strength = 'negligible'
-    elif charm_magnitude < 10000:
+    elif charm_magnitude < 500_000:
         charm_strength = 'minor'
-    elif charm_magnitude < 50000:
+    elif charm_magnitude < 2_500_000:
         charm_strength = 'moderate'
     else:
         charm_strength = 'significant'
 
-    # Vanna: IV-dependent dealer rebalancing
+    # Vanna: IV-dependent dealer rebalancing (dollar notional)
     # Positive net vanna = vol CRUSH forces dealers to BUY (bullish)
     # Negative net vanna = vol CRUSH forces dealers to SELL (bearish)
     # (reverse for vol spike)
     vanna_magnitude = abs(net_vanna)
-    if vanna_magnitude < 1000:
+    if vanna_magnitude < 50_000:
         vanna_strength = 'negligible'
-    elif vanna_magnitude < 10000:
+    elif vanna_magnitude < 500_000:
         vanna_strength = 'minor'
-    elif vanna_magnitude < 50000:
+    elif vanna_magnitude < 2_500_000:
         vanna_strength = 'moderate'
     else:
         vanna_strength = 'significant'
 
-    # Scenarios: 5-point IV move
+    # Scenarios: 5-point IV move (result is dollar notional)
     iv_move = 5  # vol points
-    vanna_crush_delta = net_vanna * iv_move  # shares from -5pt IV
-    vanna_spike_delta = -net_vanna * iv_move  # shares from +5pt IV
+    vanna_crush_notional = net_vanna * iv_move  # from -5pt IV
+    vanna_spike_notional = -net_vanna * iv_move  # from +5pt IV
 
     # Combined overnight forecast (charm + expected vanna from typical overnight vol decay)
     # Overnight vol typically drifts down ~0.5-1pt in calm markets
@@ -1540,9 +1539,7 @@ def compute_flow_forecast(df, spot, levels, is_crypto):
     overnight_direction = 'buy' if overnight_total > 0 else 'sell'
 
     # Narrative
-    charm_narrative = f"Dealers {charm_direction} ~{abs(charm_delta_shares):,.0f} shares overnight from delta decay"
-    if is_crypto:
-        charm_narrative += f" (~${abs(charm_delta_notional):,.0f} notional)"
+    charm_narrative = f"Dealers {charm_direction} ~${abs(net_charm):,.0f} notional overnight from delta decay"
 
     if net_vanna > 0:
         vanna_crush_narrative = "Vol crush → dealers BUY (supportive)"
@@ -1559,32 +1556,28 @@ def compute_flow_forecast(df, spot, levels, is_crypto):
 
     return {
         'charm': {
-            'net_shares': float(net_charm),
+            'net_notional': float(net_charm),
             'direction': charm_direction,
             'strength': charm_strength,
-            'notional': float(charm_delta_notional),
             'narrative': charm_narrative,
         },
         'vanna': {
-            'net_exposure': float(net_vanna),
+            'net_notional': float(net_vanna),
             'strength': vanna_strength,
             'crush_scenario': {
-                'delta_shares': float(vanna_crush_delta),
-                'notional': float(vanna_crush_delta * spot),
-                'direction': 'buy' if vanna_crush_delta > 0 else 'sell',
+                'notional': float(vanna_crush_notional),
+                'direction': 'buy' if vanna_crush_notional > 0 else 'sell',
                 'narrative': vanna_crush_narrative,
             },
             'spike_scenario': {
-                'delta_shares': float(vanna_spike_delta),
-                'notional': float(vanna_spike_delta * spot),
-                'direction': 'buy' if vanna_spike_delta > 0 else 'sell',
+                'notional': float(vanna_spike_notional),
+                'direction': 'buy' if vanna_spike_notional > 0 else 'sell',
                 'narrative': vanna_spike_narrative,
             },
         },
         'overnight': {
-            'net_shares': float(overnight_total),
+            'net_notional': float(overnight_total),
             'direction': overnight_direction,
-            'notional': float(overnight_total * spot),
         },
         'regime_note': regime_note,
     }
@@ -2446,7 +2439,7 @@ def run_analysis(ticker='IBIT', save=True):
             'flow_forecast': {
                 'charm': d['flow_forecast']['charm'],
                 'vanna': {
-                    'net_exposure': d['flow_forecast']['vanna']['net_exposure'],
+                    'net_notional': d['flow_forecast']['vanna']['net_notional'],
                     'strength': d['flow_forecast']['vanna']['strength'],
                     'crush_scenario': d['flow_forecast']['vanna']['crush_scenario'],
                     'spike_scenario': d['flow_forecast']['vanna']['spike_scenario'],
