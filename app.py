@@ -3028,21 +3028,45 @@ For each timeframe, provide:
 - Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
 
 If a previous analysis is provided, use it to:
-- Note whether your prior calls played out or not (e.g. "yesterday's $65K support held as expected" or "prior upside bias was invalidated")
+- Check prior calls factually: state what was predicted, what happened, right or wrong. Never use self-congratulatory language like "proved prescient", "correctly called", "nailed it". Just: "Prior put wall $68,216 — not tested. Prior call wall $71,807 — held, spot reversed at $70,305."
 - Update your thesis based on how positioning evolved
 - Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
 For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
-- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful.
+- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful. If a delta flip DISAPPEARS in a longer window, that's a structural shift — call it out.
 - Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
 - What is the highest-conviction zone where GEX levels, dealer delta direction, level trajectory, and ETF flows ALL agree?
+- What happens when near-term walls expire? Identify which longer-dated levels take over and how the range changes. If 0-3d walls expire Monday, the Tuesday range is defined by 4-7d levels — state those explicitly.
+
+Structure the cross-timeframe TRADE PLAN as:
+1. PRIMARY SETUP: The single highest-conviction trade. Entry zone, target, stop, timeframe. 2-3 lines max.
+2. INVALIDATION: What kills the setup and what to do (cut, reverse, go flat). 1-2 lines.
+3. SCENARIOS (if useful): Alternate paths with specific trigger levels. Upside/downside/vol scenarios.
+
+Keep the PRIMARY SETUP scannable — a trader should get the trade in 5 seconds of reading. Scenarios are optional context for those who want depth.
 
 ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:** followed by the single most actionable takeaway in one sentence. This should answer "what do I do today?" — include direction (long/short/flat), the key price levels to watch, and the setup trigger. Examples:
 - "**BOTTOM LINE:** Fade rallies into $71,728 call wall, buy dips at $68,141 put wall — tight $3,500 range with positive gamma and dealer selling confirms both walls."
 - "**BOTTOM LINE:** Stay flat — gamma just flipped negative, dealer delta flipping at $104K means neither wall is reliable until positioning stabilizes."
 - "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short ~$33M notional creating a bid, but charm selling into $72.8M headwind caps upside speed."
 
-After the bottom line, provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+After the bottom line, state the EDGE in one sentence: why this setup has positive expected value. Reference the specific structural factor — venue convergence, regime history, dealer delta asymmetry, level trajectory — that makes this more than a coin flip. Example: "Edge: both venues agree on $68K put wall (HIGH CONVICTION) and positive gamma regime historically means-reverts within range."
+
+Then provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+
+ANALYSIS QUALITY RULES — follow these strictly:
+
+PRIOR CALLS: Be factual, not self-congratulatory. State prediction, outcome, right/wrong. No "proved prescient" or "correctly anticipated."
+
+FABRICATED NUMBERS: Never assign numerical confidence percentages to regime calls or level strength unless derived from actual data fields (like positioning_confidence). If net GEX is near zero, say "marginal positive gamma — net GEX near zero, regime could flip with small OI changes." Don't invent "50% confidence" or similar.
+
+OI CHANGES vs EXPIRY MECHANICS: When OI drops coincide with recent expirations, explicitly note this: "OI dropped 95% — primarily from Feb 14 expiry rolling off, not active position unwinding." OI changes are only a positioning signal when they occur BETWEEN expirations, not across them. Check the dominant_expiry field to identify expiry-driven OI decay.
+
+VANNA/VOL-CRUSH: Don't aggregate vanna or vol-crush notional across DTE windows — each window's vol sensitivity is independent. A vol crush in 31-45d options doesn't affect your 0-3d range trade. When discussing vol scenarios, specify which window and whether it's relevant to the trade timeframe. The 0-3d analysis should reference 0-3d vol sensitivity, not a sum across all windows.
+
+LARGE NUMBERS: When dealer delta or flow numbers exceed $500M, contextualize them. $2.14B dealer long across 31-45d is distributed across ~15 days of expiries — the per-day flow impact is ~$140M, not $2.14B. Compare to BTC daily volume (~$30-40B) when useful. Frame magnitudes relative to the relevant timeframe.
+
+BOTTOM LINE PRECISION: The bottom line must reference exact structural levels (gamma flip, delta flip, call/put wall), not spot price. "Hold longs above $70,372 gamma flip" not "Hold longs above $69,294" (that's just where spot happens to be). The reader needs to know which level to defend, not where price currently is.
 
 DTE windows are NON-OVERLAPPING. Each timeframe shows distinct option positioning:
 - 0-3d: Immediate expirations. Highest gamma, strongest near-term hedging pressure. These are today's actionable levels.
