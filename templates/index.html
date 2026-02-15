@@ -332,7 +332,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
       <span><span style="color:rgba(136,146,164,0.4)">╌</span> Max pain</span>
       <span><span style="color:rgba(168,139,250,0.5)">╌</span> EM</span>
-      <span><span style="color:rgba(255,255,255,0.6)">▶</span> Price</span>
+      <span><span style="color:rgba(255,255,255,0.6)">▶</span> Spot</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
       <span><span style="background:rgba(0,220,130,0.06);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
       <span><span style="background:rgba(255,64,96,0.06);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
@@ -697,9 +697,7 @@ function renderGEX(data){
       const meta=chart.getDatasetMeta(0);if(!meta.data[spotIdx])return;
       const x=meta.data[spotIdx].x,{top,bottom}=chart.chartArea,c=chart.ctx;
       c.save();c.setLineDash([3,3]);c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=1;
-      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();
-      c.setLineDash([]);c.fillStyle='rgba(255,255,255,0.6)';c.font='bold 8px IBM Plex Mono';
-      c.textAlign='center';c.textBaseline='bottom';c.fillText('PRICE',x,top-2);c.restore();
+      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();c.restore();
     }}]
   });
 }
@@ -800,9 +798,7 @@ function renderDealerDelta(data){
       const meta=chart.getDatasetMeta(0);if(!meta.data[dSpotIdx])return;
       const x=meta.data[dSpotIdx].x,{top,bottom}=chart.chartArea,c=chart.ctx;
       c.save();c.setLineDash([3,3]);c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=1;
-      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();
-      c.setLineDash([]);c.fillStyle='rgba(255,255,255,0.6)';c.font='bold 8px IBM Plex Mono';
-      c.textAlign='center';c.textBaseline='bottom';c.fillText('PRICE',x,top-2);c.restore();
+      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();c.restore();
     }}]
   });
 }
@@ -1404,9 +1400,6 @@ function renderOutlook(data){
         c.lineTo(right+5,yPx+4);
         c.closePath();
         c.fill();
-        c.font='bold 8px IBM Plex Mono';
-        c.textBaseline='middle';c.textAlign='left';
-        c.fillText('PRICE',right+7,yPx);
         c.restore();
       }
     }]
