@@ -2389,6 +2389,52 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/structure')
+def structure_page():
+    return render_template('structure.html')
+
+
+@app.route('/api/structure')
+def api_structure():
+    conn = get_db()
+    c = conn.cursor()
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    days = int(request.args.get('days', 30))
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    rows = c.execute('''
+        SELECT p.analysis_date, p.dte_window, p.spot_btc, p.call_wall_btc, p.put_wall_btc,
+               p.gamma_flip_btc, p.regime, p.venue_walls_agree,
+               p.deribit_call_wall_btc, p.deribit_put_wall_btc,
+               p.ibit_call_wall_btc, p.ibit_put_wall_btc
+        FROM predictions p
+        INNER JOIN (
+            SELECT analysis_date, dte_window, MIN(dte) as min_dte
+            FROM predictions WHERE ticker=? AND analysis_date >= ?
+            GROUP BY analysis_date, dte_window
+        ) g ON p.analysis_date = g.analysis_date AND p.dte_window = g.dte_window AND p.dte = g.min_dte
+        WHERE p.ticker=? AND p.analysis_date >= ?
+        ORDER BY p.analysis_date, p.dte_window
+    ''', (ticker, cutoff, ticker, cutoff)).fetchall()
+
+    data = {}
+    for r in rows:
+        date = r[0]
+        if date not in data:
+            data[date] = {'spot': r[2], 'windows': {}}
+        data[date]['windows'][r[1]] = {
+            'call_wall': r[3], 'put_wall': r[4],
+            'gamma_flip': r[5], 'regime': r[6],
+            'venue_agree': bool(r[7]),
+            'deribit_cw': r[8], 'deribit_pw': r[9],
+            'ibit_cw': r[10], 'ibit_pw': r[11],
+        }
+
+    conn.close()
+    return Response(json.dumps(data), mimetype='application/json')
+
+
 @app.route('/api/candles')
 @app.route('/api/btc-candles')
 def api_candles():
