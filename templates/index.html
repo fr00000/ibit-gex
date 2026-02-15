@@ -332,7 +332,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
       <span><span style="color:rgba(136,146,164,0.4)">╌</span> Max pain</span>
       <span><span style="color:rgba(168,139,250,0.5)">╌</span> EM</span>
-      <span><span style="color:rgba(220,224,232,0.3)">╌</span> Spot</span>
+      <span><span style="color:rgba(255,255,255,0.6)">▶</span> Spot</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
       <span><span style="background:rgba(0,220,130,0.06);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
       <span><span style="background:rgba(255,64,96,0.06);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
@@ -1299,8 +1299,6 @@ function renderOutlook(data){
         {label:'\u03b3 Flip',data:gammaFlip,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:2,pointBackgroundColor:'rgba(255,176,32,0.7)',fill:false,tension:0,order:3},
         // Max pain
         {label:'Max Pain',data:maxPain,borderColor:'rgba(136,146,164,0.4)',borderWidth:1,borderDash:[3,4],pointRadius:2,pointBackgroundColor:'rgba(136,146,164,0.5)',fill:false,tension:0,order:4},
-        // Spot reference
-        {label:'Spot',data:wins.map(()=>spot),borderColor:'rgba(255,255,255,0.45)',borderWidth:1.5,borderDash:[3,3],pointRadius:0,fill:false,tension:0,order:6},
         // Venue agreement diamonds
         {label:'Venue Agree',data:venueAgree,borderColor:'rgba(0,220,130,0.9)',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:wins.map(w=>w.venue_agree?5:0),pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
       ]
@@ -1331,7 +1329,6 @@ function renderOutlook(data){
               if(ds==='Put Wall')return `Put Wall: ${fB(item.raw)}`;
               if(ds==='\u03b3 Flip')return `\u03b3 Flip: ${fB(item.raw)}`;
               if(ds==='Max Pain')return `Max Pain: ${fB(item.raw)}`;
-              if(ds==='Spot')return `Spot: ${fB(item.raw)}`;
               if(ds==='Venue Agree'&&item.raw!=null)return '\u25c6 IBIT+Deribit walls agree';
               return '';
             },
@@ -1375,14 +1372,23 @@ function renderOutlook(data){
     },{
       id:'spotLabel',
       afterDatasetsDraw(chart){
-        const{ctx:c,chartArea:{left},scales:{y}}=chart;
+        const{ctx:c,chartArea:{right},scales:{y}}=chart;
         const yPx=y.getPixelForValue(spot);
         if(yPx==null||!isFinite(yPx))return;
         c.save();
+        // Small arrow tick on the right edge
+        c.fillStyle='rgba(255,255,255,0.6)';
+        c.beginPath();
+        c.moveTo(right,yPx);
+        c.lineTo(right+5,yPx-4);
+        c.lineTo(right+5,yPx+4);
+        c.closePath();
+        c.fill();
+        // Label next to arrow
         c.font='bold 9px IBM Plex Mono';
-        c.fillStyle='rgba(255,255,255,0.7)';
-        c.textBaseline='bottom';
-        c.fillText('SPOT '+fB(spot),left+4,yPx-3);
+        c.textBaseline='middle';
+        c.textAlign='left';
+        c.fillText('SPOT',right+7,yPx);
         c.restore();
       }
     }]
