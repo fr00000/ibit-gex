@@ -844,8 +844,7 @@ function renderSidebar(data){
     if(ch.strength==='negligible'){
       h+=`<div class="ff-negl">Negligible charm — no meaningful overnight delta shift</div>`;
     }else{
-      h+=`<div class="ff-row"><span class="ffl">Dealers must</span><span class="ff-dir ${ch.direction==='buy'?'ff-buy':'ff-sell'}">${ch.direction.toUpperCase()} ${Math.abs(ch.net_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></div>`;
-      if(ch.notional)h+=`<div class="ff-row"><span class="ffl">Notional</span><span class="ffv">${ch.direction==='buy'?'+':'-'}$${Math.abs(ch.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
+      h+=`<div class="ff-row"><span class="ffl">Dealers must</span><span class="ff-dir ${ch.direction==='buy'?'ff-buy':'ff-sell'}">${ch.direction.toUpperCase()} $${Math.abs(ch.net_notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
       h+=`<div class="ff-row"><span class="ffl">Impact</span><span class="ffv">${ch.strength}</span></div>`;
     }
     h+=`</div>`;
@@ -856,19 +855,18 @@ function renderSidebar(data){
     if(vn.strength==='negligible'){
       h+=`<div class="ff-negl">Negligible vanna — IV moves won't trigger significant rebalancing</div>`;
     }else{
-      h+=`<div class="ff-scenario"><span class="ffs-l">IV -5pts (crush)</span><span class="ffs-v"><span class="ff-dir ${vn.crush_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.crush_scenario.direction.toUpperCase()} ${Math.abs(vn.crush_scenario.delta_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></span></div>`;
-      h+=`<div class="ff-scenario"><span class="ffs-l">IV +5pts (spike)</span><span class="ffs-v"><span class="ff-dir ${vn.spike_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.spike_scenario.direction.toUpperCase()} ${Math.abs(vn.spike_scenario.delta_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></span></div>`;
+      h+=`<div class="ff-scenario"><span class="ffs-l">IV -5pts (crush)</span><span class="ffs-v"><span class="ff-dir ${vn.crush_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.crush_scenario.direction.toUpperCase()} $${Math.abs(vn.crush_scenario.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></span></div>`;
+      h+=`<div class="ff-scenario"><span class="ffs-l">IV +5pts (spike)</span><span class="ffs-v"><span class="ff-dir ${vn.spike_scenario.direction==='buy'?'ff-buy':'ff-sell'}">${vn.spike_scenario.direction.toUpperCase()} $${Math.abs(vn.spike_scenario.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></span></div>`;
       h+=`<div class="ff-row"><span class="ffl">Sensitivity</span><span class="ffv">${vn.strength}</span></div>`;
     }
     h+=`</div>`;
 
     // Combined overnight
     const ov=ff.overnight;
-    if(Math.abs(ov.net_shares)>100){
+    if(Math.abs(ov.net_notional)>1000){
       const ovDir=ov.direction==='buy'?'ff-buy':'ff-sell';
       h+=`<div class="ff-box"><div class="ff-hdr">\u{1f303} Net Overnight (Charm + Vol Decay)</div>`;
-      h+=`<div class="ff-row"><span class="ffl">Combined</span><span class="ff-dir ${ovDir}">${ov.direction.toUpperCase()} ${Math.abs(ov.net_shares).toLocaleString(undefined,{maximumFractionDigits:0})} sh</span></div>`;
-      if(ov.notional)h+=`<div class="ff-row"><span class="ffl">Notional</span><span class="ffv">${ov.direction==='buy'?'+':'-'}$${Math.abs(ov.notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
+      h+=`<div class="ff-row"><span class="ffl">Combined</span><span class="ff-dir ${ovDir}">${ov.direction.toUpperCase()} $${Math.abs(ov.net_notional).toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>`;
       h+=`</div>`;
     }
 
@@ -964,7 +962,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position${srcLabel}</div>`;
-  [['Net GEX',fG(useLv.net_gex_total)],['Active GEX',fG(useLv.active_gex_total||0)],['Dealer \u0394',`${((useLv.net_dealer_delta||0)/1e6).toFixed(1)}M sh`],['Net Vanna',fG(useLv.net_vanna||0)],['Net Charm',`${((useLv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',(useLv.pcr||0).toFixed(2)],['Call OI',fO(useLv.total_call_oi||0)],['Put OI',fO(useLv.total_put_oi||0)]].forEach(([l,v])=>{
+  [['Net GEX',fG(useLv.net_gex_total)],['Active GEX',fG(useLv.active_gex_total||0)],['Dealer \u0394',`${((useLv.net_dealer_delta||0)/1e6).toFixed(1)}M sh`],['Net Vanna',fG(useLv.net_vanna||0)],['Net Charm',fG(useLv.net_charm||0)+'/day'],['P/C',(useLv.pcr||0).toFixed(2)],['Call OI',fO(useLv.total_call_oi||0)],['Put OI',fO(useLv.total_put_oi||0)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;
