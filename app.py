@@ -1322,8 +1322,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Significant levels with regime behavior
     sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows)
 
-    # Dealer flow forecast (vanna + charm)
-    flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
+    # Dealer flow forecast (vanna + charm) — use combined data when available
+    if deribit_available and combined_levels_btc and not combined_df.empty:
+        flow_forecast = compute_flow_forecast(combined_df, btc_spot, combined_levels_btc, is_crypto)
+    else:
+        flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
 
     # Dealer delta scenario analysis
     dealer_delta_profile = None
@@ -2555,7 +2558,7 @@ venue_breakdown (when present) shows per-venue positioning. Use it to identify d
 - If gamma flips differ between venues → note which venue is in positive vs negative gamma territory
 Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
 
-Note: significant_levels, breakout, and flow_forecast are derived from IBIT options data only. Dealer delta scenarios include both IBIT and Deribit contributions.
+Note: significant_levels and breakout are derived from IBIT options data only. flow_forecast uses combined IBIT + Deribit data. Dealer delta scenarios include both IBIT and Deribit contributions.
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
