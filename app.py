@@ -1788,10 +1788,15 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
 
     # Morning take
     parts = []
-    if cur_delta < 0:
-        parts.append(f"Dealers are net short {abs(cur_delta/1e6):.1f}M shares at spot, creating a bid under the market")
+    notional = abs(cur_delta) * spot
+    if notional >= 1e6:
+        notional_str = f"~${notional/1e6:.0f}M notional"
     else:
-        parts.append(f"Dealers are net long {abs(cur_delta/1e6):.1f}M shares at spot, creating selling pressure")
+        notional_str = f"~${notional/1e3:.0f}K notional"
+    if cur_delta < 0:
+        parts.append(f"Dealers are net short {notional_str} at spot, creating a bid under the market")
+    else:
+        parts.append(f"Dealers are net long {notional_str} at spot, creating selling pressure")
     if flip_points:
         fp = flip_points[0]
         dist_pct = ((fp['price_ibit'] - spot) / spot) * 100
