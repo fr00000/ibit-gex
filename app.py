@@ -839,10 +839,13 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
                 dealer_delta = -delta * oi * 100
                 # Dealer vanna exposure: how dealer delta changes with IV
-                dealer_vanna = -sign * vanna * oi * 100 * spot * 0.01
+                # Vanna is identical for calls/puts (put-call parity), and dealers
+                # are short both, so no sign flip per option type.
+                dealer_vanna = -vanna * oi * 100 * spot * 0.01
                 # Dealer charm exposure: how dealer hedge changes overnight
-                # bs_charm returns -dΔ/dτ; dealer hedge change = bs_charm * OI * 100 / 365
-                dealer_charm = charm * oi * 100 / 365.0
+                # bs_charm returns holder's dΔ/dT; dealer is short, so negate.
+                # Positive dealer_charm = dealers BUY delta (bullish overnight).
+                dealer_charm = -charm * oi * 100 / 365.0
 
                 vol = row.get('volume', 0)
                 if pd.isna(vol):
