@@ -144,7 +144,9 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=30000')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,7 +218,9 @@ def init_db():
 
 def get_db():
     """Get a SQLite connection (one per call, thread-safe)."""
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA busy_timeout=30000')
+    return conn
 
 
 def get_prev_strikes(conn, ticker):
@@ -604,11 +608,61 @@ def _parse_farside_value(text):
         return 0.0
 
 
+def _compute_ibit_freshness():
+    """Compute hours since last US options market close (Mon-Fri 4:15 PM ET)."""
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo('America/New_York')
+    now_et = datetime.now(et)
+
+    candidate = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+
+    if now_et.weekday() < 5:  # Mon-Fri
+        if now_et >= candidate:
+            last_close = candidate
+        else:
+            days_back = 1 if now_et.weekday() > 0 else 3
+            last_close = candidate - timedelta(days=days_back)
+    else:
+        days_back = now_et.weekday() - 4
+        last_close = candidate - timedelta(days=days_back)
+
+    age_hours = (now_et - last_close).total_seconds() / 3600
+    as_of_str = last_close.strftime('%Y-%m-%d %H:%M ET')
+    in_market = (now_et.weekday() < 5 and
+                 now_et.replace(hour=9, minute=30) <= now_et <= candidate)
+
+    return {
+        'age_hours': round(age_hours, 1),
+        'as_of': as_of_str,
+        'in_market_hours': in_market,
+    }
+
+
+def _compute_deribit_freshness():
+    """Compute minutes since last Deribit data fetch."""
+    with _deribit_lock:
+        cache_time = _deribit_cache.get('time', 0)
+    if cache_time == 0:
+        return {'age_minutes': None, 'as_of': None}
+    age_min = (time.time() - cache_time) / 60
+    as_of_str = datetime.fromtimestamp(cache_time).strftime('%Y-%m-%d %H:%M UTC')
+    return {
+        'age_minutes': round(age_min, 0),
+        'as_of': as_of_str,
+    }
+
+
 # Farside page cache: at most 1 fetch per hour
 _farside_cache = {'html': None, 'time': 0}
 _farside_lock = threading.Lock()
 FARSIDE_URL = 'https://farside.co.uk/bitcoin-etf-flow-all-data/'
 FARSIDE_CACHE_SECONDS = 3600
+
+# Deribit BTC options cache: at most 1 fetch per hour
+_deribit_cache = {'data': None, 'time': 0}
+_deribit_lock = threading.Lock()
+DERIBIT_URL = 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option'
+DERIBIT_CACHE_SECONDS = 3600
 
 
 def fetch_farside_flows():
@@ -732,6 +786,81 @@ def fetch_farside_flows():
     }
 
 
+def fetch_deribit_options(min_dte=0, max_dte=7):
+    """Fetch BTC options from Deribit public API. Returns list of dicts with
+    strike, expiry, dte, option_type, oi (in BTC), iv, underlying_price.
+    Cached for 1 hour. Returns empty list on any failure."""
+    with _deribit_lock:
+        now = time.time()
+        if _deribit_cache['data'] is not None and (now - _deribit_cache['time']) < DERIBIT_CACHE_SECONDS:
+            raw = _deribit_cache['data']
+        else:
+            try:
+                req = urllib.request.Request(DERIBIT_URL, headers={
+                    'User-Agent': 'ibit-gex/1.0'
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = json.loads(resp.read().decode())
+                _deribit_cache['data'] = raw
+                _deribit_cache['time'] = now
+                result_count = len(raw.get('result', []))
+                print(f"  [deribit] Fetched {result_count} instruments from Deribit")
+            except Exception as e:
+                print(f"  [deribit] Fetch failed: {e}")
+                raw = _deribit_cache.get('data')
+                if not raw:
+                    return []
+
+    instruments = raw.get('result', [])
+    if not instruments:
+        return []
+
+    now_dt = datetime.now(timezone.utc)
+    options = []
+    for inst in instruments:
+        name = inst.get('instrument_name', '')
+        # Parse: BTC-27MAR26-100000-C
+        parts = name.split('-')
+        if len(parts) != 4:
+            continue
+        try:
+            expiry_date = datetime.strptime(parts[1], "%d%b%y").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        strike = float(parts[2])
+        opt_type = 'call' if parts[3] == 'C' else 'put'
+
+        dte = (expiry_date - now_dt).days
+        if dte < min_dte or dte > max_dte:
+            continue
+
+        oi = inst.get('open_interest', 0)
+        if oi is None or oi <= 10:
+            continue
+
+        iv = inst.get('mark_iv', 0)
+        if iv is None or iv <= 0:
+            continue
+
+        underlying_price = inst.get('underlying_price', 0)
+        if underlying_price is None or underlying_price <= 0:
+            continue
+
+        options.append({
+            'strike': strike,
+            'expiry_str': parts[1],
+            'expiry_date': expiry_date,
+            'dte': dte,
+            'option_type': opt_type,
+            'oi': float(oi),
+            'iv': float(iv),
+            'underlying_price': float(underlying_price),
+        })
+
+    print(f"  [deribit] {len(options)} instruments in {min_dte}-{max_dte} DTE window")
+    return options
+
+
 # ── CANDLES ─────────────────────────────────────────────────────────────────
 _candle_backfill_done = {}  # symbol -> threading.Event
 
@@ -744,20 +873,31 @@ TF_DURATIONS_MS = {
 
 
 def _fetch_binance_klines(symbol, tf, start_ms, end_ms, limit=1000):
-    """Fetch klines from Binance REST API with .com/.us fallback."""
+    """Fetch klines from Binance .us, .com, or OKX fallback."""
+    # Map Binance intervals to OKX bar notation
+    okx_tf = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1d': '1D'}.get(tf, tf)
+    # OKX uses BTC-USDT not BTCUSDT
+    okx_inst = symbol[:3] + '-' + symbol[3:] if len(symbol) > 3 else symbol
     urls = [
-        f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
-        f'https://api.binance.us/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+        ('binance.us', f'https://api.binance.us/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}'),
+        ('binance.com', f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}'),
+        ('okx', f'https://www.okx.com/api/v5/market/history-candles?instId={okx_inst}&bar={okx_tf}&after={end_ms}&before={start_ms}&limit={min(limit, 300)}'),
     ]
-    for url in urls:
+    for source, url in urls:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'ibit-gex/1.0'})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                if isinstance(data, list):
-                    return data
+                raw = json.loads(resp.read().decode())
+                if source == 'okx':
+                    # OKX returns {"code":"0","data":[[ts,o,h,l,c,vol,...],...]}
+                    if isinstance(raw, dict) and raw.get('code') == '0' and raw.get('data'):
+                        # Convert to Binance kline format: [ts,o,h,l,c,vol,close_ts,...]
+                        return [[int(r[0]),r[1],r[2],r[3],r[4],r[5],int(r[0]),r[5],'0','0','0','0']
+                                for r in reversed(raw['data'])]
+                elif isinstance(raw, list):
+                    return raw
         except Exception as e:
-            print(f"  [candles] Binance fetch failed ({url[:50]}...): {e}")
+            print(f"  [candles] {source} fetch failed: {e}")
     return []
 
 
@@ -821,6 +961,125 @@ def update_btc_candles(symbol, tf):
 
 
 # ── DATA ────────────────────────────────────────────────────────────────────
+def _compute_levels_from_df(df, spot, etf_flows=None):
+    """Compute levels (call wall, put wall, gamma flip, max pain, regime, etc.)
+    from a GEX DataFrame. 'spot' is in the same units as df['strike'].
+    Returns levels dict."""
+    if df.empty:
+        return {}
+    levels = {}
+
+    # Call wall: highest call GEX at or above spot (resistance)
+    calls_above = df[df['strike'] >= spot]
+    if not calls_above.empty:
+        levels['call_wall'] = float(calls_above.loc[calls_above['call_gex'].idxmax(), 'strike'])
+    else:
+        levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
+
+    # Put wall: most negative put GEX at or below spot (support)
+    puts_below = df[df['strike'] <= spot]
+    if not puts_below.empty:
+        levels['put_wall'] = float(puts_below.loc[puts_below['put_gex'].idxmin(), 'strike'])
+    else:
+        levels['put_wall'] = float(df.loc[df['put_gex'].idxmin(), 'strike'])
+
+    # Gamma flip nearest to spot
+    df_s = df.sort_values('strike')
+    all_flips = []
+    for i in range(len(df_s) - 1):
+        g1, g2 = df_s.iloc[i]['net_gex'], df_s.iloc[i + 1]['net_gex']
+        s1, s2 = df_s.iloc[i]['strike'], df_s.iloc[i + 1]['strike']
+        if (g1 < 0 and g2 > 0) or (g1 > 0 and g2 < 0):
+            if (g2 - g1) != 0:
+                flip = s1 + (s2 - s1) * (-g1) / (g2 - g1)
+                all_flips.append(flip)
+    levels['gamma_flip'] = float(min(all_flips, key=lambda x: abs(x - spot))) if all_flips else float(spot)
+
+    # Max pain (vectorized)
+    strikes_arr = df['strike'].values
+    call_oi_arr = df['call_oi'].values
+    put_oi_arr = df['put_oi'].values
+    settle_grid = strikes_arr[:, np.newaxis]
+    call_pain = call_oi_arr * np.maximum(0, settle_grid - strikes_arr) * 100
+    put_pain = put_oi_arr * np.maximum(0, strikes_arr - settle_grid) * 100
+    total_pain = (call_pain + put_pain).sum(axis=1)
+    levels['max_pain'] = float(strikes_arr[np.argmin(total_pain)])
+
+    # Regime
+    near_spot = df[(df['strike'] >= spot * 0.98) & (df['strike'] <= spot * 1.02)]
+    local_gex = near_spot['net_gex'].sum() if not near_spot.empty else 0
+    levels['regime'] = 'positive_gamma' if local_gex > 0 else 'negative_gamma'
+
+    # Totals
+    levels['net_gex_total'] = float(df['net_gex'].sum())
+    levels['net_dealer_delta'] = float(df['net_dealer_delta'].sum())
+    levels['net_vanna'] = float(df['net_vanna'].sum())
+    levels['net_charm'] = float(df['net_charm'].sum())
+    levels['total_call_oi'] = int(df['call_oi'].sum())
+    levels['total_put_oi'] = int(df['put_oi'].sum())
+    levels['pcr'] = levels['total_put_oi'] / max(levels['total_call_oi'], 1)
+
+    # Active GEX totals and walls
+    active_col = 'active_gex' if 'active_gex' in df.columns else 'net_gex'
+    levels['active_gex_total'] = float(df[active_col].sum())
+    active_pos = df[df[active_col] > 0]
+    active_neg = df[df[active_col] < 0]
+    levels['active_call_wall'] = float(active_pos.loc[active_pos[active_col].idxmax(), 'strike']) if not active_pos.empty else levels['call_wall']
+    levels['active_put_wall'] = float(active_neg.loc[active_neg[active_col].idxmin(), 'strike']) if not active_neg.empty else levels['put_wall']
+
+    # Positioning confidence
+    pos_conf = 100
+    pos_warnings = []
+    pcr = levels['pcr']
+    if pcr < 0.5:
+        pos_conf -= 40
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — heavy speculative call buying, dealers likely short calls')
+    elif pcr < 0.7:
+        pos_conf -= 25
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — call-heavy flow suggests dealers short calls')
+    elif pcr < 0.85:
+        pos_conf -= 10
+        pos_warnings.append(f'P/C ratio {pcr:.2f} — mild call skew')
+
+    otm_call_oi = int(df[df['strike'] > spot]['call_oi'].sum())
+    total_call_oi = levels['total_call_oi']
+    if total_call_oi > 0 and (otm_call_oi / total_call_oi) > 0.6:
+        pos_conf -= 15
+        pos_warnings.append(f'{otm_call_oi/total_call_oi*100:.0f}% of call OI is OTM — speculative accumulation')
+
+    if 'call_volume' in df.columns:
+        total_call_vol = int(df['call_volume'].sum())
+        total_put_vol = int(df['put_volume'].sum())
+        call_voi = total_call_vol / max(total_call_oi, 1)
+        put_voi = total_put_vol / max(levels['total_put_oi'], 1)
+        if put_voi > 0 and call_voi > 2 * put_voi:
+            pos_conf -= 10
+            pos_warnings.append(f'Call V/OI {call_voi:.2f} vs put V/OI {put_voi:.2f} — active speculative call turnover')
+
+        if total_call_oi > 0:
+            max_call_oi_strike = int(df['call_oi'].max())
+            if (max_call_oi_strike / total_call_oi) > 0.2:
+                pos_conf -= 10
+                pos_warnings.append(f'Single strike holds {max_call_oi_strike/total_call_oi*100:.0f}% of call OI — concentrated speculative bet')
+
+    # ETF fund flow context
+    if etf_flows and etf_flows['streak'] <= -3 and etf_flows['strength'] in ('moderate', 'strong'):
+        pos_conf -= 15
+        pos_warnings.append(f"ETF outflow streak ({etf_flows['streak']}d, avg ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M/d) — institutional exit weakens support")
+
+    levels['positioning_confidence'] = max(0, min(100, pos_conf))
+    levels['positioning_warnings'] = pos_warnings
+
+    # Resistance / support
+    levels['resistance'] = df[df['net_gex'] > 0].nlargest(3, 'net_gex')['strike'].tolist()
+    levels['support'] = df[df['net_gex'] < 0].nsmallest(3, 'net_gex')['strike'].tolist()
+
+    # OI magnets
+    levels['oi_magnets'] = df.nlargest(5, 'total_oi')[['strike', 'total_oi', 'call_oi', 'put_oi']].to_dict('records')
+
+    return levels
+
+
 def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     cfg = TICKER_CONFIG.get(ticker_symbol)
     is_crypto = cfg is not None
@@ -899,15 +1158,15 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 vanna = bs_vanna(spot, strike, T, rfr, iv)
                 charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
-                dealer_delta = -delta * oi * 100
+                dealer_delta = -delta * oi * 100 * spot  # dollar notional
                 # Dealer vanna exposure: how dealer delta changes with IV
                 # Vanna is identical for calls/puts (put-call parity), and dealers
                 # are short both, so no sign flip per option type.
-                dealer_vanna = -vanna * oi * 100 * spot * 0.01
+                dealer_vanna = -vanna * oi * 100 * spot * 0.01  # dollar notional (vanna * n * S * 0.01)
                 # Dealer charm exposure: how dealer hedge changes overnight
                 # bs_charm returns holder's dΔ/dT; dealer is short, so negate.
                 # Positive dealer_charm = dealers BUY delta (bullish overnight).
-                dealer_charm = -charm * oi * 100 / 365.0
+                dealer_charm = -charm * oi * 100 / 365.0 * spot  # dollar notional
 
                 vol = row.get('volume', 0)
                 if pd.isna(vol):
@@ -977,115 +1236,94 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         active_gex_values.append(row['net_gex'] * ratio)
     df['active_gex'] = active_gex_values
 
-    # Derive levels
-    levels = {}
-    # Call wall: highest call GEX at or above spot (resistance)
-    calls_above = df[df['strike'] >= spot]
-    if not calls_above.empty:
-        levels['call_wall'] = float(calls_above.loc[calls_above['call_gex'].idxmax(), 'strike'])
+    # Derive levels (IBIT-only, using extracted helper)
+    levels = _compute_levels_from_df(df, spot, etf_flows)
+
+    # Deribit options integration
+    deribit_available = False
+    deribit_strike_data = {}
+    deribit_oi_btc = 0
+    deribit_options = []
+    if is_crypto and ticker_symbol == 'IBIT':
+        try:
+            deribit_options = fetch_deribit_options(min_dte, max_dte)
+            if deribit_options:
+                deribit_available = True
+                for opt in deribit_options:
+                    strike_btc = opt['strike']
+                    oi = opt['oi']
+                    iv = opt['iv'] / 100.0  # Deribit gives IV as percentage
+                    btc_s = opt['underlying_price']
+                    T = max(opt['dte'] / 365.0, 0.5 / 365)
+                    opt_type = opt['option_type']
+                    sign = 1 if opt_type == 'call' else -1
+
+                    gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
+                    delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
+                    vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
+                    charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
+
+                    # Contract multiplier = 1 BTC (not 100 shares)
+                    gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
+                    dealer_delta = -delta * oi * 1 * btc_s  # dollar notional
+                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
+                    dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
+
+                    deribit_oi_btc += oi
+
+                    if strike_btc not in deribit_strike_data:
+                        deribit_strike_data[strike_btc] = {
+                            'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
+                            'call_delta': 0, 'put_delta': 0,
+                            'call_vanna': 0, 'put_vanna': 0,
+                            'call_charm': 0, 'put_charm': 0,
+                        }
+                    d_entry = deribit_strike_data[strike_btc]
+                    d_entry[f'{opt_type}_oi'] += oi
+                    d_entry[f'{opt_type}_gex'] += gex
+                    d_entry[f'{opt_type}_delta'] += dealer_delta
+                    d_entry[f'{opt_type}_vanna'] += dealer_vanna
+                    d_entry[f'{opt_type}_charm'] += dealer_charm
+        except Exception as e:
+            print(f"  [deribit] Failed: {e}")
+
+    # Build Deribit DataFrame
+    deribit_rows = []
+    for strike_btc, d_entry in sorted(deribit_strike_data.items()):
+        deribit_rows.append({
+            'strike': strike_btc,
+            'btc_price': strike_btc,
+            'call_oi': d_entry['call_oi'], 'put_oi': d_entry['put_oi'],
+            'total_oi': d_entry['call_oi'] + d_entry['put_oi'],
+            'call_gex': d_entry['call_gex'], 'put_gex': d_entry['put_gex'],
+            'net_gex': d_entry['call_gex'] + d_entry['put_gex'],
+            'net_dealer_delta': d_entry['call_delta'] + d_entry['put_delta'],
+            'net_vanna': d_entry['call_vanna'] + d_entry['put_vanna'],
+            'net_charm': d_entry['call_charm'] + d_entry['put_charm'],
+            'call_vanna': d_entry['call_vanna'], 'put_vanna': d_entry['put_vanna'],
+            'call_charm': d_entry['call_charm'], 'put_charm': d_entry['put_charm'],
+            'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+            'active_gex': d_entry['call_gex'] + d_entry['put_gex'],
+            'expiry_gex': {},
+        })
+    deribit_df = pd.DataFrame(deribit_rows) if deribit_rows else pd.DataFrame()
+
+    # Build combined DataFrame (BTC-price-keyed)
+    ibit_btc_df = df.copy()
+    # Use btc_price as the strike key for combined
+    if is_crypto and 'btc_price' in ibit_btc_df.columns:
+        ibit_btc_df = ibit_btc_df.copy()
+        ibit_btc_df['strike'] = ibit_btc_df['btc_price']
+
+    if not deribit_df.empty:
+        combined_df = pd.concat([ibit_btc_df, deribit_df], ignore_index=True)
+        combined_df = combined_df.sort_values('strike').reset_index(drop=True)
     else:
-        levels['call_wall'] = float(df.loc[df['call_gex'].idxmax(), 'strike'])
-    # Put wall: most negative put GEX at or below spot (support)
-    puts_below = df[df['strike'] <= spot]
-    if not puts_below.empty:
-        levels['put_wall'] = float(puts_below.loc[puts_below['put_gex'].idxmin(), 'strike'])
-    else:
-        levels['put_wall'] = float(df.loc[df['put_gex'].idxmin(), 'strike'])
+        combined_df = ibit_btc_df
 
-    # Gamma flip nearest to spot
-    df_s = df.sort_values('strike')
-    all_flips = []
-    for i in range(len(df_s) - 1):
-        g1, g2 = df_s.iloc[i]['net_gex'], df_s.iloc[i + 1]['net_gex']
-        s1, s2 = df_s.iloc[i]['strike'], df_s.iloc[i + 1]['strike']
-        if (g1 < 0 and g2 > 0) or (g1 > 0 and g2 < 0):
-            if (g2 - g1) != 0:
-                flip = s1 + (s2 - s1) * (-g1) / (g2 - g1)
-                all_flips.append(flip)
-    levels['gamma_flip'] = float(min(all_flips, key=lambda x: abs(x - spot))) if all_flips else float(spot)
-
-    # Max pain (vectorized)
-    strikes_arr = df['strike'].values
-    call_oi_arr = df['call_oi'].values
-    put_oi_arr = df['put_oi'].values
-    # For each potential settle price, compute total payout across all strikes
-    # Shape: (num_settles, num_strikes) via broadcasting
-    settle_grid = strikes_arr[:, np.newaxis]  # column of settle prices
-    call_pain = call_oi_arr * np.maximum(0, settle_grid - strikes_arr) * 100
-    put_pain = put_oi_arr * np.maximum(0, strikes_arr - settle_grid) * 100
-    total_pain = (call_pain + put_pain).sum(axis=1)
-    levels['max_pain'] = float(strikes_arr[np.argmin(total_pain)])
-
-    # Regime
-    near_spot = df[(df['strike'] >= spot * 0.98) & (df['strike'] <= spot * 1.02)]
-    local_gex = near_spot['net_gex'].sum() if not near_spot.empty else 0
-    levels['regime'] = 'positive_gamma' if local_gex > 0 else 'negative_gamma'
-
-    # Totals
-    levels['net_gex_total'] = float(df['net_gex'].sum())
-    levels['net_dealer_delta'] = float(df['net_dealer_delta'].sum())
-    levels['net_vanna'] = float(df['net_vanna'].sum())
-    levels['net_charm'] = float(df['net_charm'].sum())
-    levels['total_call_oi'] = int(df['call_oi'].sum())
-    levels['total_put_oi'] = int(df['put_oi'].sum())
-    levels['pcr'] = levels['total_put_oi'] / max(levels['total_call_oi'], 1)
-
-    # Active GEX totals and walls
-    levels['active_gex_total'] = float(df['active_gex'].sum())
-    active_pos = df[df['active_gex'] > 0]
-    active_neg = df[df['active_gex'] < 0]
-    levels['active_call_wall'] = float(active_pos.loc[active_pos['active_gex'].idxmax(), 'strike']) if not active_pos.empty else levels['call_wall']
-    levels['active_put_wall'] = float(active_neg.loc[active_neg['active_gex'].idxmin(), 'strike']) if not active_neg.empty else levels['put_wall']
-
-    # Positioning confidence: how much to trust the naive GEX sign convention
-    # (dealers long calls, short puts — the Perfiliev/SqueezeMetrics assumption)
-    pos_conf = 100
-    pos_warnings = []
-    pcr = levels['pcr']
-    if pcr < 0.5:
-        pos_conf -= 40
-        pos_warnings.append(f'P/C ratio {pcr:.2f} — heavy speculative call buying, dealers likely short calls')
-    elif pcr < 0.7:
-        pos_conf -= 25
-        pos_warnings.append(f'P/C ratio {pcr:.2f} — call-heavy flow suggests dealers short calls')
-    elif pcr < 0.85:
-        pos_conf -= 10
-        pos_warnings.append(f'P/C ratio {pcr:.2f} — mild call skew')
-
-    otm_call_oi = int(df[df['strike'] > spot]['call_oi'].sum())
-    total_call_oi = levels['total_call_oi']
-    if total_call_oi > 0 and (otm_call_oi / total_call_oi) > 0.6:
-        pos_conf -= 15
-        pos_warnings.append(f'{otm_call_oi/total_call_oi*100:.0f}% of call OI is OTM — speculative accumulation')
-
-    total_call_vol = int(df['call_volume'].sum())
-    total_put_vol = int(df['put_volume'].sum())
-    call_voi = total_call_vol / max(total_call_oi, 1)
-    put_voi = total_put_vol / max(levels['total_put_oi'], 1)
-    if put_voi > 0 and call_voi > 2 * put_voi:
-        pos_conf -= 10
-        pos_warnings.append(f'Call V/OI {call_voi:.2f} vs put V/OI {put_voi:.2f} — active speculative call turnover')
-
-    if total_call_oi > 0:
-        max_call_oi_strike = int(df['call_oi'].max())
-        if (max_call_oi_strike / total_call_oi) > 0.2:
-            pos_conf -= 10
-            pos_warnings.append(f'Single strike holds {max_call_oi_strike/total_call_oi*100:.0f}% of call OI — concentrated speculative bet')
-
-    # ETF fund flow context
-    if etf_flows and etf_flows['streak'] <= -3 and etf_flows['strength'] in ('moderate', 'strong'):
-        pos_conf -= 15
-        pos_warnings.append(f"ETF outflow streak ({etf_flows['streak']}d, avg ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M/d) — institutional exit weakens support")
-
-    levels['positioning_confidence'] = max(0, min(100, pos_conf))
-    levels['positioning_warnings'] = pos_warnings
-
-    # Resistance / support
-    levels['resistance'] = df[df['net_gex'] > 0].nlargest(3, 'net_gex')['strike'].tolist()
-    levels['support'] = df[df['net_gex'] < 0].nsmallest(3, 'net_gex')['strike'].tolist()
-
-    # OI magnets
-    levels['oi_magnets'] = df.nlargest(5, 'total_oi')[['strike', 'total_oi', 'call_oi', 'put_oi']].to_dict('records')
+    # Compute combined levels (BTC-space) and Deribit-only levels
+    combined_levels_btc = _compute_levels_from_df(combined_df, btc_spot, etf_flows) if btc_spot else None
+    deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if (not deribit_df.empty and btc_spot) else None
 
     # Expected move (reuse cached chain instead of re-fetching)
     expected_move = None
@@ -1143,8 +1381,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Significant levels with regime behavior
     sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows)
 
-    # Dealer flow forecast (vanna + charm)
-    flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
+    # Dealer flow forecast (vanna + charm) — use combined data when available
+    if deribit_available and combined_levels_btc and not combined_df.empty:
+        flow_forecast = compute_flow_forecast(combined_df, btc_spot, combined_levels_btc, is_crypto)
+    else:
+        flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
 
     # Dealer delta scenario analysis
     dealer_delta_profile = None
@@ -1153,7 +1394,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     try:
         scenario_result = compute_dealer_delta_scenarios(
             cached_chains, spot, levels, expected_move,
-            rfr, ref_per_share, is_crypto
+            rfr, ref_per_share, is_crypto,
+            deribit_options=deribit_options if deribit_available else None
         )
         dealer_delta_profile = scenario_result['profile']
         delta_flip_points = scenario_result['flip_points']
@@ -1186,33 +1428,74 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     history = get_history(conn, ticker_symbol, 10)
     conn.close()
 
-    # Build response
+    # Build response — BTC-price-indexed chart with per-venue breakdown
     gex_chart_data = []
+    # Build IBIT lookup by BTC price
+    ibit_by_btc = {}
     for _, row in df[(df['strike'] >= spot * 0.82) & (df['strike'] <= spot * 1.22)].iterrows():
-        # Per-expiry breakdown for stacked chart
-        expiry_gex = row.get('expiry_gex', {})
+        btc_p = round(float(row['strike'] / ref_per_share)) if is_crypto else round(float(row['strike']))
+        ibit_by_btc[btc_p] = row
+
+    # Build Deribit lookup by BTC price
+    deribit_by_btc = {}
+    if not deribit_df.empty and btc_spot:
+        btc_lo, btc_hi = btc_spot * 0.82, btc_spot * 1.22
+        for _, row in deribit_df[(deribit_df['strike'] >= btc_lo) & (deribit_df['strike'] <= btc_hi)].iterrows():
+            deribit_by_btc[round(float(row['strike']))] = row
+
+    all_btc_prices = sorted(set(list(ibit_by_btc.keys()) + list(deribit_by_btc.keys())))
+
+    for btc_p in all_btc_prices:
+        ibit_row = ibit_by_btc.get(btc_p)
+        deribit_row = deribit_by_btc.get(btc_p)
+
+        i_gex = float(ibit_row['net_gex']) if ibit_row is not None else 0
+        d_gex = float(deribit_row['net_gex']) if deribit_row is not None else 0
+
+        # Per-expiry breakdown from IBIT
         expiry_breakdown = {}
-        if isinstance(expiry_gex, dict):
-            for exp_str, eg in expiry_gex.items():
-                expiry_breakdown[exp_str] = {
-                    'net_gex': eg.get('net_gex', 0),
-                    'dte': eg.get('dte'),
-                }
-        gex_chart_data.append({
-            'strike': float(row['strike']),
-            'btc': float(row['strike'] / ref_per_share) if is_crypto else float(row['strike']),
-            'net_gex': float(row['net_gex']),
-            'active_gex': float(row['active_gex']),
-            'net_vanna': float(row['net_vanna']),
-            'net_charm': float(row['net_charm']),
-            'call_oi': int(row['call_oi']),
-            'put_oi': int(row['put_oi']),
-            'total_oi': int(row['total_oi']),
-            'call_volume': int(row['call_volume']),
-            'put_volume': int(row['put_volume']),
-            'total_volume': int(row['total_volume']),
-            'expiry_breakdown': expiry_breakdown,
-        })
+        if ibit_row is not None:
+            expiry_gex = ibit_row.get('expiry_gex', {})
+            if isinstance(expiry_gex, dict):
+                for exp_str, eg in expiry_gex.items():
+                    expiry_breakdown[exp_str] = {
+                        'net_gex': eg.get('net_gex', 0),
+                        'dte': eg.get('dte'),
+                    }
+
+        entry = {
+            'strike': float(ibit_row['strike']) if ibit_row is not None else 0,
+            'btc': float(btc_p),
+            'net_gex': i_gex + d_gex,
+            'ibit_gex': i_gex,
+            'deribit_gex': d_gex,
+        }
+
+        if ibit_row is not None:
+            entry.update({
+                'active_gex': float(ibit_row['active_gex']) + d_gex,
+                'net_vanna': float(ibit_row['net_vanna']) + (float(deribit_row['net_vanna']) if deribit_row is not None else 0),
+                'net_charm': float(ibit_row['net_charm']) + (float(deribit_row['net_charm']) if deribit_row is not None else 0),
+                'call_oi': int(ibit_row['call_oi']) + (int(deribit_row['call_oi']) if deribit_row is not None else 0),
+                'put_oi': int(ibit_row['put_oi']) + (int(deribit_row['put_oi']) if deribit_row is not None else 0),
+                'total_oi': int(ibit_row['total_oi']) + (int(deribit_row['total_oi']) if deribit_row is not None else 0),
+                'call_volume': int(ibit_row['call_volume']),
+                'put_volume': int(ibit_row['put_volume']),
+                'total_volume': int(ibit_row['total_volume']),
+                'expiry_breakdown': expiry_breakdown,
+            })
+        else:
+            entry.update({
+                'active_gex': d_gex,
+                'net_vanna': float(deribit_row['net_vanna']),
+                'net_charm': float(deribit_row['net_charm']),
+                'call_oi': int(deribit_row['call_oi']),
+                'put_oi': int(deribit_row['put_oi']),
+                'total_oi': int(deribit_row['total_oi']),
+                'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                'expiry_breakdown': {},
+            })
+        gex_chart_data.append(entry)
 
     history_data = []
     for h in history:
@@ -1256,51 +1539,61 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         'history': history_data,
         'expirations': selected_exps,
         'expiry_meta': expiry_meta,
+        'deribit_available': deribit_available,
+        'deribit_oi_btc': float(deribit_oi_btc) if deribit_available else 0,
+        'deribit_net_gex': float(deribit_df['net_gex'].sum()) if not deribit_df.empty else 0,
+        'combined_levels_btc': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                for k, v in combined_levels_btc.items()} if combined_levels_btc else None,
+        'deribit_levels_btc': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                               for k, v in deribit_levels_btc.items()} if deribit_levels_btc else None,
+        'data_freshness': {
+            'ibit': _compute_ibit_freshness(),
+            'deribit': _compute_deribit_freshness() if deribit_available else {'age_minutes': None, 'as_of': None},
+        },
     }
 
 
 def compute_flow_forecast(df, spot, levels, is_crypto):
-    """Compute dealer flow forecasts from vanna and charm exposures."""
+    """Compute dealer flow forecasts from vanna and charm exposures.
+    net_vanna and net_charm in df are already in dollar notional."""
     net_vanna = float(df['net_vanna'].sum())
     net_charm = float(df['net_charm'].sum())
     regime = levels['regime']
 
-    # Charm: overnight dealer rebalancing
+    # Charm: overnight dealer rebalancing (dollar notional)
     # Positive net charm = dealers need to BUY delta tomorrow (bullish flow)
     # Negative net charm = dealers need to SELL delta tomorrow (bearish flow)
-    charm_delta_shares = net_charm  # shares dealers need to trade
-    charm_delta_notional = charm_delta_shares * spot  # dollar notional (shares × IBIT price)
     charm_direction = 'buy' if net_charm > 0 else 'sell'
     charm_magnitude = abs(net_charm)
 
-    # Categorize charm impact
-    if charm_magnitude < 1000:
+    # Categorize charm impact (dollar notional thresholds)
+    if charm_magnitude < 50_000:
         charm_strength = 'negligible'
-    elif charm_magnitude < 10000:
+    elif charm_magnitude < 500_000:
         charm_strength = 'minor'
-    elif charm_magnitude < 50000:
+    elif charm_magnitude < 2_500_000:
         charm_strength = 'moderate'
     else:
         charm_strength = 'significant'
 
-    # Vanna: IV-dependent dealer rebalancing
+    # Vanna: IV-dependent dealer rebalancing (dollar notional)
     # Positive net vanna = vol CRUSH forces dealers to BUY (bullish)
     # Negative net vanna = vol CRUSH forces dealers to SELL (bearish)
     # (reverse for vol spike)
     vanna_magnitude = abs(net_vanna)
-    if vanna_magnitude < 1000:
+    if vanna_magnitude < 50_000:
         vanna_strength = 'negligible'
-    elif vanna_magnitude < 10000:
+    elif vanna_magnitude < 500_000:
         vanna_strength = 'minor'
-    elif vanna_magnitude < 50000:
+    elif vanna_magnitude < 2_500_000:
         vanna_strength = 'moderate'
     else:
         vanna_strength = 'significant'
 
-    # Scenarios: 5-point IV move
+    # Scenarios: 5-point IV move (result is dollar notional)
     iv_move = 5  # vol points
-    vanna_crush_delta = net_vanna * iv_move  # shares from -5pt IV
-    vanna_spike_delta = -net_vanna * iv_move  # shares from +5pt IV
+    vanna_crush_notional = net_vanna * iv_move  # from -5pt IV
+    vanna_spike_notional = -net_vanna * iv_move  # from +5pt IV
 
     # Combined overnight forecast (charm + expected vanna from typical overnight vol decay)
     # Overnight vol typically drifts down ~0.5-1pt in calm markets
@@ -1309,9 +1602,7 @@ def compute_flow_forecast(df, spot, levels, is_crypto):
     overnight_direction = 'buy' if overnight_total > 0 else 'sell'
 
     # Narrative
-    charm_narrative = f"Dealers {charm_direction} ~{abs(charm_delta_shares):,.0f} shares overnight from delta decay"
-    if is_crypto:
-        charm_narrative += f" (~${abs(charm_delta_notional):,.0f} notional)"
+    charm_narrative = f"Dealers {charm_direction} ~${abs(net_charm):,.0f} notional overnight from delta decay"
 
     if net_vanna > 0:
         vanna_crush_narrative = "Vol crush → dealers BUY (supportive)"
@@ -1328,38 +1619,34 @@ def compute_flow_forecast(df, spot, levels, is_crypto):
 
     return {
         'charm': {
-            'net_shares': float(net_charm),
+            'net_notional': float(net_charm),
             'direction': charm_direction,
             'strength': charm_strength,
-            'notional': float(charm_delta_notional),
             'narrative': charm_narrative,
         },
         'vanna': {
-            'net_exposure': float(net_vanna),
+            'net_notional': float(net_vanna),
             'strength': vanna_strength,
             'crush_scenario': {
-                'delta_shares': float(vanna_crush_delta),
-                'notional': float(vanna_crush_delta * spot),
-                'direction': 'buy' if vanna_crush_delta > 0 else 'sell',
+                'notional': float(vanna_crush_notional),
+                'direction': 'buy' if vanna_crush_notional > 0 else 'sell',
                 'narrative': vanna_crush_narrative,
             },
             'spike_scenario': {
-                'delta_shares': float(vanna_spike_delta),
-                'notional': float(vanna_spike_delta * spot),
-                'direction': 'buy' if vanna_spike_delta > 0 else 'sell',
+                'notional': float(vanna_spike_notional),
+                'direction': 'buy' if vanna_spike_notional > 0 else 'sell',
                 'narrative': vanna_spike_narrative,
             },
         },
         'overnight': {
-            'net_shares': float(overnight_total),
+            'net_notional': float(overnight_total),
             'direction': overnight_direction,
-            'notional': float(overnight_total * spot),
         },
         'regime_note': regime_note,
     }
 
 
-def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, rfr, ref_per_share, is_crypto):
+def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, rfr, ref_per_share, is_crypto, deribit_options=None):
     """Pre-compute dealer delta at hypothetical prices across the key level grid."""
     cw = levels.get('call_wall', spot * 1.05)
     pw = levels.get('put_wall', spot * 0.95)
@@ -1435,12 +1722,26 @@ def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, r
                     if pd.isna(iv) or iv <= 0:
                         continue
                     delta = bs_delta(S_hyp, strike, T, rfr, iv, opt_type)
-                    dd = -delta * oi * 100
+                    dd = -delta * oi * 100 * S_hyp  # dollar notional
                     net_dd += dd
                     if opt_type == 'call':
                         call_dd += dd
                     else:
                         put_dd += dd
+
+        # Deribit options contribution (1 BTC per contract)
+        if deribit_options:
+            S_hyp_btc = S_hyp / ref_per_share if is_crypto else S_hyp
+            for opt in deribit_options:
+                T_d = max(opt['dte'] / 365.0, 0.5 / 365)
+                iv_d = opt['iv'] / 100.0
+                delta_d = bs_delta(S_hyp_btc, opt['strike'], T_d, rfr, iv_d, opt['option_type'])
+                dd_d = -delta_d * opt['oi'] * 1 * S_hyp_btc  # dollar notional
+                net_dd += dd_d
+                if opt['option_type'] == 'call':
+                    call_dd += dd_d
+                else:
+                    put_dd += dd_d
 
         profile.append({
             'price_ibit': float(S_hyp),
@@ -1519,10 +1820,15 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
     # Current delta (closest to spot)
     spot_entry = min(profile, key=lambda p: abs(p['price_ibit'] - spot))
     cur_delta = spot_entry['net_dealer_delta']
-    if cur_delta < 0:
-        current_delta = f"Dealers are net SHORT {abs(cur_delta/1e6):.1f}M shares — must BUY on dips (supportive)"
+    cur_abs = abs(cur_delta)
+    if cur_abs >= 1e6:
+        cur_str = f"~${cur_abs/1e6:.0f}M notional"
     else:
-        current_delta = f"Dealers are net LONG {abs(cur_delta/1e6):.1f}M shares — must SELL on rallies (resistive)"
+        cur_str = f"~${cur_abs/1e3:.0f}K notional"
+    if cur_delta < 0:
+        current_delta = f"Dealers are net SHORT {cur_str} — must BUY on dips (supportive)"
+    else:
+        current_delta = f"Dealers are net LONG {cur_str} — must SELL on rallies (resistive)"
 
     # Flip summary
     if flip_points:
@@ -1550,10 +1856,15 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
 
     # Morning take
     parts = []
-    if cur_delta < 0:
-        parts.append(f"Dealers are net short {abs(cur_delta/1e6):.1f}M shares at spot, creating a bid under the market")
+    notional = abs(cur_delta)  # already dollar notional
+    if notional >= 1e6:
+        notional_str = f"~${notional/1e6:.0f}M notional"
     else:
-        parts.append(f"Dealers are net long {abs(cur_delta/1e6):.1f}M shares at spot, creating selling pressure")
+        notional_str = f"~${notional/1e3:.0f}K notional"
+    if cur_delta < 0:
+        parts.append(f"Dealers are net short {notional_str} at spot, creating a bid under the market")
+    else:
+        parts.append(f"Dealers are net long {notional_str} at spot, creating selling pressure")
     if flip_points:
         fp = flip_points[0]
         dist_pct = ((fp['price_ibit'] - spot) / spot) * 100
@@ -2132,29 +2443,64 @@ def run_analysis(ticker='IBIT', save=True):
     for label, min_d, max_d in dtes:
         d = results[label]
         bps = d['btc_per_share']
-        lvl = d['levels']
+        ibit_lvl = d['levels']  # IBIT-only levels (in IBIT strike space)
+        deribit_avail = d.get('deribit_available', False)
+        combined_lvl = d.get('combined_levels_btc') or {}  # combined levels (in BTC space)
+        deribit_lvl = d.get('deribit_levels_btc') or {}  # Deribit-only levels (in BTC space)
         current_btc = live_ref_price if live_ref_price else d['btc_spot']
         key = f"{min_d}-{max_d}d"
+
+        # Use combined levels as primary when Deribit is available
+        if deribit_avail and combined_lvl:
+            primary_lvl_btc = {
+                'call_wall': round(combined_lvl.get('call_wall', 0)),
+                'put_wall': round(combined_lvl.get('put_wall', 0)),
+                'gamma_flip': round(combined_lvl.get('gamma_flip', 0)),
+                'max_pain': round(combined_lvl.get('max_pain', 0)),
+                'resistance': [round(s) for s in combined_lvl.get('resistance', [])],
+                'support': [round(s) for s in combined_lvl.get('support', [])],
+            }
+            primary_net_gex = combined_lvl.get('net_gex_total', 0)
+            primary_active_gex = combined_lvl.get('active_gex_total', 0)
+            primary_regime = combined_lvl.get('regime', ibit_lvl.get('regime'))
+            primary_active_cw = round(combined_lvl.get('active_call_wall', combined_lvl.get('call_wall', 0)))
+            primary_active_pw = round(combined_lvl.get('active_put_wall', combined_lvl.get('put_wall', 0)))
+            primary_confidence = combined_lvl.get('positioning_confidence', 100)
+            primary_warnings = combined_lvl.get('positioning_warnings', [])
+            source_label = 'IBIT + Deribit (~91% of BTC options OI)'
+        else:
+            primary_lvl_btc = {
+                'call_wall': round(ibit_lvl['call_wall'] / bps),
+                'put_wall': round(ibit_lvl['put_wall'] / bps),
+                'gamma_flip': round(ibit_lvl['gamma_flip'] / bps),
+                'max_pain': round(ibit_lvl['max_pain'] / bps),
+                'resistance': [round(s / bps) for s in ibit_lvl.get('resistance', [])],
+                'support': [round(s / bps) for s in ibit_lvl.get('support', [])],
+            }
+            primary_net_gex = ibit_lvl.get('net_gex_total', 0)
+            primary_active_gex = ibit_lvl.get('active_gex_total', 0)
+            primary_regime = ibit_lvl.get('regime')
+            primary_active_cw = round(ibit_lvl.get('active_call_wall', ibit_lvl['call_wall']) / bps)
+            primary_active_pw = round(ibit_lvl.get('active_put_wall', ibit_lvl['put_wall']) / bps)
+            primary_confidence = ibit_lvl.get('positioning_confidence', 100)
+            primary_warnings = ibit_lvl.get('positioning_warnings', [])
+            source_label = 'IBIT only (~52% of BTC options OI)'
+
         summaries[key] = {
             'spot_btc': round(current_btc),
             'spot_ibit': d['spot'],
             'btc_per_share': bps,
-            'levels_btc': {
-                'call_wall': round(lvl['call_wall'] / bps),
-                'put_wall': round(lvl['put_wall'] / bps),
-                'gamma_flip': round(lvl['gamma_flip'] / bps),
-                'max_pain': round(lvl['max_pain'] / bps),
-                'resistance': [round(s / bps) for s in lvl.get('resistance', [])],
-                'support': [round(s / bps) for s in lvl.get('support', [])],
-            },
-            'active_gex_total': lvl.get('active_gex_total', 0),
-            'net_gex_total': lvl.get('net_gex_total', 0),
-            'level_trajectory': lvl.get('level_trajectory', {}),
-            'active_call_wall_btc': round(lvl.get('active_call_wall', lvl['call_wall']) / bps),
-            'active_put_wall_btc': round(lvl.get('active_put_wall', lvl['put_wall']) / bps),
-            'positioning_confidence': lvl.get('positioning_confidence', 100),
-            'positioning_warnings': lvl.get('positioning_warnings', []),
-            'levels': lvl,
+            'source': source_label,
+            'levels_btc': primary_lvl_btc,
+            'regime': primary_regime,
+            'active_gex_total': primary_active_gex,
+            'net_gex_total': primary_net_gex,
+            'level_trajectory': ibit_lvl.get('level_trajectory', {}),
+            'active_call_wall_btc': primary_active_cw,
+            'active_put_wall_btc': primary_active_pw,
+            'positioning_confidence': primary_confidence,
+            'positioning_warnings': primary_warnings,
+            'levels': ibit_lvl,
             'expected_move': d['expected_move'],
             'breakout': {
                 'up_signals': d['breakout']['up_signals'],
@@ -2166,7 +2512,7 @@ def run_analysis(ticker='IBIT', save=True):
             'flow_forecast': {
                 'charm': d['flow_forecast']['charm'],
                 'vanna': {
-                    'net_exposure': d['flow_forecast']['vanna']['net_exposure'],
+                    'net_notional': d['flow_forecast']['vanna']['net_notional'],
                     'strength': d['flow_forecast']['vanna']['strength'],
                     'crush_scenario': d['flow_forecast']['vanna']['crush_scenario'],
                     'spike_scenario': d['flow_forecast']['vanna']['spike_scenario'],
@@ -2197,11 +2543,37 @@ def run_analysis(ticker='IBIT', save=True):
                 }
                 for fp in (d.get('delta_flip_points') or [])
             ],
-            'key_level_dealer_delta_btc': {
-                name: round(delta * d['btc_per_share']) if delta is not None else None
+            'key_level_dealer_delta': {
+                name: round(delta) if delta is not None else None
                 for name, delta in (d.get('dealer_delta_briefing', {}).get('key_level_deltas', {}) or {}).items()
             } if d.get('dealer_delta_briefing') else None,
+            'data_freshness': d.get('data_freshness'),
         }
+
+        # Per-venue breakdown for divergence analysis
+        if deribit_avail:
+            summaries[key]['venue_breakdown'] = {
+                'ibit': {
+                    'oi_contracts': ibit_lvl.get('total_call_oi', 0) + ibit_lvl.get('total_put_oi', 0),
+                    'net_gex': ibit_lvl.get('net_gex_total', 0),
+                    'call_wall_btc': round(ibit_lvl['call_wall'] / bps),
+                    'put_wall_btc': round(ibit_lvl['put_wall'] / bps),
+                    'gamma_flip_btc': round(ibit_lvl['gamma_flip'] / bps),
+                    'regime': ibit_lvl.get('regime'),
+                    'net_vanna': ibit_lvl.get('net_vanna', 0),
+                    'net_charm': ibit_lvl.get('net_charm', 0),
+                },
+                'deribit': {
+                    'oi_btc': d.get('deribit_oi_btc', 0),
+                    'net_gex': d.get('deribit_net_gex', 0),
+                    'call_wall_btc': round(deribit_lvl.get('call_wall', 0)) if deribit_lvl else None,
+                    'put_wall_btc': round(deribit_lvl.get('put_wall', 0)) if deribit_lvl else None,
+                    'gamma_flip_btc': round(deribit_lvl.get('gamma_flip', 0)) if deribit_lvl else None,
+                    'regime': deribit_lvl.get('regime') if deribit_lvl else None,
+                    'net_vanna': deribit_lvl.get('net_vanna', 0) if deribit_lvl else 0,
+                    'net_charm': deribit_lvl.get('net_charm', 0) if deribit_lvl else 0,
+                },
+            }
 
         # Add day-over-day level changes if previous data exists
         prev_date, prev_data = get_prev_cache(ticker, max_d)
@@ -2213,17 +2585,17 @@ def run_analysis(ticker='IBIT', save=True):
                 'spot_btc_prev': round(prev_data.get('btc_spot', 0)),
                 'spot_btc_change': round(d['btc_spot'] - prev_data.get('btc_spot', d['btc_spot'])),
                 'regime_prev': prev_lvl.get('regime', 'unknown'),
-                'regime_changed': prev_lvl.get('regime') != lvl.get('regime'),
+                'regime_changed': prev_lvl.get('regime') != ibit_lvl.get('regime'),
                 'call_wall_btc_prev': round(prev_lvl['call_wall'] / prev_bps),
-                'call_wall_btc_change': round(lvl['call_wall'] / bps - prev_lvl['call_wall'] / prev_bps),
+                'call_wall_btc_change': round(ibit_lvl['call_wall'] / bps - prev_lvl['call_wall'] / prev_bps),
                 'put_wall_btc_prev': round(prev_lvl['put_wall'] / prev_bps),
-                'put_wall_btc_change': round(lvl['put_wall'] / bps - prev_lvl['put_wall'] / prev_bps),
+                'put_wall_btc_change': round(ibit_lvl['put_wall'] / bps - prev_lvl['put_wall'] / prev_bps),
                 'gamma_flip_btc_prev': round(prev_lvl['gamma_flip'] / prev_bps),
-                'gamma_flip_btc_change': round(lvl['gamma_flip'] / bps - prev_lvl['gamma_flip'] / prev_bps),
+                'gamma_flip_btc_change': round(ibit_lvl['gamma_flip'] / bps - prev_lvl['gamma_flip'] / prev_bps),
                 'net_gex_prev': prev_lvl.get('net_gex_total', 0),
-                'net_gex_change': lvl.get('net_gex_total', 0) - prev_lvl.get('net_gex_total', 0),
+                'net_gex_change': ibit_lvl.get('net_gex_total', 0) - prev_lvl.get('net_gex_total', 0),
                 'pcr_prev': prev_lvl.get('pcr', 0),
-                'pcr_change': round(lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
+                'pcr_change': round(ibit_lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
             }
 
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
@@ -2245,6 +2617,24 @@ Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new 
 Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
 
 ETF fund flows (etf_flows) show daily creation/redemption activity from Farside Investors. 'daily_flow_millions' is IBIT-specific flow; 'total_btc_etf_flow_millions' is the total across ALL BTC spot ETFs (IBIT, FBTC, ARKB, GBTC, etc.). Positive = inflows, negative = outflows. A streak of 3+ days in one direction is significant. IMPORTANT: Distinguish between IBIT-specific outflows and total BTC ETF outflows. If IBIT has outflows but total BTC ETFs have inflows, that's fund rotation (not bearish). If ALL BTC ETFs have outflows, that's genuine institutional exit (bearish). Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
+
+VENUE DATA:
+levels_btc contains the COMBINED IBIT + Deribit gamma exposure profile (~91% of all BTC options OI when Deribit is available). These are your primary levels for analysis — call walls, put walls, gamma flip, max pain all reflect the full options market. The 'source' field indicates what data is included.
+
+venue_breakdown (when present) shows per-venue positioning. Use it to identify divergences:
+- If both IBIT and Deribit have a call wall at the same BTC level → HIGH CONVICTION resistance (TradFi + crypto-native agree)
+- If both have a put wall at the same level → HIGH CONVICTION support
+- If IBIT has a big wall that Deribit doesn't → TradFi-driven level, may not hold if crypto-native flow pushes through
+- If Deribit has a big wall that IBIT doesn't → crypto-native positioning that TradFi hasn't hedged around; watch for convergence
+- If gamma flips differ between venues → note which venue is in positive vs negative gamma territory
+Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
+
+DATA FRESHNESS:
+data_freshness shows how stale each venue's data is. IBIT options data updates once per day at US market close (4:15 PM ET) — age_hours tells you how many hours since that last close. Deribit data is near real-time (cached up to 60 minutes) — age_minutes tells you minutes since last fetch. If IBIT age_hours > 16 (e.g., weekend or overnight), note that IBIT levels may be stale while Deribit reflects current positioning. If in_market_hours is true, IBIT data is from the current or most recent session and is fresh. On weekends, IBIT data can be 40+ hours old — Deribit levels become more reliable for current positioning.
+
+venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
+
+Note: significant_levels and breakout are derived from IBIT options data only. flow_forecast uses combined IBIT + Deribit data. Dealer delta scenarios include both IBIT and Deribit contributions.
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
@@ -2271,7 +2661,7 @@ For each timeframe, provide:
 - Regime summary and implication (1-2 sentences)
 - Historical context: Reference regime streak, level migration trends, and range evolution from _history_trends. Is today's positioning a continuation or a change?
 - Key levels in BTC price with level trajectory status (STRENGTHENING/WEAKENING/STABLE) and dominant expiry if near-term. Example: "Call wall $108,200 (STRENGTHENING, driven by Feb 21 exp — 3 DTE)"
-- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta_btc.
+- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta (dollar notional).
 - Dealer flow direction (charm/vanna implications)
 - Risk assessment — specifically note where dealer delta ACCELERATES (acceleration_zone), as these are prices where moves become self-reinforcing
 - Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
@@ -2289,7 +2679,7 @@ For the "all" key: provide cross-timeframe alignment analysis — whether short-
 ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:** followed by the single most actionable takeaway in one sentence. This should answer "what do I do today?" — include direction (long/short/flat), the key price levels to watch, and the setup trigger. Examples:
 - "**BOTTOM LINE:** Fade rallies into $71,728 call wall, buy dips at $68,141 put wall — tight $3,500 range with positive gamma and dealer selling confirms both walls."
 - "**BOTTOM LINE:** Stay flat — gamma just flipped negative, dealer delta flipping at $104K means neither wall is reliable until positioning stabilizes."
-- "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short 5M shares creating a bid, but charm selling into $72.8M headwind caps upside speed."
+- "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short ~$33M notional creating a bid, but charm selling into $72.8M headwind caps upside speed."
 
 After the bottom line, provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
@@ -2314,7 +2704,7 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-opus-4-6",
-        max_tokens=5120,
+        max_tokens=8192,
         system=system_prompt,
         messages=[{
             "role": "user",
