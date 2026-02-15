@@ -1372,23 +1372,18 @@ function renderOutlook(data){
     },{
       id:'spotLabel',
       afterDatasetsDraw(chart){
-        const{ctx:c,chartArea:{right},scales:{y}}=chart;
+        const{ctx:c,chartArea:{left},scales:{y}}=chart;
         const yPx=y.getPixelForValue(spot);
         if(yPx==null||!isFinite(yPx))return;
         c.save();
-        // Small arrow tick on the right edge
+        // Small arrow on left edge
         c.fillStyle='rgba(255,255,255,0.6)';
         c.beginPath();
-        c.moveTo(right,yPx);
-        c.lineTo(right+5,yPx-4);
-        c.lineTo(right+5,yPx+4);
+        c.moveTo(left+1,yPx);
+        c.lineTo(left+6,yPx-4);
+        c.lineTo(left+6,yPx+4);
         c.closePath();
         c.fill();
-        // Label next to arrow
-        c.font='bold 9px IBM Plex Mono';
-        c.textBaseline='middle';
-        c.textAlign='left';
-        c.fillText('SPOT',right+7,yPx);
         c.restore();
       }
     }]
