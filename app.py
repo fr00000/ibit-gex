@@ -873,20 +873,31 @@ TF_DURATIONS_MS = {
 
 
 def _fetch_binance_klines(symbol, tf, start_ms, end_ms, limit=1000):
-    """Fetch klines from Binance REST API with .com/.us fallback."""
+    """Fetch klines from Binance .us, .com, or OKX fallback."""
+    # Map Binance intervals to OKX bar notation
+    okx_tf = {'1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1d': '1D'}.get(tf, tf)
+    # OKX uses BTC-USDT not BTCUSDT
+    okx_inst = symbol[:3] + '-' + symbol[3:] if len(symbol) > 3 else symbol
     urls = [
-        f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
-        f'https://api.binance.us/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}',
+        ('binance.us', f'https://api.binance.us/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}'),
+        ('binance.com', f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={tf}&startTime={start_ms}&endTime={end_ms}&limit={limit}'),
+        ('okx', f'https://www.okx.com/api/v5/market/history-candles?instId={okx_inst}&bar={okx_tf}&after={end_ms}&before={start_ms}&limit={min(limit, 300)}'),
     ]
-    for url in urls:
+    for source, url in urls:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'ibit-gex/1.0'})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                if isinstance(data, list):
-                    return data
+                raw = json.loads(resp.read().decode())
+                if source == 'okx':
+                    # OKX returns {"code":"0","data":[[ts,o,h,l,c,vol,...],...]}
+                    if isinstance(raw, dict) and raw.get('code') == '0' and raw.get('data'):
+                        # Convert to Binance kline format: [ts,o,h,l,c,vol,close_ts,...]
+                        return [[int(r[0]),r[1],r[2],r[3],r[4],r[5],int(r[0]),r[5],'0','0','0','0']
+                                for r in reversed(raw['data'])]
+                elif isinstance(raw, list):
+                    return raw
         except Exception as e:
-            print(f"  [candles] Binance fetch failed ({url[:50]}...): {e}")
+            print(f"  [candles] {source} fetch failed: {e}")
     return []
 
 
