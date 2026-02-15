@@ -1099,7 +1099,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 vanna = bs_vanna(spot, strike, T, rfr, iv)
                 charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
-                dealer_delta = -delta * oi * 100
+                dealer_delta = -delta * oi * 100 * spot  # dollar notional
                 # Dealer vanna exposure: how dealer delta changes with IV
                 # Vanna is identical for calls/puts (put-call parity), and dealers
                 # are short both, so no sign flip per option type.
@@ -1206,7 +1206,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
                     # Contract multiplier = 1 BTC (not 100 shares)
                     gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
-                    dealer_delta = -delta * oi * 1
+                    dealer_delta = -delta * oi * 1 * btc_s  # dollar notional
                     dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
                     dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
 
@@ -1659,7 +1659,7 @@ def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, r
                     if pd.isna(iv) or iv <= 0:
                         continue
                     delta = bs_delta(S_hyp, strike, T, rfr, iv, opt_type)
-                    dd = -delta * oi * 100
+                    dd = -delta * oi * 100 * S_hyp  # dollar notional
                     net_dd += dd
                     if opt_type == 'call':
                         call_dd += dd
@@ -1673,7 +1673,7 @@ def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, r
                 T_d = max(opt['dte'] / 365.0, 0.5 / 365)
                 iv_d = opt['iv'] / 100.0
                 delta_d = bs_delta(S_hyp_btc, opt['strike'], T_d, rfr, iv_d, opt['option_type'])
-                dd_d = -delta_d * opt['oi'] * 1
+                dd_d = -delta_d * opt['oi'] * 1 * S_hyp_btc  # dollar notional
                 net_dd += dd_d
                 if opt['option_type'] == 'call':
                     call_dd += dd_d
@@ -1788,7 +1788,7 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
 
     # Morning take
     parts = []
-    notional = abs(cur_delta) * spot
+    notional = abs(cur_delta)  # already dollar notional
     if notional >= 1e6:
         notional_str = f"~${notional/1e6:.0f}M notional"
     else:
