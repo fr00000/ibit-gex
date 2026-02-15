@@ -263,6 +263,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="hdr-flow" id="hdr-flow" style="display:none"></div>
   <div class="hdr-right">
     <div class="hdr-ts" id="hdr-time"></div>
+    <span id="hdr-freshness" style="display:none;color:var(--t3);font-size:9px;margin-left:6px"></span>
     <div class="hdr-sep"></div>
     <label style="color:var(--t3);font-size:10px;">DTE</label>
     <select id="dte-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
@@ -1000,6 +1001,18 @@ async function loadData(){
     const tkLabel=data.ticker||currentTicker;
     document.getElementById('hdr-ibit').textContent=`${tkLabel} ${fmt(data.spot)}`;
     document.getElementById('hdr-time').textContent=data.timestamp;
+    // Data freshness badge
+    const freshEl=document.getElementById('hdr-freshness');
+    if(data.data_freshness&&data.data_freshness.ibit){
+      const ih=data.data_freshness.ibit.age_hours;
+      if(!data.data_freshness.ibit.in_market_hours&&ih>16){
+        freshEl.style.display='inline';
+        freshEl.style.color=ih>40?'#ff4060':'var(--t3)';
+        freshEl.textContent=`IBIT ${Math.round(ih)}h old`;
+      } else {
+        freshEl.style.display='none';
+      }
+    } else {freshEl.style.display='none'}
     const re=document.getElementById('hdr-regime');
     const neg=data.levels.regime==='negative_gamma';
     re.className=`hdr-regime ${neg?'regime-neg':'regime-pos'}`;
