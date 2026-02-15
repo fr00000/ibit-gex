@@ -55,6 +55,16 @@ RISK_FREE_RATE_DEFAULT = 0.043
 STRIKE_RANGE_PCT = 0.35
 DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
 
+# Non-overlapping DTE windows: each shows distinct positioning
+# (label, min_dte, max_dte)
+DTE_WINDOWS = [
+    (3,  0,  3),   # This week's expirations — immediate hedging
+    (7,  4,  7),   # Next week's setup
+    (14, 8,  14),  # Two weeks out
+    (30, 15, 30),  # Monthly cycle positioning
+    (45, 31, 45),  # Structural / quarterly
+]
+
 TICKER_CONFIG = {
     'IBIT': {
         'name': 'IBIT', 'asset_label': 'BTC', 'ref_ticker': 'BTC-USD',
@@ -384,16 +394,11 @@ def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
         return 'flat'
 
     net_gex_vals = [h[8] for h in history if h[8] is not None]
-    w_gex_vals = [h[11] for h in history if h[11] is not None]
-
     net_gex_3d_pct = pct_change_nd(net_gex_vals, min(3, len(net_gex_vals) - 1)) if len(net_gex_vals) >= 2 else None
-    w_gex_3d_pct = pct_change_nd(w_gex_vals, min(3, len(w_gex_vals) - 1)) if len(w_gex_vals) >= 2 else None
 
     gex_trend = {
         'net_gex_direction': gex_direction(net_gex_3d_pct),
         'net_gex_3d_change_pct': net_gex_3d_pct,
-        'weighted_gex_direction': gex_direction(w_gex_3d_pct),
-        'weighted_gex_3d_change_pct': w_gex_3d_pct,
     }
 
     # ── OI trend ──
@@ -754,7 +759,7 @@ def update_btc_candles(symbol, tf):
 
 
 # ── DATA ────────────────────────────────────────────────────────────────────
-def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
+def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     cfg = TICKER_CONFIG.get(ticker_symbol)
     is_crypto = cfg is not None
 
@@ -780,10 +785,19 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
 
     all_exps = list(ticker.options)
     now = datetime.now(timezone.utc)
-    cutoff = now + timedelta(days=max_dte)
-    selected_exps = [e for e in all_exps if datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff]
+    cutoff_max = now + timedelta(days=max_dte)
+    cutoff_min = now + timedelta(days=min_dte)
+    selected_exps = [
+        e for e in all_exps
+        if cutoff_min <= datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff_max
+    ]
     if not selected_exps:
-        selected_exps = all_exps[:3]
+        # If no expirations in this window, find the nearest expiration after cutoff_min
+        future_exps = [e for e in all_exps if datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) > cutoff_min]
+        if future_exps:
+            selected_exps = future_exps[:1]  # take just the nearest one
+        else:
+            selected_exps = all_exps[-1:]  # last resort: furthest available
 
     # Fetch previous day's strike data (needed for Active GEX + breakout + sig levels)
     conn = get_db()
@@ -1084,9 +1098,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
     except Exception as e:
         print(f"  [delta-scenario] Failed: {e}")
 
-    # Save to DB
+    # Save to DB (only for 0-min_dte windows — most relevant for day-over-day comparisons)
     conn = get_db()
-    save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
+    if min_dte == 0:
+        save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
 
     # OI aggregate changes
     oi_changes = None
@@ -1160,6 +1175,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7):
         'btc_per_share': float(ref_per_share),
         'is_btc': bool(is_crypto),
         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'dte_window': {'min': min_dte, 'max': max_dte},
         'levels': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                    for k, v in levels.items()},
         'expected_move': expected_move,
@@ -1762,24 +1778,26 @@ def set_cached_data(ticker, dte, data):
     conn.close()
 
 
-def fetch_with_cache(ticker, dte):
+def fetch_with_cache(ticker, dte, min_dte=0):
     """Return cached data if fresh, otherwise check Yahoo for new OI."""
     today = datetime.now().strftime('%Y-%m-%d')
     cache_date, cached = get_latest_cache(ticker, dte)
 
-    # Already confirmed today's data
+    # Already confirmed today's data (and min_dte matches)
     if cached and cache_date == today:
-        return cached
+        cached_min = cached.get('dte_window', {}).get('min', 0)
+        if cached_min == min_dte:
+            return cached
 
     # Throttle: don't re-check Yahoo more than every 30 min
-    check_key = (ticker, dte)
+    check_key = (ticker, dte, min_dte)
     with _yahoo_check_lock:
         last_check = _last_yahoo_check.get(check_key)
         if cached and last_check and (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
             return cached
 
     # Fetch from Yahoo
-    data = fetch_and_analyze(ticker, dte)
+    data = fetch_and_analyze(ticker, dte, min_dte)
     with _yahoo_check_lock:
         _last_yahoo_check[check_key] = datetime.now()
 
@@ -1797,7 +1815,7 @@ def fetch_with_cache(ticker, dte):
 
 # ── BACKGROUND REFRESH ─────────────────────────────────────────────────────
 
-REFRESH_DTES = [3, 7, 14, 30, 45]
+REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
@@ -1848,20 +1866,22 @@ def _bg_refresh():
         for tk, cfg in TICKER_CONFIG.items():
             today = datetime.now().strftime('%Y-%m-%d')
             all_fresh = True
-            stale_dtes = []
-            for dte in REFRESH_DTES:
-                cache_date, _ = get_latest_cache(tk, dte)
-                if cache_date != today:
-                    stale_dtes.append(dte)
-            if stale_dtes:
+            stale_windows = []
+            for label, min_d, max_d in REFRESH_DTES:
+                cache_date, cached = get_latest_cache(tk, max_d)
+                # Check both date and that min_dte matches
+                if cache_date != today or (cached and cached.get('dte_window', {}).get('min', 0) != min_d):
+                    stale_windows.append((label, min_d, max_d))
+            if stale_windows:
                 all_fresh = False
-                with ThreadPoolExecutor(max_workers=len(stale_dtes)) as pool:
-                    futures = {pool.submit(fetch_with_cache, tk, d): d for d in stale_dtes}
+                with ThreadPoolExecutor(max_workers=len(stale_windows)) as pool:
+                    futures = {pool.submit(fetch_with_cache, tk, max_d, min_d): (label, min_d, max_d) for label, min_d, max_d in stale_windows}
                     for fut in as_completed(futures):
                         try:
                             fut.result()
                         except Exception as e:
-                            print(f"  [bg-refresh] {tk} DTE {futures[fut]} error: {e}")
+                            w = futures[fut]
+                            print(f"  [bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
 
             if all_fresh:
                 # Auto-run AI analysis if not cached, or re-run if ref asset moved >2%
@@ -1943,18 +1963,20 @@ def api_data():
         ticker = request.args.get('ticker', 'IBIT').upper()
         if ticker not in TICKER_CONFIG:
             return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
-        dte = request.args.get('dte', 7, type=int)
+        dte = request.args.get('dte', 3, type=int)
+        min_dte = request.args.get('min_dte', 0, type=int)
         dte = max(1, min(dte, 90))
+        min_dte = max(0, min(min_dte, dte - 1))
         try:
-            data = fetch_with_cache(ticker, dte)
+            data = fetch_with_cache(ticker, dte, min_dte)
         except (ValueError, KeyError):
             # Serve most recent cached data for this DTE if available
             _, cached = get_latest_cache(ticker, dte)
             if cached:
                 data = cached
                 data['stale'] = True
-            elif dte != 7:
-                data = fetch_with_cache(ticker, 7)
+            elif dte != 3:
+                data = fetch_with_cache(ticker, 3, 0)
                 data['fallback_from'] = dte
             else:
                 raise
@@ -2015,7 +2037,7 @@ def run_analysis(ticker='IBIT'):
     if not api_key:
         raise RuntimeError('ANTHROPIC_API_KEY not set')
 
-    dtes = [3, 7, 14, 30, 45]
+    dtes = DTE_WINDOWS  # list of (label, min_dte, max_dte)
     results = {}
 
     # Fetch live ref asset price so the AI sees current price, not stale cache
@@ -2025,29 +2047,32 @@ def run_analysis(ticker='IBIT'):
     except Exception:
         pass
 
-    def fetch_dte(dte):
-        return dte, fetch_with_cache(ticker, dte)
+    def fetch_dte(window):
+        label, min_d, max_d = window
+        return label, fetch_with_cache(ticker, max_d, min_d)
 
     with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(fetch_dte, d): d for d in dtes}
+        futures = {pool.submit(fetch_dte, w): w for w in dtes}
         for fut in as_completed(futures):
-            dte, data = fut.result()
-            results[dte] = data
+            label, data = fut.result()
+            results[label] = data
 
     # Compute history trends (ticker-level, shared across all DTEs)
+    first_label = dtes[0][0]
     conn = get_db()
-    history_trends = summarize_history_trends(conn, ticker, results[dtes[0]]['btc_per_share'], results[dtes[0]]['levels'])
+    history_trends = summarize_history_trends(conn, ticker, results[first_label]['btc_per_share'], results[first_label]['levels'])
     conn.close()
 
     # Build concise summaries (strip chart data to keep prompt small)
     summaries = {}
     summaries['_history_trends'] = history_trends
-    for dte in dtes:
-        d = results[dte]
+    for label, min_d, max_d in dtes:
+        d = results[label]
         bps = d['btc_per_share']
         lvl = d['levels']
         current_btc = live_ref_price if live_ref_price else d['btc_spot']
-        summaries[f"{dte}d"] = {
+        key = f"{min_d}-{max_d}d"
+        summaries[key] = {
             'spot_btc': round(current_btc),
             'spot_ibit': d['spot'],
             'btc_per_share': bps,
@@ -2115,11 +2140,11 @@ def run_analysis(ticker='IBIT'):
         }
 
         # Add day-over-day level changes if previous data exists
-        prev_date, prev_data = get_prev_cache(ticker, dte)
+        prev_date, prev_data = get_prev_cache(ticker, max_d)
         if prev_data:
             prev_lvl = prev_data['levels']
             prev_bps = prev_data.get('btc_per_share', bps)
-            summaries[f"{dte}d"]['changes_vs_prev'] = {
+            summaries[key]['changes_vs_prev'] = {
                 'prev_date': prev_date,
                 'spot_btc_prev': round(prev_data.get('btc_spot', 0)),
                 'spot_btc_change': round(d['btc_spot'] - prev_data.get('btc_spot', d['btc_spot'])),
@@ -2204,7 +2229,16 @@ ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:*
 
 After the bottom line, provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
-IMPORTANT: Return ONLY valid JSON with keys "3d", "7d", "14d", "30d", "45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
+DTE windows are NON-OVERLAPPING. Each timeframe shows distinct option positioning:
+- 0-3d: Immediate expirations. Highest gamma, strongest near-term hedging pressure. These are today's actionable levels.
+- 4-7d: Next week's expirations. Where the next wave of gamma concentration is forming.
+- 8-14d: Two-week positioning. Emerging walls that will become dominant after near-term expiries clear.
+- 15-30d: Monthly cycle. Institutional positioning around monthly options expiration.
+- 31-45d: Structural. Quarterly and longer-dated positioning that forms the backdrop.
+
+When comparing across windows: if 0-3d and 4-7d call walls are at the same strike, that level has multi-week support and is high conviction. If they differ, the near-term wall will expire and levels will shift — flag this as a potential level migration.
+
+IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "31-45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
 
     # Build user message with optional previous analysis
     prev_analysis_date, prev_analysis = get_prev_analysis(ticker)
