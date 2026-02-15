@@ -296,14 +296,6 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <option value="deribit">DERIBIT</option>
     </select>
     <span id="hdr-deribit" style="display:none;color:var(--t3);font-size:9px"></span>
-    <div class="hdr-sep"></div>
-    <label style="color:var(--t3);font-size:10px;">TF</label>
-    <select id="tf-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
-      <option value="15m" selected>15m</option>
-      <option value="1h">1h</option>
-      <option value="4h">4h</option>
-      <option value="1d">1d</option>
-    </select>
     <button class="hdr-btn" onclick="loadData()">REFRESH</button>
   </div>
 </div>
@@ -311,6 +303,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 <div class="grid">
   <div class="chart-area">
     <div id="tv-chart"></div>
+    <div style="position:absolute;top:4px;right:4px;z-index:10;display:flex;align-items:center;gap:3px">
+      <label style="color:var(--t3);font-size:9px">TF</label>
+      <select id="tf-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:9px;cursor:pointer">
+        <option value="15m" selected>15m</option>
+        <option value="1h">1h</option>
+        <option value="4h">4h</option>
+        <option value="1d">1d</option>
+      </select>
+    </div>
     <div class="chart-legend">
       <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#00dc82"></div>Call Wall<div class="chart-legend-tip">Strike with highest call GEX. Acts as resistance — dealers sell into rallies here. In positive gamma this is a hard ceiling.</div></div>
       <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#ff4060"></div>Put Wall<div class="chart-legend-tip">Strike with most negative put GEX. Acts as support — dealers buy dips here. In positive gamma this is a hard floor.</div></div>
