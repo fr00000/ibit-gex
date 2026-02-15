@@ -57,7 +57,7 @@ python3 app.py
 python3 app.py --port 8080 --host 0.0.0.0
 ```
 
-DTE (days to expiration) is selectable from the web UI dropdown (3d, 7d, 14d, 30d, 45d).
+DTE windows are selectable from the web UI dropdown. Windows are non-overlapping so each shows distinct positioning: 0-3 (immediate), 4-7 (next week), 8-14 (two weeks), 15-30 (monthly), 31-45 (structural).
 
 ### Flags
 
@@ -69,13 +69,13 @@ DTE (days to expiration) is selectable from the web UI dropdown (3d, 7d, 14d, 30
 ## Dashboard
 
 ### Header
-Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE selector, candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
+Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE window selector (non-overlapping ranges), candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
 
 ### Candlestick Chart
-Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, and support/resistance levels. Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
+Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, support/resistance levels, and dealer delta flip points (purple dotted). Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
 
 ### GEX Profile
-Stacked bar chart showing Active GEX (new OI since yesterday, solid) and Stale GEX (existing positions, faded) at each strike. Green = positive gamma, red = negative gamma. Active GEX highlights where fresh dealer exposure is concentrated vs legacy "zombie gamma."
+Stacked bar chart showing per-expiry GEX contribution at each strike. Green = positive gamma, red = negative gamma. Each expiry gets a distinct color in the stack, with a legend showing DTE and date. An expiry filter dropdown (ALL EXP, NEAREST, NEXT 2, NEXT 3) controls which expirations are displayed. Tooltip shows net GEX, active GEX, and volume.
 
 ### Open Interest Profile
 Call vs put open interest at each strike, showing where hedging activity is concentrated.
@@ -83,9 +83,12 @@ Call vs put open interest at each strike, showing where hedging activity is conc
 ### ETF Flows
 Bar chart of daily ETF fund flows over the last 30 days. Green bars = inflow days (creation/accumulation), red bars = outflow days (redemption/distribution). Backfilled from Yahoo Finance historical data on first run, then updated daily from shares outstanding changes.
 
+### Dealer Delta Profile
+Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices across the key level grid. Green bars = dealers must BUY (supportive), red bars = dealers must SELL (resistive). Shows where dealer hedging creates natural support/resistance independent of the GEX profile.
+
 ### Sidebar
 
-- **AI Analysis** — Claude-powered trading analysis across all DTE timeframes (3d/7d/14d/30d/45d + combined). Auto-runs daily when fresh data arrives. Includes day-over-day level changes and prior analysis context for thesis continuity.
+- **AI Analysis** — Claude-powered trading analysis across all non-overlapping DTE windows (0-3d/4-7d/8-14d/15-30d/31-45d + cross-timeframe). Auto-runs daily when fresh data arrives. Includes day-over-day level changes, historical trend context, and prior analysis for thesis continuity.
 - **Regime Banner** — Positive gamma (range-bound, fade extremes) or negative gamma (trending, don't fade)
 - **Expected Move** — Implied straddle range for nearest expiry
 - **Range Visual** — In positive gamma: tradeable range between put wall and call wall with spot indicator
@@ -95,6 +98,7 @@ Bar chart of daily ETF fund flows over the last 30 days. Green bars = inflow day
 - **Dealer Flows** — Overnight charm forecast, vanna vol scenarios, and combined overnight dealer rebalancing estimate
 - **OI Changes** — Call/put open interest shifts vs prior snapshot
 - **ETF Fund Flows** — Daily flow amount, direction, strength, and 5-day momentum with streak dots
+- **Dealer Hedging Pressure** — Scenario analysis showing current dealer delta position, delta flip points (where hedging direction reverses), dealer delta at key levels, and a morning briefing summary
 - **Dealer Position** — Net GEX, Active GEX, dealer delta, net vanna, net charm, put/call ratio
 - **History** — Daily snapshots of regime and levels
 
@@ -111,7 +115,7 @@ Bar chart of daily ETF fund flows over the last 30 days. Green bars = inflow day
 ### Data Caching
 Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed.
 
-A background thread pre-fetches all 5 DTE timeframes on startup and keeps the cache warm. Once all timeframes are fresh for the day, it auto-runs AI analysis (if `ANTHROPIC_API_KEY` is set).
+A background thread pre-fetches all 5 non-overlapping DTE windows on startup and keeps the cache warm. Once all windows are fresh for the day, it auto-runs AI analysis (if `ANTHROPIC_API_KEY` is set).
 
 ### GEX Calculation
 ```
@@ -123,6 +127,14 @@ GEX = Gamma x OI x 100 x Spot^2 x 0.01
 
 ### Active GEX
 Active GEX weights net GEX by the fraction of OI that is new since yesterday (delta_OI / total_OI). This surfaces where fresh dealer exposure is concentrated vs stale positions from days ago. Active walls show the strikes with the most new positioning.
+
+### Dealer Delta Scenarios
+Pre-computes dealer delta (net hedging pressure) at hypothetical prices across the key level grid. At each price point, Black-Scholes delta is recalculated for every option in the chain. Key outputs:
+- **Delta flip points** — Prices where net dealer delta crosses zero (hedging direction reverses). Distinct from gamma flip.
+- **Hedging acceleration** — Rate of change of dealer delta. High acceleration zones are inflection points where small price moves trigger large hedging flows.
+- **Key level deltas** — Dealer delta values at call wall, put wall, gamma flip, and max pain.
+
+Sign convention: negative dealer delta = dealers must BUY = supportive (green). Positive = dealers must SELL = resistive (red).
 
 ### Positioning Confidence
 A 0-100% score indicating how much to trust the standard GEX sign convention (dealers long calls, short puts). Penalized by:
@@ -181,8 +193,18 @@ When IV changes, dealer delta shifts. The dashboard models two scenarios:
 | ETF flow streak | 3+ day inflow streak | 3+ day outflow streak |
 | ETF flow momentum | 5d avg inflow > $100M | 5d avg outflow > $100M |
 
-### DTE Selection
-Lower DTE (7) focuses on near-term expirations where gamma is strongest (gamma scales as 1/sqrt(T)). Higher DTE (14-45) includes longer-dated positioning which is structurally relevant but has less gamma impact. Default is 7 for short-term trading. DTE is selectable from the web UI dropdown.
+### DTE Windows
+DTE windows are **non-overlapping** so each shows distinct option positioning rather than cumulative views dominated by near-term expirations:
+
+| Window | Range | What it shows |
+|---|---|---|
+| 0-3 DTE | Today through 3 days | Immediate expirations — highest gamma, strongest hedging pressure. Most actionable. |
+| 4-7 DTE | 4 through 7 days | Next week's setup — where the next wave of gamma is forming. |
+| 8-14 DTE | 8 through 14 days | Two-week positioning — emerging walls that become dominant after near-term expiry. |
+| 15-30 DTE | 15 through 30 days | Monthly cycle — institutional positioning around monthly options expiration. |
+| 31-45 DTE | 31 through 45 days | Structural — quarterly and longer-dated positioning that forms the backdrop. |
+
+Default is 0-3 for morning briefings. When comparing across windows, matching levels (e.g. same call wall in 0-3d and 4-7d) indicate high-conviction multi-week positioning. Divergent levels flag potential level migration after near-term expiry.
 
 ## Daily OI Tracking
 
@@ -198,7 +220,10 @@ The database also stores full data caches (per DTE) and AI analysis results, bot
 ### `GET /api/data`
 Returns JSON with spot prices, levels, GEX/OI chart data, significant levels, breakout assessment, dealer flow forecast, ETF flows, OI changes, and history. Served from cache when available.
 
-Accepts `?ticker=IBIT` (or `ETHA`) and `?dte=N` (1-90) query parameters.
+Query parameters:
+- `?ticker=IBIT` (or `ETHA`)
+- `?dte=N` — max DTE (1-90, default 3)
+- `?min_dte=N` — min DTE (default 0). Use with `dte` to define non-overlapping windows (e.g. `?min_dte=4&dte=7`).
 
 ### `GET /api/candles`
 Returns candlestick data from SQLite (90-day backfill from Binance). Accepts `?ticker=IBIT` and `?tf=15m` (15m/1h/4h/1d).
