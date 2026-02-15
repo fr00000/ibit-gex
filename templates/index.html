@@ -79,7 +79,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .hdr-btn:hover{border-color:var(--blue);color:var(--blue)}
 
 /* GRID */
-.grid{display:grid;grid-template-columns:1fr 320px 300px;grid-template-rows:1fr auto;height:calc(100vh - 36px);gap:1px;background:var(--border)}
+.grid{display:grid;grid-template-columns:1fr 320px 300px;grid-template-rows:1fr auto auto;height:calc(100vh - 36px);gap:1px;background:var(--border)}
 
 /* CHART AREA */
 .chart-area{background:var(--bg);grid-row:1;grid-column:1;position:relative;min-height:0}
@@ -93,7 +93,13 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .chart-legend-tip{display:none;position:absolute;top:100%;left:0;margin-top:4px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;font-size:9px;color:var(--t2);line-height:1.4;width:220px;white-space:normal;z-index:20;box-shadow:0 4px 12px rgba(0,0,0,.4)}
 
 /* BOTTOM CHARTS */
-.bottom{grid-row:2;grid-column:1;background:var(--bg);display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:1px;height:180px}
+.outlook-row{grid-row:2;grid-column:1;background:var(--bg);padding:6px 10px;display:flex;flex-direction:column;height:180px}
+.outlook-row .cell-label{font-size:9px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:2px;display:flex;align-items:center;gap:5px}
+.outlook-row .cell-label::before{content:'';display:inline-block;width:6px;height:6px;border-radius:1px;background:var(--blue)}
+.outlook-row canvas{flex:1;min-height:0}
+.outlook-legend{display:flex;gap:14px;padding:4px 0 0;justify-content:center;flex-wrap:wrap}
+.outlook-legend span{font-size:9px;color:var(--t3)}
+.bottom{grid-row:3;grid-column:1;background:var(--bg);display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:1px;height:180px}
 .bottom .cell{background:var(--bg);padding:6px 10px;min-height:0;display:flex;flex-direction:column}
 .cell-label{font-size:9px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:4px;display:flex;align-items:center;gap:5px}
 .cell-label::before{content:'';display:inline-block;width:6px;height:6px;border-radius:1px}
@@ -104,13 +110,13 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .cell canvas{flex:1;min-height:0}
 
 /* RIGHT PANEL */
-.right{grid-row:1/3;grid-column:2;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.right{grid-row:1/4;grid-column:2;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
 .right::-webkit-scrollbar{width:4px}
 .right::-webkit-scrollbar-track{background:transparent}
 .right::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 
 /* AI PANEL */
-.ai-panel{grid-row:1/3;grid-column:3;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;padding:8px 12px}
+.ai-panel{grid-row:1/4;grid-column:3;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;padding:8px 12px}
 .ai-panel::-webkit-scrollbar{width:4px}
 .ai-panel::-webkit-scrollbar-track{background:transparent}
 .ai-panel::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
@@ -226,15 +232,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 
 /* RESPONSIVE */
 @media(max-width:1400px){
-  .grid{grid-template-columns:1fr 320px;grid-template-rows:1fr auto auto}
-  .ai-panel{grid-row:3;grid-column:1/3;max-height:40vh}
+  .grid{grid-template-columns:1fr 320px;grid-template-rows:1fr auto auto auto}
+  .ai-panel{grid-row:4;grid-column:1/3;max-height:40vh}
   .bottom{grid-template-columns:1fr 1fr;height:auto}
   .bottom .cell{min-height:160px}
 }
 @media(max-width:1100px){
-  .grid{grid-template-columns:1fr;grid-template-rows:50vh auto auto auto}
-  .right{grid-row:3;grid-column:1;max-height:50vh}
-  .ai-panel{grid-row:4;grid-column:1;max-height:40vh}
+  .grid{grid-template-columns:1fr;grid-template-rows:50vh auto auto auto auto}
+  .right{grid-row:4;grid-column:1;max-height:50vh}
+  .ai-panel{grid-row:5;grid-column:1;max-height:40vh}
   .bottom{grid-template-columns:1fr}
   .bottom .cell{min-height:140px}
 }
@@ -309,6 +315,21 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#c084fc88"></div>&#x394; Flip<div class="chart-legend-tip">Price where net dealer delta crosses zero. Above = dealers must sell (resistive). Below = dealers must buy (supportive). Distinct from gamma flip.</div></div>
     </div>
   </div>
+  <div class="outlook-row" id="outlook-sec" style="display:none">
+    <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span></div>
+    <canvas id="outlook-chart"></canvas>
+    <div class="outlook-legend">
+      <span><span style="color:rgba(255,64,96,0.7)">━</span> Call wall</span>
+      <span><span style="color:rgba(0,220,130,0.7)">━</span> Put wall</span>
+      <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
+      <span><span style="color:rgba(136,146,164,0.4)">╌</span> Max pain</span>
+      <span><span style="color:rgba(168,139,250,0.5)">╌</span> EM</span>
+      <span><span style="color:rgba(220,224,232,0.3)">╌</span> Spot</span>
+      <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
+      <span><span style="background:rgba(0,220,130,0.06);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
+      <span><span style="background:rgba(255,64,96,0.06);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
+    </div>
+  </div>
   <div class="bottom" style="background:var(--border)">
     <div class="cell cell-gex">
       <div class="cell-label">GEX Profile
@@ -341,7 +362,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 </div>
 
 <script>
-let gexChart=null,oiChart=null,flowChart=null,deltaChart=null,tvChart=null,tvSeries=null,priceLines=[];
+let gexChart=null,oiChart=null,flowChart=null,deltaChart=null,tvChart=null,tvSeries=null,priceLines=[],outlookChart=null;
 let aiData=null;
 let aiUnsaved=false;
 let btcWs=null;
@@ -1080,6 +1101,7 @@ async function loadData(){
     try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
     try{renderSidebar(data)}catch(e){console.warn('Sidebar:',e)}
     try{renderAiPanel()}catch(e){console.warn('AI:',e)}
+    loadOutlook();
 
   }catch(e){
     console.error(e);
@@ -1165,6 +1187,142 @@ async function saveAnalysis(){
     console.error('Save error:',e);
     if(btn){btn.disabled=false;btn.textContent='SAVE';}
   }
+}
+
+// Outlook funnel
+async function loadOutlook(){
+  try{
+    const r=await fetch(`/api/outlook?ticker=${currentTicker}`);
+    const d=await r.json();
+    if(d.error||!d.windows||!d.windows.length){document.getElementById('outlook-sec').style.display='none';return}
+    document.getElementById('outlook-sec').style.display='';
+    renderOutlook(d);
+  }catch(e){console.warn('Outlook:',e);document.getElementById('outlook-sec').style.display='none'}
+}
+
+function renderOutlook(data){
+  const ctx=document.getElementById('outlook-chart');
+  if(!ctx)return;
+  const wins=data.windows;
+  const spot=data.spot;
+  if(!wins.length||!spot)return;
+
+  const labels=wins.map(w=>w.label);
+
+  // Datasets
+  const callWall=wins.map(w=>w.call_wall);
+  const putWall=wins.map(w=>w.put_wall);
+  const gammaFlip=wins.map(w=>w.gamma_flip);
+  const maxPain=wins.map(w=>w.max_pain);
+  const emUpper=wins.map(w=>w.em_upper);
+  const emLower=wins.map(w=>w.em_lower);
+
+  // Regime background colors per window
+  const regimeBg=wins.map(w=>w.regime==='negative_gamma'?'rgba(255,64,96,0.06)':'rgba(0,220,130,0.06)');
+
+  // Venue agreement diamonds
+  const venueAgree=wins.map(w=>w.venue_agree?w.call_wall:null);
+
+  if(outlookChart){outlookChart.destroy();outlookChart=null}
+
+  // Compute y-axis range: encompass all levels with padding
+  const allVals=[spot,...callWall,...putWall,...gammaFlip,...maxPain,...emUpper,...emLower].filter(v=>v!=null&&isFinite(v));
+  const yMin=Math.min(...allVals);
+  const yMax=Math.max(...allVals);
+  const yPad=(yMax-yMin)*0.12||1000;
+
+  outlookChart=new Chart(ctx,{
+    type:'line',
+    data:{
+      labels,
+      datasets:[
+        // EM cone (upper boundary)
+        {label:'EM Upper',data:emUpper,borderColor:'rgba(168,139,250,0.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,fill:false,tension:0,order:5},
+        // EM cone (lower boundary)
+        {label:'EM Lower',data:emLower,borderColor:'rgba(168,139,250,0.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,fill:'-1',backgroundColor:'rgba(168,139,250,0.04)',tension:0,order:5},
+        // Call wall
+        {label:'Call Wall',data:callWall,borderColor:'rgba(255,64,96,0.7)',borderWidth:2,pointRadius:3,pointBackgroundColor:'rgba(255,64,96,0.9)',fill:false,tension:0,order:2},
+        // Put wall
+        {label:'Put Wall',data:putWall,borderColor:'rgba(0,220,130,0.7)',borderWidth:2,pointRadius:3,pointBackgroundColor:'rgba(0,220,130,0.9)',fill:false,tension:0,order:2},
+        // Gamma flip
+        {label:'\u03b3 Flip',data:gammaFlip,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:2,pointBackgroundColor:'rgba(255,176,32,0.7)',fill:false,tension:0,order:3},
+        // Max pain
+        {label:'Max Pain',data:maxPain,borderColor:'rgba(136,146,164,0.4)',borderWidth:1,borderDash:[3,4],pointRadius:2,pointBackgroundColor:'rgba(136,146,164,0.5)',fill:false,tension:0,order:4},
+        // Spot reference
+        {label:'Spot',data:wins.map(()=>spot),borderColor:'rgba(220,224,232,0.3)',borderWidth:1,borderDash:[2,2],pointRadius:0,fill:false,tension:0,order:6},
+        // Venue agreement diamonds
+        {label:'Venue Agree',data:venueAgree,borderColor:'rgba(0,220,130,0.9)',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:wins.map(w=>w.venue_agree?5:0),pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
+      ]
+    },
+    options:{
+      responsive:true,
+      maintainAspectRatio:false,
+      animation:{duration:300},
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{display:false},
+        tooltip:{
+          backgroundColor:'rgba(6,8,12,0.95)',
+          borderColor:'rgba(28,34,48,0.8)',
+          borderWidth:1,
+          titleFont:{family:'IBM Plex Mono',size:10},
+          bodyFont:{family:'IBM Plex Mono',size:10},
+          padding:8,
+          callbacks:{
+            title(items){return items[0]?.label||''},
+            label(item){
+              const w=wins[item.dataIndex];
+              if(!w)return '';
+              const ds=item.dataset.label;
+              if(ds==='EM Upper')return `EM Upper: ${fB(item.raw)}`;
+              if(ds==='EM Lower')return `EM Lower: ${fB(item.raw)}`;
+              if(ds==='Call Wall')return `Call Wall: ${fB(item.raw)} (${w.regime==='negative_gamma'?'NEG \u03b3':'POS \u03b3'})`;
+              if(ds==='Put Wall')return `Put Wall: ${fB(item.raw)}`;
+              if(ds==='\u03b3 Flip')return `\u03b3 Flip: ${fB(item.raw)}`;
+              if(ds==='Max Pain')return `Max Pain: ${fB(item.raw)}`;
+              if(ds==='Spot')return `Spot: ${fB(item.raw)}`;
+              if(ds==='Venue Agree'&&item.raw!=null)return '\u25c6 IBIT+Deribit walls agree';
+              return '';
+            },
+            afterBody(items){
+              const w=wins[items[0]?.dataIndex];
+              if(!w)return '';
+              const lines=[];
+              if(w.dealer_delta_dir)lines.push(`Dealers ${w.dealer_delta_dir}`);
+              if(w.charm_dir)lines.push(`Charm: ${w.charm_dir}`);
+              return lines.join('\n');
+            }
+          }
+        }
+      },
+      scales:{
+        x:{
+          grid:{color:'rgba(28,34,48,0.5)',lineWidth:0.5},
+          ticks:{font:{family:'IBM Plex Mono',size:9},color:'#4a5568'}
+        },
+        y:{
+          min:Math.floor((yMin-yPad)/1000)*1000,
+          max:Math.ceil((yMax+yPad)/1000)*1000,
+          grid:{color:'rgba(28,34,48,0.5)',lineWidth:0.5},
+          ticks:{font:{family:'IBM Plex Mono',size:9},color:'#4a5568',callback:v=>fB(v)},
+          position:'right'
+        }
+      }
+    },
+    plugins:[{
+      id:'regimeBand',
+      beforeDatasetsDraw(chart){
+        const{ctx:c,chartArea:{left,right,top,bottom},scales:{x}}=chart;
+        const wins2=data.windows;
+        wins2.forEach((w,i)=>{
+          const xc=x.getPixelForValue(i);
+          const half=(right-left)/wins2.length/2;
+          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.04)':'rgba(0,220,130,0.04)';
+          c.fillRect(xc-half,top,half*2,bottom-top);
+        });
+      }
+    }]
+  });
 }
 
 // Init

@@ -2487,6 +2487,88 @@ def structure_page():
     return render_template('structure.html')
 
 
+@app.route('/api/outlook')
+def api_outlook():
+    """Return key levels from all DTE windows for the outlook funnel chart."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+
+    windows = []
+    spot_btc = None
+
+    for dte_key, min_d, max_d in DTE_WINDOWS:
+        _, cached = get_latest_cache(ticker, dte_key)
+        if not cached:
+            continue
+
+        bps = cached.get('btc_per_share', 1)
+        lvl = cached.get('levels', {})
+        combined = cached.get('combined_levels_btc') or {}
+        deribit_lvl = cached.get('deribit_levels_btc') or {}
+        em = cached.get('expected_move') or {}
+        flow = cached.get('flow_forecast', {})
+        dd = cached.get('dealer_delta_briefing', {})
+
+        if spot_btc is None:
+            spot_btc = cached.get('btc_spot')
+
+        if combined:
+            cw = combined.get('call_wall')
+            pw = combined.get('put_wall')
+            gf = combined.get('gamma_flip')
+            mp = combined.get('max_pain')
+            regime = combined.get('regime', lvl.get('regime'))
+            net_gex = combined.get('net_gex_total', 0)
+        else:
+            cw = lvl.get('call_wall', 0) / bps if bps else None
+            pw = lvl.get('put_wall', 0) / bps if bps else None
+            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            mp = lvl.get('max_pain', 0) / bps if bps else None
+            regime = lvl.get('regime')
+            net_gex = lvl.get('net_gex_total', 0)
+
+        ibit_cw = lvl.get('call_wall', 0) / bps if bps else None
+        ibit_pw = lvl.get('put_wall', 0) / bps if bps else None
+        deribit_cw = deribit_lvl.get('call_wall') if deribit_lvl else None
+        deribit_pw = deribit_lvl.get('put_wall') if deribit_lvl else None
+
+        venue_agree = False
+        if deribit_cw and ibit_cw and ibit_cw > 0:
+            venue_agree = abs(deribit_cw - ibit_cw) / ibit_cw < 0.03
+
+        net_dd = dd.get('current_delta')
+        dd_dir = 'short' if (isinstance(net_dd, (int, float)) and net_dd < 0) else 'long' if isinstance(net_dd, (int, float)) else None
+
+        charm = flow.get('charm', {})
+
+        windows.append({
+            'label': f'{min_d}-{max_d}d',
+            'min_dte': min_d,
+            'max_dte': max_d,
+            'call_wall': cw,
+            'put_wall': pw,
+            'gamma_flip': gf,
+            'max_pain': mp,
+            'regime': regime,
+            'net_gex': net_gex,
+            'em_upper': em.get('upper_btc'),
+            'em_lower': em.get('lower_btc'),
+            'venue_agree': venue_agree,
+            'ibit_cw': ibit_cw,
+            'ibit_pw': ibit_pw,
+            'deribit_cw': deribit_cw,
+            'deribit_pw': deribit_pw,
+            'dealer_delta_dir': dd_dir,
+            'charm_dir': charm.get('direction'),
+        })
+
+    return Response(json.dumps({
+        'spot': spot_btc,
+        'windows': windows,
+    }, cls=NumpyEncoder), mimetype='application/json')
+
+
 @app.route('/api/structure')
 def api_structure():
     conn = get_db()
