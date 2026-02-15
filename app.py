@@ -144,7 +144,9 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=30000')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,7 +218,9 @@ def init_db():
 
 def get_db():
     """Get a SQLite connection (one per call, thread-safe)."""
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA busy_timeout=30000')
+    return conn
 
 
 def get_prev_strikes(conn, ticker):
