@@ -81,14 +81,14 @@ Stacked bar chart showing per-expiry GEX contribution at each strike. Green = po
 Call vs put open interest at each strike, showing where hedging activity is concentrated.
 
 ### ETF Flows
-Bar chart of daily ETF fund flows over the last 30 days. Green bars = inflow days (creation/accumulation), red bars = outflow days (redemption/distribution). Backfilled from Yahoo Finance historical data on first run, then updated daily from shares outstanding changes.
+Dual-bar chart of daily ETF fund flows over the last 30 days sourced from Farside Investors. Wide faded bars show total BTC ETF flow (all spot Bitcoin ETFs combined), narrow solid bars show IBIT-specific flow. Green = inflow, red = outflow. When IBIT outflows coincide with positive total flow, it signals fund rotation rather than genuine institutional exit.
 
 ### Dealer Delta Profile
 Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices across the key level grid. Green bars = dealers must BUY (supportive), red bars = dealers must SELL (resistive). Shows where dealer hedging creates natural support/resistance independent of the GEX profile.
 
 ### Sidebar
 
-- **AI Analysis** — Claude-powered trading analysis across all non-overlapping DTE windows (0-3d/4-7d/8-14d/15-30d/31-45d + cross-timeframe). Auto-runs daily when fresh data arrives. Includes day-over-day level changes, historical trend context, and prior analysis for thesis continuity.
+- **AI Analysis** — Claude-powered trading analysis across all non-overlapping DTE windows (0-3d/4-7d/8-14d/15-30d/31-45d + cross-timeframe). Auto-runs daily when fresh data arrives (saved automatically). Manual refresh via the refresh button generates a new analysis without saving; use the Save button to persist it when satisfied. Includes day-over-day level changes, historical trend context, and prior analysis for thesis continuity.
 - **Regime Banner** — Positive gamma (range-bound, fade extremes) or negative gamma (trending, don't fade)
 - **Expected Move** — Implied straddle range for nearest expiry
 - **Range Visual** — In positive gamma: tradeable range between put wall and call wall with spot indicator
@@ -97,7 +97,7 @@ Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices
 - **Breakout Assessment** — Upside/downside signal scoring with targets, includes ETF flow streak signals
 - **Dealer Flows** — Overnight charm forecast, vanna vol scenarios, and combined overnight dealer rebalancing estimate
 - **OI Changes** — Call/put open interest shifts vs prior snapshot
-- **ETF Fund Flows** — Daily flow amount, direction, strength, and 5-day momentum with streak dots
+- **ETF Fund Flows** — IBIT and total BTC ETF daily flow amount, direction, strength, and 5-day momentum with streak dots
 - **Dealer Hedging Pressure** — Scenario analysis showing current dealer delta position, delta flip points (where hedging direction reverses), dealer delta at key levels, and a morning briefing summary
 - **Dealer Position** — Net GEX, Active GEX, dealer delta, net vanna, net charm, put/call ratio
 - **History** — Daily snapshots of regime and levels
@@ -110,7 +110,7 @@ Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices
 3. Pulls options chains across expirations within the DTE window
 4. Calculates Black-Scholes gamma, delta, vanna, and charm using per-strike implied volatility
 5. Aggregates to build a GEX profile, derive levels, and compute dealer flow forecasts
-6. Fetches ETF fund flows from shares outstanding changes (daily creation/redemption activity)
+6. Fetches ETF fund flows from Farside Investors (IBIT-specific and total BTC ETF daily flows)
 
 ### Data Caching
 Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed.
@@ -229,13 +229,16 @@ Query parameters:
 Returns candlestick data from SQLite (90-day backfill from Binance). Accepts `?ticker=IBIT` and `?tf=15m` (15m/1h/4h/1d).
 
 ### `GET /api/flows`
-Returns last 30 days of ETF fund flow data (date, flow in dollars, shares outstanding, AUM, NAV). Accepts `?ticker=IBIT`.
+Returns last 30 days of ETF fund flow data from Farside Investors (date, flow in dollars, total BTC ETF flow). Accepts `?ticker=IBIT`.
 
 ### `GET /api/analysis`
 Returns the cached AI analysis for today, or `{"status": "pending"}` if not yet generated. Accepts `?ticker=IBIT`.
 
 ### `POST /api/analyze`
-Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON directly. Requires `ANTHROPIC_API_KEY`. Accepts `?ticker=IBIT`.
+Re-run AI analysis across all DTE timeframes. Returns the analysis JSON without saving to the database — use `POST /api/analysis/save` to persist. Requires `ANTHROPIC_API_KEY`. Accepts `?ticker=IBIT`.
+
+### `POST /api/analysis/save`
+Save an AI analysis result to the database for today. Accepts the analysis JSON as the request body. Overwrites any previously saved analysis for today. Accepts `?ticker=IBIT`.
 
 ## Config Constants
 
@@ -250,5 +253,5 @@ Force re-run AI analysis across all DTE timeframes. Returns the analysis JSON di
 - Assumes dealers are net short all options (standard but not always true — see positioning confidence)
 - Crypto/share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
 - Vanna/charm magnitudes are estimates — actual dealer positioning depends on their book, which isn't public
-- ETF flow backfill uses a volume-based heuristic (~15% of daily volume as creation/redemption proxy); real flow calculations begin after 2+ days of actual shares outstanding data
+- ETF flow data from Farside Investors is only available for IBIT (and total BTC ETFs); ETHA flow data is not yet supported
 - AI analysis requires an Anthropic API key and uses Claude Opus (~$0.15/day)

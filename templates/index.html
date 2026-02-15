@@ -215,6 +215,9 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .ai-btn{background:none;border:1px solid var(--blue);color:var(--blue);padding:2px 10px;border-radius:2px;cursor:pointer;font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.6px;transition:all .15s}
 .ai-btn:hover{background:var(--blue);color:var(--bg)}
 .ai-btn:disabled{opacity:.4;cursor:not-allowed}
+.ai-btn-save{border-color:#00dc82;color:#00dc82}
+.ai-btn-save:hover{background:#00dc82;color:var(--bg)}
+.ai-unsaved{font-size:8px;color:#f0a040;margin-left:6px;letter-spacing:.3px}
 .ai-content{background:var(--bg3);border:1px solid var(--border);border-radius:3px;padding:8px 10px;font-size:10px;line-height:1.6;color:var(--t2);min-height:60px;white-space:pre-wrap;word-wrap:break-word}
 .ai-content .ai-loading{display:flex;align-items:center;gap:8px;color:var(--t3);font-size:10px}
 .ai-content .ai-loading .spin{width:14px;height:14px;border:2px solid var(--border2);border-top-color:var(--blue);border-radius:50%;animation:sp .7s linear infinite;flex-shrink:0}
@@ -330,6 +333,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 <script>
 let gexChart=null,oiChart=null,flowChart=null,deltaChart=null,tvChart=null,tvSeries=null,priceLines=[];
 let aiData=null;
+let aiUnsaved=false;
 let btcWs=null;
 let currentTicker='IBIT';
 let _loadSeq=0;
@@ -366,6 +370,7 @@ function switchTicker(tk){
   if(btcWs){btcWs.close();btcWs=null}
   document.querySelectorAll('.hdr-tab').forEach(b=>b.classList.toggle('active',b.dataset.ticker===tk));
   aiData=null;
+  aiUnsaved=false;
   loadData();
   loadAnalysis();
 }
@@ -965,8 +970,11 @@ function renderAiPanel(){
   const panel=document.getElementById('ai-panel');
   if(!panel)return;
   const aiDte=document.getElementById('dte-select').value+'d';
-  let h=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis</div>`;
-  h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button></div>`;
+  let h=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis${aiUnsaved?'<span class="ai-unsaved">UNSAVED</span>':''}</div>`;
+  h+=`<div style="display:flex;gap:4px">`;
+  if(aiUnsaved)h+=`<button class="ai-btn ai-btn-save" id="ai-save-btn" onclick="saveAnalysis()" title="Save analysis for today">SAVE</button>`;
+  h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
+  h+=`</div></div>`;
   if(aiData&&aiData._timestamp){
     h+=`<div style="font-size:9px;color:var(--t3);margin-bottom:4px">Updated ${esc(aiData._timestamp)}${aiData._btc_price?' · BTC '+fB(aiData._btc_price):''}</div>`;
   }
@@ -1012,11 +1020,28 @@ async function runAnalysis(){
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     aiData=data;
+    aiUnsaved=true;
     renderAiPanel();
   }catch(e){
     console.error('Analysis error:',e);
     const b2=document.getElementById('ai-analyze-btn');
     if(b2){b2.disabled=false;b2.innerHTML='&#x21bb;'}
+  }
+}
+
+async function saveAnalysis(){
+  if(!aiData)return;
+  const btn=document.getElementById('ai-save-btn');
+  if(btn){btn.disabled=true;btn.textContent='...';}
+  try{
+    const resp=await fetch(`/api/analysis/save?ticker=${currentTicker}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiData)});
+    const data=await resp.json();
+    if(data.error)throw new Error(data.error);
+    aiUnsaved=false;
+    renderAiPanel();
+  }catch(e){
+    console.error('Save error:',e);
+    if(btn){btn.disabled=false;btn.textContent='SAVE';}
   }
 }
 
