@@ -2015,7 +2015,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
     conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
-    c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
+    c.execute('INSERT OR IGNORE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
               (today, ticker, json.dumps(analysis)))
     conn.commit()
     conn.close()
