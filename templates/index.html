@@ -665,6 +665,8 @@ function renderGEX(data){
       datasets.push({label:'GEX',data:vals,backgroundColor:cols,borderWidth:0,borderRadius:1,barPercentage:.85});
     }
   }
+  const spotBtc=data.btc_spot||0;
+  const spotIdx=data.gex_chart.reduce((best,d,i)=>Math.abs(d.btc-spotBtc)<Math.abs(data.gex_chart[best].btc-spotBtc)?i:best,0);
   gexChart=new Chart(ctx,{
     type:'bar',
     data:{labels,datasets},
@@ -690,7 +692,15 @@ function renderGEX(data){
         x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
         y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
       }
-    }
+    },
+    plugins:[{id:'spotLine',afterDatasetsDraw(chart){
+      const meta=chart.getDatasetMeta(0);if(!meta.data[spotIdx])return;
+      const x=meta.data[spotIdx].x,{top,bottom}=chart.chartArea,c=chart.ctx;
+      c.save();c.setLineDash([3,3]);c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=1;
+      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();
+      c.setLineDash([]);c.fillStyle='rgba(255,255,255,0.6)';c.font='bold 8px IBM Plex Mono';
+      c.textAlign='center';c.textBaseline='bottom';c.fillText('SPOT',x,top-2);c.restore();
+    }}]
   });
 }
 
@@ -759,6 +769,8 @@ function renderDealerDelta(data){
   const values=profile.map(d=>d.net_dealer_delta);
   const colors=values.map(v=>v<0?'#00dc82cc':'#ff4060cc');
 
+  const dSpotBtc=data.btc_spot||0;
+  const dSpotIdx=profile.reduce((best,d,i)=>Math.abs(d.price_btc-dSpotBtc)<Math.abs(profile[best].price_btc-dSpotBtc)?i:best,0);
   deltaChart=new Chart(ctx,{
     type:'bar',
     data:{labels,datasets:[{
@@ -783,7 +795,15 @@ function renderDealerDelta(data){
         x:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:10,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
         y:{ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${v<0?'-':''}${fG(Math.abs(v))}`},grid:{color:'#111620'},border:{color:'#1c2230'}}
       }
-    }
+    },
+    plugins:[{id:'spotLine',afterDatasetsDraw(chart){
+      const meta=chart.getDatasetMeta(0);if(!meta.data[dSpotIdx])return;
+      const x=meta.data[dSpotIdx].x,{top,bottom}=chart.chartArea,c=chart.ctx;
+      c.save();c.setLineDash([3,3]);c.strokeStyle='rgba(255,255,255,0.5)';c.lineWidth=1;
+      c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();
+      c.setLineDash([]);c.fillStyle='rgba(255,255,255,0.6)';c.font='bold 8px IBM Plex Mono';
+      c.textAlign='center';c.textBaseline='bottom';c.fillText('SPOT',x,top-2);c.restore();
+    }}]
   });
 }
 
