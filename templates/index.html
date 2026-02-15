@@ -300,9 +300,13 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="bottom" style="background:var(--border)">
     <div class="cell cell-gex">
       <div class="cell-label">GEX Profile
-        <span style="margin-left:auto;display:flex;gap:2px">
-          <button class="gex-mode-btn active" id="gex-mode-w" onclick="setGexMode('weighted')" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 6px;border-radius:2px;border:1px solid var(--blue);background:var(--blue);color:var(--bg);cursor:pointer">WEIGHTED</button>
-          <button class="gex-mode-btn" id="gex-mode-r" onclick="setGexMode('raw')" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 6px;border-radius:2px;border:1px solid var(--border2);background:none;color:var(--t3);cursor:pointer">RAW</button>
+        <span style="margin-left:auto;display:flex;gap:2px;align-items:center">
+          <select id="expiry-filter" onchange="setExpiryFilter(this.value)" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 4px;border-radius:2px;border:1px solid var(--border2);background:var(--bg);color:var(--t2);cursor:pointer;outline:none">
+            <option value="all">ALL EXP</option>
+            <option value="1">NEAREST</option>
+            <option value="2">NEXT 2</option>
+            <option value="3">NEXT 3</option>
+          </select>
         </span>
       </div>
       <canvas id="gex-chart"></canvas>
@@ -330,7 +334,7 @@ let aiData=null;
 let btcWs=null;
 let currentTicker='IBIT';
 let _loadSeq=0;
-let gexMode='weighted';
+let expiryFilter='all';
 const TICKER_WS={IBIT:'btcusdt',ETHA:'ethusdt'};
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
 const fB=n=>`$${Math.round(n).toLocaleString()}`;
@@ -339,16 +343,8 @@ const fP=n=>`${n>=0?'+':''}${n.toFixed(1)}%`;
 const fG=n=>{const a=Math.abs(n);if(a>=1e6)return `${n<0?'-':''}$${(a/1e6).toFixed(1)}M`;if(a>=1e3)return `${n<0?'-':''}$${(a/1e3).toFixed(0)}K`;return `$${Math.round(n)}`};
 const esc=s=>{if(!s)return '';const d=document.createElement('div');d.textContent=s;return d.innerHTML};
 
-function setGexMode(mode){
-  gexMode=mode;
-  const wBtn=document.getElementById('gex-mode-w'),rBtn=document.getElementById('gex-mode-r');
-  if(mode==='weighted'){
-    wBtn.style.background='var(--blue)';wBtn.style.color='var(--bg)';wBtn.style.borderColor='var(--blue)';
-    rBtn.style.background='none';rBtn.style.color='var(--t3)';rBtn.style.borderColor='var(--border2)';
-  }else{
-    rBtn.style.background='var(--blue)';rBtn.style.color='var(--bg)';rBtn.style.borderColor='var(--blue)';
-    wBtn.style.background='none';wBtn.style.color='var(--t3)';wBtn.style.borderColor='var(--border2)';
-  }
+function setExpiryFilter(val){
+  expiryFilter=val;
   if(window._lastData)renderGEX(window._lastData);
 }
 
@@ -481,94 +477,59 @@ function renderGEX(data){
   const ctx=document.getElementById('gex-chart');
   if(gexChart)gexChart.destroy();
   const labels=data.gex_chart.map(d=>fB(d.btc));
-
-  if(gexMode==='raw'){
-    // Raw mode: Active + Stale bars using raw net_gex (original behavior)
-    const netVals=data.gex_chart.map(d=>d.net_gex);
-    const activeVals=data.gex_chart.map(d=>d.active_gex!=null?d.active_gex:d.net_gex);
-    const staleVals=netVals.map((v,i)=>v-activeVals[i]);
-    const staleCols=staleVals.map(v=>v>0?'rgba(0,220,130,0.25)':'rgba(255,64,96,0.25)');
-    const activeCols=activeVals.map(v=>v>0?'#00dc82cc':'#ff4060cc');
-    gexChart=new Chart(ctx,{
-      type:'bar',
-      data:{labels,datasets:[
-        {label:'Stale GEX',data:staleVals,backgroundColor:staleCols,borderWidth:0,borderRadius:0,barPercentage:.85},
-        {label:'Active GEX',data:activeVals,backgroundColor:activeCols,borderWidth:0,borderRadius:1,barPercentage:.85}
-      ]},
-      options:{
-        responsive:true,maintainAspectRatio:false,
-        plugins:{
-          legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
-          tooltip:{callbacks:{
-            title:i=>i[0].label,
-            afterBody:function(items){
-              const idx=items[0].dataIndex;
-              const d=data.gex_chart[idx];
-              const lines=[`Net GEX (raw): ${fG(d.net_gex)}`];
-              if(d.active_gex!=null)lines.push(`Active GEX: ${fG(d.active_gex)}`);
-              if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
-              return lines;
-            },
-            label:()=>null
-          }}
-        },
-        scales:{
-          x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
-          y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
-        }
-      }
-    });
-  }else{
-    // Weighted mode: Stacked bar chart by expiry
-    const meta=data.expiry_meta||[];
-    const exps=meta.map(m=>m.exp);
-    const palette=generateExpiryPalette(exps.length||1);
-    const datasets=[];
-    exps.forEach((exp,ei)=>{
-      const dteLabel=meta[ei]?`${meta[ei].dte}d`:'';
-      const vals=data.gex_chart.map(d=>{
-        const eb=d.expiry_breakdown||{};
-        return eb[exp]?eb[exp].net_gex_w:0;
-      });
-      const cols=vals.map(v=>v>=0?palette[ei].pos:palette[ei].neg);
-      datasets.push({
-        label:`${dteLabel} (${exp.slice(5)})`,
-        data:vals,backgroundColor:cols,borderWidth:0,borderRadius:ei===0?1:0,barPercentage:.85
-      });
-    });
-    // Fallback if no expiry breakdown available
-    if(datasets.length===0){
-      const wVals=data.gex_chart.map(d=>d.net_gex_w!=null?d.net_gex_w:d.net_gex);
-      const wCols=wVals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
-      datasets.push({label:'Weighted GEX',data:wVals,backgroundColor:wCols,borderWidth:0,borderRadius:1,barPercentage:.85});
-    }
-    gexChart=new Chart(ctx,{
-      type:'bar',
-      data:{labels,datasets},
-      options:{
-        responsive:true,maintainAspectRatio:false,
-        plugins:{
-          legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
-          tooltip:{callbacks:{
-            title:i=>i[0].label,
-            afterBody:function(items){
-              const idx=items[0].dataIndex;
-              const d=data.gex_chart[idx];
-              const lines=[`Net GEX (W): ${fG(d.net_gex_w||d.net_gex)}`];
-              lines.push(`Net GEX (raw): ${fG(d.net_gex)}`);
-              if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
-              return lines;
-            },
-            label:()=>null
-          }}
-        },
-        scales:{
-          x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
-          y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
-        }
-      }
-    });
+  const meta=data.expiry_meta||[];
+  // Filter expirations based on dropdown
+  let exps=meta.map(m=>m.exp);
+  if(expiryFilter!=='all'){
+    const n=parseInt(expiryFilter);
+    exps=exps.slice(0,n);
   }
+  const palette=generateExpiryPalette(exps.length||1);
+  const datasets=[];
+  exps.forEach((exp,ei)=>{
+    const dteLabel=meta.find(m=>m.exp===exp);
+    const label=dteLabel?`${dteLabel.dte}d (${exp.slice(5)})`:`${exp.slice(5)}`;
+    const vals=data.gex_chart.map(d=>{
+      const eb=d.expiry_breakdown||{};
+      return eb[exp]?eb[exp].net_gex:0;
+    });
+    const cols=vals.map(v=>v>=0?palette[ei].pos:palette[ei].neg);
+    datasets.push({
+      label,data:vals,backgroundColor:cols,borderWidth:0,borderRadius:ei===0?1:0,barPercentage:.85
+    });
+  });
+  // Fallback if no expiry breakdown available
+  if(datasets.length===0){
+    const vals=data.gex_chart.map(d=>d.net_gex);
+    const cols=vals.map(v=>v>=0?'#00dc82cc':'#ff4060cc');
+    datasets.push({label:'GEX',data:vals,backgroundColor:cols,borderWidth:0,borderRadius:1,barPercentage:.85});
+  }
+  gexChart=new Chart(ctx,{
+    type:'bar',
+    data:{labels,datasets},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{
+        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
+        tooltip:{callbacks:{
+          title:i=>i[0].label,
+          afterBody:function(items){
+            const idx=items[0].dataIndex;
+            const d=data.gex_chart[idx];
+            const lines=[`Net GEX: ${fG(d.net_gex)}`];
+            if(d.active_gex!=null)lines.push(`Active GEX: ${fG(d.active_gex)}`);
+            if(d.total_volume)lines.push(`Volume: ${d.total_volume.toLocaleString()}`);
+            return lines;
+          },
+          label:()=>null
+        }}
+      },
+      scales:{
+        x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+        y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>fG(v)},grid:{color:'#111620'},border:{color:'#1c2230'}}
+      }
+    }
+  });
 }
 
 function renderOI(data){
@@ -876,7 +837,7 @@ function renderSidebar(data){
 
   // Dealer Stats
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--t3)"></span>Dealer Position</div>`;
-  [['Net GEX (W)',fG(lv.net_gex_w_total||lv.net_gex_total)],['Net GEX (raw)',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
+  [['Net GEX',fG(lv.net_gex_total)],['Active GEX',fG(lv.active_gex_total||0)],['Dealer \u0394',`${(lv.net_dealer_delta/1e6).toFixed(1)}M sh`],['Net Vanna',fG(lv.net_vanna||0)],['Net Charm',`${((lv.net_charm||0)/1000).toFixed(1)}K sh/day`],['P/C',lv.pcr.toFixed(2)],['Call OI',fO(lv.total_call_oi)],['Put OI',fO(lv.total_put_oi)]].forEach(([l,v])=>{
     h+=`<div class="ds-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`;
   });
   h+=`</div>`;
