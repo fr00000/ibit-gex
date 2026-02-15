@@ -2482,11 +2482,6 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/structure')
-def structure_page():
-    return render_template('structure.html')
-
-
 @app.route('/api/outlook')
 def api_outlook():
     """Return key levels from all DTE windows for the outlook funnel chart."""
