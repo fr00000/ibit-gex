@@ -2085,13 +2085,13 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
     conn = get_db()
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
-    c.execute('INSERT OR IGNORE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
+    c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
               (today, ticker, json.dumps(analysis)))
     conn.commit()
     conn.close()
 
 
-def run_analysis(ticker='IBIT'):
+def run_analysis(ticker='IBIT', save=True):
     """Run AI analysis across all DTEs. Returns analysis dict or raises."""
     cfg = TICKER_CONFIG.get(ticker)
     if not cfg:
@@ -2335,14 +2335,18 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
         analysis = json.loads(raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f'Failed to parse LLM response: {e}. Raw: {raw[:500]}')
-    # Store BTC price at analysis time for staleness checks
+    # Attach BTC price and timestamp metadata
     btc_price = live_ref_price
     if not btc_price:
         for dte in dtes:
             if dte in results and results[dte].get('btc_spot'):
                 btc_price = results[dte]['btc_spot']
                 break
-    set_cached_analysis(ticker, analysis, btc_price)
+    if btc_price is not None:
+        analysis['_btc_price'] = btc_price
+        analysis['_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    if save:
+        set_cached_analysis(ticker, analysis, btc_price)
     return analysis
 
 
@@ -2364,16 +2368,33 @@ def api_analysis():
 
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
-    """Force re-run analysis (manual refresh)."""
+    """Re-run analysis without saving. Use /api/analysis/save to persist."""
     ticker = request.args.get('ticker', 'IBIT').upper()
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
     try:
-        analysis = run_analysis(ticker)
+        analysis = run_analysis(ticker, save=False)
         return Response(json.dumps(analysis), mimetype='application/json')
     except Exception as e:
         return Response(json.dumps({'error': str(e)}),
                         mimetype='application/json'), 500
+
+
+@app.route('/api/analysis/save', methods=['POST'])
+def api_analysis_save():
+    """Save the provided analysis as today's cached analysis."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+    try:
+        analysis = request.get_json()
+        if not analysis:
+            return Response(json.dumps({'error': 'No analysis data'}), mimetype='application/json'), 400
+        btc_price = analysis.get('_btc_price')
+        set_cached_analysis(ticker, analysis, btc_price)
+        return Response(json.dumps({'status': 'saved'}), mimetype='application/json')
+    except Exception as e:
+        return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
 
 
 if __name__ == '__main__':
