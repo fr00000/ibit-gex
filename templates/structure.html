@@ -32,6 +32,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .hdr-sep{width:1px;height:18px;background:var(--border2)}
 .range-btn{background:var(--bg3);color:var(--t3);border:1px solid var(--border2);border-radius:2px;padding:2px 8px;font-family:var(--mono);font-size:10px;cursor:pointer}
 .range-btn.active{color:var(--t1);border-color:var(--t2)}
+.hdr-select{background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer}
 .chart-wrap{flex:1;min-height:0;padding:12px;position:relative}
 canvas{width:100%!important;height:100%!important}
 .legend{display:flex;gap:16px;padding:8px 12px;background:var(--bg2);border-top:1px solid var(--border);flex-shrink:0;align-items:center;justify-content:center;flex-wrap:wrap}
@@ -46,6 +47,12 @@ canvas{width:100%!important;height:100%!important}
   <div class="hdr-sep"></div>
   <span class="hdr-logo">GEX Structure</span>
   <div style="flex:1"></div>
+  <select id="heatmap-select" onchange="load(currentDays)" class="hdr-select">
+    <option value="off">Heatmap Off</option>
+    <option value="oi">Total OI</option>
+    <option value="gex">Net GEX</option>
+  </select>
+  <div class="hdr-sep"></div>
   <button class="range-btn" onclick="load(7)" id="btn-7">7d</button>
   <button class="range-btn active" onclick="load(30)" id="btn-30">30d</button>
   <button class="range-btn" onclick="load(90)" id="btn-90">90d</button>
@@ -65,6 +72,8 @@ canvas{width:100%!important;height:100%!important}
   <div class="leg-item"><div class="leg-swatch" style="background:var(--t1);height:2px;border:none"></div><span>Spot</span></div>
   <div class="leg-item"><div class="leg-swatch" style="background:none;height:0;border-top:1.5px dashed rgba(255,176,32,0.6);border-left:none;border-right:none;border-bottom:none"></div><span>&gamma; Flip</span></div>
   <div class="leg-item"><span style="color:rgba(0,220,130,0.9);font-size:12px">&#9670;</span><span>Venue agree</span></div>
+  <div class="leg-item leg-heat leg-heat-oi" style="display:none"><div class="leg-swatch" style="background:linear-gradient(to right, rgba(56,144,255,0.05), rgba(56,144,255,0.40));border:none"></div><span>OI density (low &rarr; high)</span></div>
+  <div class="leg-item leg-heat leg-heat-gex" style="display:none"><div class="leg-swatch" style="background:linear-gradient(to right, rgba(255,64,96,0.35), rgba(56,56,56,0.1), rgba(0,220,130,0.35));border:none"></div><span>GEX (put-heavy &rarr; call-heavy)</span></div>
 </div>
 <script>
 let chart = null;
@@ -80,23 +89,101 @@ const WINDOWS = [
   {key:'0-3',   label:'0-3d',   bg:'rgba(0,220,130,0.12)',   border:'rgba(0,220,130,0.55)',   bw: 2},
 ];
 
+const heatmapPlugin = {
+  id: 'heatmapBg',
+  beforeDatasetsDraw(chart) {
+    if (!window._heatData || !window._heatMode || window._heatMode === 'off') return;
+
+    const ctx = chart.ctx;
+    const xScale = chart.scales.x;
+    const yScale = chart.scales.y;
+    const meta = window._heatData;
+    const mode = window._heatMode;
+    const dates = window._structDates;
+    const bucketSize = meta.bucket_size || 1000;
+
+    let maxVal = 0;
+    for (const date of dates) {
+      const cells = meta.data[date] || [];
+      for (const cell of cells) {
+        const val = mode === 'oi' ? cell.total_oi : Math.abs(cell.net_gex);
+        if (val > maxVal) maxVal = val;
+      }
+    }
+    if (maxVal === 0) return;
+
+    const cellW = dates.length > 1
+      ? Math.abs(xScale.getPixelForValue(1) - xScale.getPixelForValue(0))
+      : 40;
+
+    for (let i = 0; i < dates.length; i++) {
+      const cells = meta.data[dates[i]] || [];
+      const cx = xScale.getPixelForValue(i);
+
+      for (const cell of cells) {
+        const cy = yScale.getPixelForValue(cell.price);
+        const halfBucket = yScale.getPixelForValue(cell.price - bucketSize / 2)
+                         - yScale.getPixelForValue(cell.price + bucketSize / 2);
+        const cellH = Math.max(Math.abs(halfBucket), 2);
+
+        if (mode === 'oi') {
+          const intensity = Math.min(cell.total_oi / maxVal, 1);
+          const alpha = 0.05 + intensity * 0.35;
+          ctx.fillStyle = `rgba(56,144,255,${alpha})`;
+        } else {
+          const intensity = Math.min(Math.abs(cell.net_gex) / maxVal, 1);
+          const alpha = 0.05 + intensity * 0.35;
+          if (cell.net_gex >= 0) {
+            ctx.fillStyle = `rgba(0,220,130,${alpha})`;
+          } else {
+            ctx.fillStyle = `rgba(255,64,96,${alpha})`;
+          }
+        }
+
+        ctx.fillRect(cx - cellW / 2, cy - cellH / 2, cellW, cellH);
+      }
+    }
+  },
+};
+
 function toggleFocus() {
   focusMode = !focusMode;
   document.getElementById('btn-focus').classList.toggle('active', focusMode);
   load(currentDays);
 }
 
-function load(days) {
+async function load(days) {
   currentDays = days;
   document.querySelectorAll('.range-btn:not(#btn-focus)').forEach(b => b.classList.remove('active'));
   document.getElementById('btn-' + days).classList.add('active');
-  fetch('/api/structure?ticker=IBIT&days=' + days)
-    .then(r => r.json())
-    .then(render)
-    .catch(e => console.error('Structure fetch failed:', e));
+
+  const heatmapMode = document.getElementById('heatmap-select').value;
+
+  try {
+    const [structRes, heatRes] = await Promise.all([
+      fetch('/api/structure?ticker=IBIT&days=' + days).then(r => r.json()),
+      heatmapMode !== 'off'
+        ? fetch('/api/structure/heatmap?ticker=IBIT&days=' + days).then(r => r.json())
+        : Promise.resolve(null),
+    ]);
+    render(structRes, heatRes, heatmapMode);
+  } catch(e) {
+    console.error('Structure fetch failed:', e);
+  }
 }
 
-function render(data) {
+function render(data, heatData, heatMode) {
+  window._heatData = heatData;
+  window._heatMode = heatMode || 'off';
+
+  // Toggle heatmap legend items
+  document.querySelectorAll('.leg-heat').forEach(el => el.style.display = 'none');
+  if (heatMode === 'oi') {
+    document.querySelector('.leg-heat-oi').style.display = 'flex';
+  } else if (heatMode === 'gex') {
+    document.querySelector('.leg-heat-gex').style.display = 'flex';
+  }
+
   const dates = Object.keys(data).sort();
   const emptyEl = document.getElementById('empty');
   const canvas = document.getElementById('chart');
@@ -128,7 +215,6 @@ function render(data) {
 
   // Bands: widest first (31-45d) to narrowest (0-3d)
   for (const w of WINDOWS) {
-    // Call wall (top line)
     datasets.push({
       label: w.label + ' CW',
       data: dates.map(d => data[d]?.windows?.[w.key]?.call_wall || null),
@@ -139,7 +225,6 @@ function render(data) {
       spanGaps: true,
       tension: 0,
     });
-    // Put wall (bottom line, fill up to previous dataset = call wall)
     datasets.push({
       label: w.label + ' PW',
       data: dates.map(d => data[d]?.windows?.[w.key]?.put_wall || null),
@@ -225,6 +310,7 @@ function render(data) {
   chart = new Chart(document.getElementById('chart'), {
     type: 'line',
     data: { labels: dates, datasets },
+    plugins: [heatmapPlugin],
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -238,7 +324,7 @@ function render(data) {
           titleFont: { family: "'IBM Plex Mono', monospace", size: 11 },
           bodyFont: { family: "'IBM Plex Mono', monospace", size: 10 },
           padding: 10,
-          filter: () => false,  // hide default items
+          filter: () => false,
           callbacks: {
             title: function(items) {
               return items[0]?.label || '';
@@ -262,6 +348,22 @@ function render(data) {
               }
               const gf = d.windows?.['0-3']?.gamma_flip;
               if (gf) lines.push('\u03B3 flip: ' + fB(gf));
+              // Heatmap data at spot
+              if (window._heatData && window._heatMode !== 'off' && window._heatData.data[date]) {
+                const cells = window._heatData.data[date];
+                if (cells.length > 0) {
+                  const spotBucket = cells.reduce((best, c) =>
+                    Math.abs(c.price - d.spot) < Math.abs(best.price - d.spot) ? c : best,
+                    cells[0]
+                  );
+                  if (spotBucket) {
+                    lines.push('');
+                    lines.push('At spot (' + fB(spotBucket.price) + '):');
+                    lines.push('  OI: ' + spotBucket.total_oi.toLocaleString() + ' (' + spotBucket.call_oi.toLocaleString() + 'C / ' + spotBucket.put_oi.toLocaleString() + 'P)');
+                    lines.push('  GEX: ' + (spotBucket.net_gex / 1e6).toFixed(1) + 'M');
+                  }
+                }
+              }
               return lines.join('\n');
             },
             label: () => null,
@@ -282,7 +384,7 @@ function render(data) {
             maxTicksLimit: 15,
             callback: function(val, idx) {
               const d = this.getLabelForValue(val);
-              return d ? d.slice(5) : '';  // MM-DD format
+              return d ? d.slice(5) : '';
             },
           },
         },

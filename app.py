@@ -608,6 +608,99 @@ def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
     }
 
 
+def summarize_structure_trends(conn, ticker, days=7):
+    """Summarize per-DTE-window level migration for AI analysis."""
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    dte_to_window = {3: '0-3', 7: '4-7', 14: '8-14', 30: '15-30', 45: '31-45'}
+
+    window_history = {}
+
+    cache_rows = c.execute('''SELECT date, dte, data_json FROM data_cache
+                              WHERE ticker=? AND date >= ? ORDER BY date, dte''',
+                           (ticker, cutoff)).fetchall()
+
+    for date, dte, data_json_str in cache_rows:
+        d = json.loads(data_json_str)
+        window = dte_to_window.get(dte)
+        if not window:
+            continue
+        bps = d.get('btc_per_share', 1)
+        lvl = d.get('levels', {})
+        combined = d.get('combined_levels_btc') or {}
+
+        if combined:
+            cw = combined.get('call_wall')
+            pw = combined.get('put_wall')
+            gf = combined.get('gamma_flip')
+            regime = combined.get('regime', lvl.get('regime'))
+        else:
+            cw = lvl.get('call_wall', 0) / bps if bps else None
+            pw = lvl.get('put_wall', 0) / bps if bps else None
+            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            regime = lvl.get('regime')
+
+        if window not in window_history:
+            window_history[window] = []
+        window_history[window].append({
+            'date': date, 'call_wall': cw, 'put_wall': pw,
+            'gamma_flip': gf, 'regime': regime,
+        })
+
+    if not window_history:
+        return None
+
+    def direction(old, new, threshold_pct=3):
+        if old is None or new is None or old == 0:
+            return 'unknown'
+        pct = (new - old) / old * 100
+        if pct > threshold_pct:
+            return 'rising'
+        elif pct < -threshold_pct:
+            return 'falling'
+        return 'stable'
+
+    trends = {}
+    for window, entries in window_history.items():
+        if len(entries) < 2:
+            trends[window] = {'days': len(entries), 'trend': 'insufficient_data'}
+            continue
+
+        first = entries[0]
+        last = entries[-1]
+
+        trends[window] = {
+            'days': len(entries),
+            'call_wall': {'first': first['call_wall'], 'last': last['call_wall'],
+                          'direction': direction(first['call_wall'], last['call_wall'])},
+            'put_wall': {'first': first['put_wall'], 'last': last['put_wall'],
+                         'direction': direction(first['put_wall'], last['put_wall'])},
+            'gamma_flip': {'first': first['gamma_flip'], 'last': last['gamma_flip'],
+                           'direction': direction(first['gamma_flip'], last['gamma_flip'])},
+            'regime_changes': sum(1 for i in range(1, len(entries))
+                                 if entries[i]['regime'] != entries[i-1]['regime']),
+        }
+
+    convergence = {}
+    for metric in ['call_wall', 'put_wall']:
+        values_first = [window_history[w][0].get(metric) for w in ['0-3', '4-7', '8-14', '15-30', '31-45']
+                        if w in window_history and len(window_history[w]) > 0 and window_history[w][0].get(metric)]
+        values_last = [window_history[w][-1].get(metric) for w in ['0-3', '4-7', '8-14', '15-30', '31-45']
+                       if w in window_history and len(window_history[w]) > 1 and window_history[w][-1].get(metric)]
+        if len(values_first) >= 2 and len(values_last) >= 2:
+            spread_first = max(values_first) - min(values_first)
+            spread_last = max(values_last) - min(values_last)
+            if spread_first > 0:
+                change = (spread_last - spread_first) / spread_first * 100
+                convergence[metric] = 'converging' if change < -10 else 'diverging' if change > 10 else 'stable'
+
+    return {
+        'window_trends': trends,
+        'convergence': convergence,
+    }
+
+
 class _FarsideTableParser(HTMLParser):
     """Parse the Farside Investors BTC ETF flow HTML table."""
     def __init__(self):
@@ -2498,6 +2591,79 @@ def api_structure():
     return Response(json.dumps(data), mimetype='application/json')
 
 
+@app.route('/api/structure/heatmap')
+def api_structure_heatmap():
+    """Return bucketed OI/GEX heatmap data for the structure chart."""
+    conn = get_db()
+    c = conn.cursor()
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    days = int(request.args.get('days', 30))
+    bucket_size = int(request.args.get('bucket', 1000))
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    rows = c.execute('''
+        SELECT sh.date, sh.strike, sh.total_oi, sh.net_gex, sh.call_oi, sh.put_oi,
+               s.spot, s.btc_price
+        FROM strike_history sh
+        JOIN snapshots s ON sh.date = s.date AND sh.ticker = s.ticker
+        WHERE sh.ticker=? AND sh.date >= ?
+        ORDER BY sh.date, sh.strike
+    ''', (ticker, cutoff)).fetchall()
+
+    conn.close()
+
+    if not rows:
+        return Response(json.dumps({'dates': [], 'buckets': [], 'data': {}}),
+                        mimetype='application/json')
+
+    heatmap = {}
+    all_buckets = set()
+
+    for date, strike, total_oi, net_gex, call_oi, put_oi, spot_ibit, btc_price in rows:
+        if not spot_ibit or not btc_price:
+            continue
+        bps = btc_price / spot_ibit
+        strike_btc = strike * bps
+        bucket = int(round(strike_btc / bucket_size) * bucket_size)
+        all_buckets.add(bucket)
+
+        if date not in heatmap:
+            heatmap[date] = {}
+        if bucket not in heatmap[date]:
+            heatmap[date][bucket] = {'total_oi': 0, 'net_gex': 0, 'call_oi': 0, 'put_oi': 0}
+
+        heatmap[date][bucket]['total_oi'] += total_oi or 0
+        heatmap[date][bucket]['net_gex'] += net_gex or 0
+        heatmap[date][bucket]['call_oi'] += call_oi or 0
+        heatmap[date][bucket]['put_oi'] += put_oi or 0
+
+    dates = sorted(heatmap.keys())
+    buckets = sorted(all_buckets)
+
+    data = {}
+    for date in dates:
+        cells = []
+        for bucket in buckets:
+            vals = heatmap[date].get(bucket)
+            if vals and (vals['total_oi'] > 0 or vals['net_gex'] != 0):
+                cells.append({
+                    'price': bucket,
+                    'total_oi': vals['total_oi'],
+                    'net_gex': round(vals['net_gex'], 2),
+                    'call_oi': vals['call_oi'],
+                    'put_oi': vals['put_oi'],
+                })
+        data[date] = cells
+
+    return Response(json.dumps({
+        'dates': dates,
+        'buckets': buckets,
+        'bucket_size': bucket_size,
+        'data': data,
+    }), mimetype='application/json')
+
+
 @app.route('/api/candles')
 @app.route('/api/btc-candles')
 def api_candles():
@@ -2866,11 +3032,14 @@ def run_analysis(ticker='IBIT', save=True):
     first_label = dtes[0][0]
     conn = get_db()
     history_trends = summarize_history_trends(conn, ticker, results[first_label]['btc_per_share'], results[first_label]['levels'])
+    structure_trends = summarize_structure_trends(conn, ticker, days=7)
     conn.close()
 
     # Build concise summaries (strip chart data to keep prompt small)
     summaries = {}
     summaries['_history_trends'] = history_trends
+    if structure_trends:
+        summaries['_structure_trends'] = structure_trends
     for label, min_d, max_d in dtes:
         d = results[label]
         bps = d['btc_per_share']
@@ -3117,6 +3286,18 @@ Historical Trends (_history_trends): A compressed summary of the last 10 daily s
 - narrative: One-line summary of the dominant trend pattern.
 
 Use history_trends to contextualize today's snapshot. A call wall at $107K means different things if it's been there for 7 days (strong, tested resistance) vs if it jumped there overnight (new, untested). Always mention regime streak length and level migration direction in your analysis.
+
+STRUCTURE TRENDS (_structure_trends, when present):
+_structure_trends shows how levels in each DTE window have migrated over the past week.
+For each window, call_wall/put_wall/gamma_flip show first value, last value, and direction (rising/falling/stable). regime_changes counts how many times the regime flipped.
+
+Use this to identify:
+- Structural floor/ceiling migration: "The 31-45d put wall rose from $60K to $68K over 7 days — the structural floor is lifting."
+- Near-term noise vs structural moves: "The 0-3d call wall jumped $3K but the 15-30d call wall hasn't moved — this is expiry-driven, not structural."
+- Cross-window convergence: When convergence shows "converging" for a wall, all timeframes are agreeing — high conviction. "Diverging" means timeframes disagree — lower conviction on that level.
+- Regime creep: If regime_changes > 0 in mid-term windows (8-14d), the gamma regime is unstable and the current regime label is less trustworthy.
+
+Don't mechanically list per-window changes — synthesize them into a structural narrative. "Floors are rising across all timeframes" or "near-term ceiling is compressing while structural ceiling holds — breakout setup building."
 
 Dealer Delta Scenario Analysis (dealer_delta_briefing): Pre-computed dealer hedging pressure at hypothetical price levels across the key level grid. 'current_delta' shows dealer positioning at spot. 'flip_summary' identifies where dealer pressure reverses direction. 'acceleration_zone' shows where dealers are most reactive to price moves. Negative dealer delta = dealers must BUY to hedge = supportive (acts as a bid). Positive dealer delta = dealers must SELL = resistive (acts as an offer). Use this to identify price levels where dealer hedging creates natural support or resistance, independent of the GEX profile.
 
