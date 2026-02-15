@@ -1,10 +1,10 @@
 # IBIT GEX Trading Dashboard
 
-A web dashboard that pulls crypto ETF (IBIT/ETHA) options chain data from Yahoo Finance, calculates Gamma Exposure (GEX) using Black-Scholes, and displays actionable trading levels for **BTC/ETH perpetual futures trading with leverage**.
+A web dashboard that pulls crypto ETF (IBIT/ETHA) options chain data from Yahoo Finance and BTC options from Deribit, calculates Gamma Exposure (GEX) using Black-Scholes, and displays actionable trading levels for **BTC/ETH perpetual futures trading with leverage**.
 
 The core thesis: ETF options flow creates dealer hedging dynamics that produce support/resistance levels in the underlying crypto asset. When the gamma regime is positive, price is range-bound and you can fade the extremes on perps. When negative, ranges break and you should trade momentum or sit out.
 
-Supports **IBIT** (Bitcoin ETF) and **ETHA** (Ethereum ETF) with ticker switching in the header.
+Supports **IBIT** (Bitcoin ETF) and **ETHA** (Ethereum ETF) with ticker switching in the header. For IBIT, Deribit BTC options are automatically integrated, bringing total BTC options market coverage from ~52% (IBIT only) to ~91% (IBIT + Deribit).
 
 ## Options Primer
 
@@ -69,13 +69,13 @@ DTE windows are selectable from the web UI dropdown. Windows are non-overlapping
 ## Dashboard
 
 ### Header
-Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE window selector (non-overlapping ranges), candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
+Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE window selector (non-overlapping ranges), source selector (ALL/IBIT/DERIBIT — shown when Deribit data is available), Deribit OI badge, candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
 
 ### Candlestick Chart
-Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, support/resistance levels, and dealer delta flip points (purple dotted). Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
+Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, support/resistance levels, and dealer delta flip points (purple dotted). Overlay lines update when the source selector changes. Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
 
 ### GEX Profile
-Stacked bar chart showing per-expiry GEX contribution at each strike. Green = positive gamma, red = negative gamma. Each expiry gets a distinct color in the stack, with a legend showing DTE and date. An expiry filter dropdown (ALL EXP, NEAREST, NEXT 2, NEXT 3) controls which expirations are displayed. Tooltip shows net GEX, active GEX, and volume.
+Stacked bar chart showing GEX at each strike. Green = positive gamma, red = negative gamma. In ALL source mode, bars are stacked by venue (IBIT solid, Deribit translucent). In IBIT mode, bars stack by expiry with distinct colors. In DERIBIT mode, Deribit-only bars are shown. An expiry filter dropdown (ALL EXP, NEAREST, NEXT 2, NEXT 3) controls which expirations are displayed. Tooltip shows net GEX, per-venue breakdown, and volume.
 
 ### Open Interest Profile
 Call vs put open interest at each strike, showing where hedging activity is concentrated.
@@ -88,7 +88,7 @@ Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices
 
 ### Sidebar
 
-- **AI Analysis** — Claude-powered trading analysis across all non-overlapping DTE windows (0-3d/4-7d/8-14d/15-30d/31-45d + cross-timeframe). Auto-runs daily when fresh data arrives (saved automatically). Manual refresh via the refresh button generates a new analysis without saving; use the Save button to persist it when satisfied. Includes day-over-day level changes, historical trend context, and prior analysis for thesis continuity.
+- **AI Analysis** — Claude-powered trading analysis across all non-overlapping DTE windows (0-3d/4-7d/8-14d/15-30d/31-45d + cross-timeframe). Uses combined IBIT+Deribit levels as primary data with per-venue breakdown for divergence analysis. Auto-runs daily when fresh data arrives (saved automatically). Manual refresh via the refresh button generates a new analysis without saving; use the Save button to persist it when satisfied. Includes day-over-day level changes, historical trend context, and prior analysis for thesis continuity.
 - **Regime Banner** — Positive gamma (range-bound, fade extremes) or negative gamma (trending, don't fade)
 - **Expected Move** — Implied straddle range for nearest expiry
 - **Range Visual** — In positive gamma: tradeable range between put wall and call wall with spot indicator
@@ -110,20 +110,24 @@ Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices
 3. Pulls options chains across expirations within the DTE window
 4. Calculates Black-Scholes gamma, delta, vanna, and charm using per-strike implied volatility
 5. Aggregates to build a GEX profile, derive levels, and compute dealer flow forecasts
-6. Fetches ETF fund flows from Farside Investors (IBIT-specific and total BTC ETF daily flows)
+6. For IBIT: fetches Deribit BTC options via public API (`get_book_summary_by_currency`), computes Greeks with 1 BTC/contract multiplier, and merges into a combined BTC-price-indexed profile
+7. Fetches ETF fund flows from Farside Investors (IBIT-specific and total BTC ETF daily flows)
 
 ### Data Caching
-Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed.
+Options OI updates once per day (after market close). The app caches the full computed result in SQLite per DTE. On subsequent loads it compares OI to detect when Yahoo has fresh data — if unchanged, the cache is served instantly. Yahoo is re-checked at most every 30 minutes until new data is confirmed. Deribit data is cached in-memory for 1 hour (single API call returns all BTC options).
 
 A background thread pre-fetches all 5 non-overlapping DTE windows on startup and keeps the cache warm. Once all windows are fresh for the day, it auto-runs AI analysis (if `ANTHROPIC_API_KEY` is set).
 
 ### GEX Calculation
 ```
-GEX = Gamma x OI x 100 x Spot^2 x 0.01
+IBIT:    GEX = Gamma x OI x 100 x Spot^2 x 0.01    (100 shares/contract)
+Deribit: GEX = Gamma x OI x 1 x Spot^2 x 0.01      (1 BTC/contract)
 ```
 - **Call GEX** = positive (dealers short calls -> buy dips / sell rips)
 - **Put GEX** = negative (dealers short puts -> sell dips / buy rips)
 - **Net GEX** at each strike = Call GEX + Put GEX
+
+IBIT strikes are converted to BTC via `strike / btc_per_share`. Deribit strikes are already in BTC/USD. Both merge into a single BTC-price-indexed profile.
 
 ### Active GEX
 Active GEX weights net GEX by the fraction of OI that is new since yesterday (delta_OI / total_OI). This surfaces where fresh dealer exposure is concentrated vs stale positions from days ago. Active walls show the strikes with the most new positioning.
@@ -254,4 +258,9 @@ Save an AI analysis result to the database for today. Accepts the analysis JSON 
 - Crypto/share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
 - Vanna/charm magnitudes are estimates — actual dealer positioning depends on their book, which isn't public
 - ETF flow data from Farside Investors is only available for IBIT (and total BTC ETFs); ETHA flow data is not yet supported
+- Deribit integration is BTC-only (IBIT); ETHA/ETH Deribit options are not fetched
+- Deribit data is cached for 1 hour; IBIT OI is daily — refresh cadences differ
+- Expected move is derived from IBIT ATM straddle only, not Deribit
+- Significant levels, breakout signals, and flow forecast are computed from IBIT data only; dealer delta scenarios include both venues
+- If Deribit API is unreachable, the dashboard falls back to IBIT-only seamlessly
 - AI analysis requires an Anthropic API key and uses Claude Opus (~$0.15/day)
