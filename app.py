@@ -13,6 +13,8 @@ Usage:
 """
 
 import json
+import logging
+import logging.handlers
 import math
 import os
 import re
@@ -37,6 +39,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# Logging — rotating file + console
+# ---------------------------------------------------------------------------
+LOG_DIR = Path(__file__).parent / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
+
+log = logging.getLogger('gex')
+log.setLevel(logging.DEBUG)
+
+_fmt = logging.Formatter('%(asctime)s %(levelname)-5s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+_fh = logging.handlers.RotatingFileHandler(
+    LOG_DIR / 'gex.log', maxBytes=10 * 1024 * 1024, backupCount=5)
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(_fmt)
+log.addHandler(_fh)
+
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(_fmt)
+log.addHandler(_ch)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -92,10 +116,10 @@ def get_risk_free_rate():
             rate = irx / 100.0
             _rfr_cache['rate'] = rate
             _rfr_cache['date'] = today
-            print(f"  [rfr] 13-week T-bill rate: {irx:.2f}% ({rate:.4f})")
+            log.info(f"[rfr] 13-week T-bill rate: {irx:.2f}% ({rate:.4f})")
             return rate
     except Exception as e:
-        print(f"  [rfr] Failed to fetch ^IRX, using default: {e}")
+        log.warning(f"[rfr] Failed to fetch ^IRX, using default: {e}")
     return RISK_FREE_RATE_DEFAULT
 
 
@@ -830,9 +854,9 @@ def fetch_farside_flows():
                     html = resp.read().decode('utf-8')
                 _farside_cache['html'] = html
                 _farside_cache['time'] = now
-                print(f"  [farside] Fetched {len(html)//1024}KB from Farside")
+                log.info(f"[farside] Fetched {len(html)//1024}KB from Farside")
             except Exception as e:
-                print(f"  [farside] Fetch failed: {e}")
+                log.warning(f"[farside] Fetch failed: {e}")
                 html = _farside_cache.get('html')
                 if not html:
                     return None
@@ -842,7 +866,7 @@ def fetch_farside_flows():
     parser.feed(html)
 
     if not parser.headers or len(parser.headers) < 13:
-        print(f"  [farside] Bad table structure: {len(parser.headers)} headers")
+        log.warning(f"[farside] Bad table structure: {len(parser.headers)} headers")
         return None
 
     # Find column indices
@@ -851,7 +875,7 @@ def fetch_farside_flows():
         ibit_col = header_names.index('IBIT')
         total_col = header_names.index('Total')
     except ValueError:
-        print(f"  [farside] Missing IBIT or Total column in headers: {header_names}")
+        log.warning(f"[farside] Missing IBIT or Total column in headers: {header_names}")
         return None
 
     # Parse all valid date rows and store in DB
@@ -888,7 +912,7 @@ def fetch_farside_flows():
     conn.close()
 
     if inserted > 0:
-        print(f"  [farside] Stored {inserted} days of IBIT flow data")
+        log.info(f"[farside] Stored {inserted} days of IBIT flow data")
 
     if not history:
         return None
@@ -952,9 +976,9 @@ def fetch_deribit_options(min_dte=0, max_dte=7):
                 _deribit_cache['data'] = raw
                 _deribit_cache['time'] = now
                 result_count = len(raw.get('result', []))
-                print(f"  [deribit] Fetched {result_count} instruments from Deribit")
+                log.info(f"[deribit] Fetched {result_count} instruments from Deribit")
             except Exception as e:
-                print(f"  [deribit] Fetch failed: {e}")
+                log.warning(f"[deribit] Fetch failed: {e}")
                 raw = _deribit_cache.get('data')
                 if not raw:
                     return []
@@ -1005,7 +1029,7 @@ def fetch_deribit_options(min_dte=0, max_dte=7):
             'underlying_price': float(underlying_price),
         })
 
-    print(f"  [deribit] {len(options)} instruments in {min_dte}-{max_dte} DTE window")
+    log.info(f"[deribit] {len(options)} instruments in {min_dte}-{max_dte} DTE window")
     return options
 
 
@@ -1045,7 +1069,7 @@ def _fetch_binance_klines(symbol, tf, start_ms, end_ms, limit=1000):
                 elif isinstance(raw, list):
                     return raw
         except Exception as e:
-            print(f"  [candles] {source} fetch failed: {e}")
+            log.warning(f"[candles] {source} fetch failed: {e}")
     return []
 
 
@@ -1075,7 +1099,7 @@ def backfill_btc_candles(symbol, tf, days=90):
             break
         time.sleep(0.2)
     conn.close()
-    print(f"  [candles] Backfilled {total} candles for {symbol}/{tf}")
+    log.info(f"[candles] Backfilled {total} candles for {symbol}/{tf}")
 
 
 def get_btc_candles(symbol, tf):
@@ -1433,7 +1457,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     d_entry[f'{opt_type}_vanna'] += dealer_vanna
                     d_entry[f'{opt_type}_charm'] += dealer_charm
         except Exception as e:
-            print(f"  [deribit] Failed: {e}")
+            log.warning(f"[deribit] Failed: {e}")
 
     # Build Deribit DataFrame
     deribit_rows = []
@@ -1551,7 +1575,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             scenario_result, spot, levels, ref_per_share, is_crypto
         )
     except Exception as e:
-        print(f"  [delta-scenario] Failed: {e}")
+        log.warning(f"[delta-scenario] Failed: {e}")
 
     # Save to DB (only for 0-min_dte windows — most relevant for day-over-day comparisons)
     conn = get_db()
@@ -2348,20 +2372,20 @@ def _bg_refresh():
     try:
         fetch_farside_flows()
     except Exception as e:
-        print(f"  [bg-refresh] Farside flow fetch error: {e}")
+        log.error(f"[bg-refresh] Farside flow fetch error: {e}")
 
     # Phase 1: Backfill candles for all tickers
     for tk, cfg in TICKER_CONFIG.items():
         symbol = cfg['binance_symbol']
         _candle_backfill_done.setdefault(symbol, threading.Event())
-        print(f"  [bg-refresh] Starting {symbol} candle backfill...")
+        log.info(f"[bg-refresh] Starting {symbol} candle backfill...")
         for tf in ('15m', '1h', '4h', '1d'):
             try:
                 backfill_btc_candles(symbol, tf, days=90)
             except Exception as e:
-                print(f"  [bg-refresh] Backfill {symbol}/{tf} error: {e}")
+                log.error(f"[bg-refresh] Backfill {symbol}/{tf} error: {e}")
         _candle_backfill_done[symbol].set()
-        print(f"  [bg-refresh] {symbol} candle backfill complete")
+        log.info(f"[bg-refresh] {symbol} candle backfill complete")
 
     # Phase 2: Main loop — GEX refresh + candle updates
     last_candle_update = 0
@@ -2375,14 +2399,14 @@ def _bg_refresh():
                     try:
                         update_btc_candles(symbol, tf)
                     except Exception as e:
-                        print(f"  [bg-refresh] Candle update {symbol}/{tf} error: {e}")
+                        log.error(f"[bg-refresh] Candle update {symbol}/{tf} error: {e}")
             last_candle_update = now
 
         # Refresh Farside ETF flow data
         try:
             fetch_farside_flows()
         except Exception as e:
-            print(f"  [bg-refresh] Farside flow error: {e}")
+            log.error(f"[bg-refresh] Farside flow error: {e}")
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
@@ -2403,7 +2427,7 @@ def _bg_refresh():
                             fut.result()
                         except Exception as e:
                             w = futures[fut]
-                            print(f"  [bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
+                            log.error(f"[bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
 
             if all_fresh:
                 # Auto-run AI analysis if not cached, or re-run if ref asset moved >2%
@@ -2418,17 +2442,17 @@ def _bg_refresh():
                             old_price = cached_analysis['_btc_price']
                             pct_move = abs(current_price - old_price) / old_price * 100
                             if pct_move > 2:
-                                print(f"  [bg-refresh] {cfg['asset_label']} moved {pct_move:.1f}% since last {tk} analysis (${old_price:,.0f} -> ${current_price:,.0f})")
+                                log.info(f"[bg-refresh] {cfg['asset_label']} moved {pct_move:.1f}% since last {tk} analysis (${old_price:,.0f} -> ${current_price:,.0f})")
                                 should_run = True
                     except Exception:
                         pass
                 if should_run:
                     try:
-                        print(f"  [bg-refresh] Running {tk} AI analysis...")
+                        log.info(f"[bg-refresh] Running {tk} AI analysis...")
                         run_analysis(tk)
-                        print(f"  [bg-refresh] {tk} AI analysis complete and cached")
+                        log.info(f"[bg-refresh] {tk} AI analysis complete and cached")
                     except Exception as e:
-                        print(f"  [bg-refresh] {tk} AI analysis error: {e}")
+                        log.error(f"[bg-refresh] {tk} AI analysis error: {e}")
 
             # 6 AM ET anchor: IBIT OI is from last close, Deribit is live,
             # prediction is forward-looking for the trading day.
@@ -2451,20 +2475,20 @@ def _bg_refresh():
                         cached_analysis = get_cached_analysis(tk)
                         if pred_results:
                             save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
-                            print(f"  [predictions] Saved {tk} predictions (6 AM ET snapshot)")
+                            log.info(f"[predictions] Saved {tk} predictions (6 AM ET snapshot)")
                     conn.close()
             except Exception as e:
-                print(f"  [predictions] Save failed for {tk}: {e}")
+                log.error(f"[predictions] Save failed for {tk}: {e}")
 
         # Score any expired predictions
         try:
             conn = get_db()
             scored = score_expired_predictions(conn)
             if scored:
-                print(f"  [predictions] Scored {scored} expired predictions")
+                log.info(f"[predictions] Scored {scored} expired predictions")
             conn.close()
         except Exception as e:
-            print(f"  [predictions] Scoring failed: {e}")
+            log.error(f"[predictions] Scoring failed: {e}")
 
         # Sleep 5 min (candle update cadence), but also covers GEX re-check
         time.sleep(300)
@@ -2473,7 +2497,7 @@ def _bg_refresh():
 def start_bg_refresh():
     t = threading.Thread(target=_bg_refresh, daemon=True)
     t.start()
-    print("  [bg-refresh] Background data refresh started")
+    log.info("[bg-refresh] Background data refresh started")
 
 
 # ── ROUTES ──────────────────────────────────────────────────────────────────
@@ -3303,7 +3327,7 @@ def run_analysis(ticker='IBIT', save=True):
             summaries['_prediction_accuracy'] = accuracy
         conn.close()
     except Exception as e:
-        print(f"  [predictions] Accuracy query failed: {e}")
+        log.error(f"[predictions] Accuracy query failed: {e}")
 
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
@@ -3667,7 +3691,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='127.0.0.1')
     args = parser.parse_args()
     init_db()
-    print(f"\n  GEX Terminal → http://{args.host}:{args.port}\n")
+    log.info(f"GEX Terminal → http://{args.host}:{args.port}")
     # Start background refresh (skip reloader parent to avoid double threads)
     if os.environ.get('WERKZEUG_RUN_MAIN') or not app.debug:
         start_bg_refresh()
