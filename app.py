@@ -2418,7 +2418,70 @@ def api_structure():
         ORDER BY p.analysis_date, p.dte_window
     ''', (ticker, cutoff, ticker, cutoff)).fetchall()
 
+    # Layer 0: snapshots (oldest data, single-window only)
     data = {}
+    snap_rows = c.execute('''SELECT date, spot, btc_price, call_wall, put_wall, gamma_flip, regime
+                             FROM snapshots WHERE ticker=? AND date >= ? ORDER BY date''',
+                          (ticker, cutoff)).fetchall()
+    for date, spot_ibit, btc_p, cw_ibit, pw_ibit, gf_ibit, regime in snap_rows:
+        bps = btc_p / spot_ibit if spot_ibit else 1
+        data[date] = {'spot': btc_p, 'windows': {
+            '0-3': {
+                'call_wall': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'put_wall': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'gamma_flip': gf_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'regime': regime, 'venue_agree': False,
+                'deribit_cw': None, 'deribit_pw': None,
+                'ibit_cw': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'ibit_pw': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
+            }
+        }}
+
+    # Layer 1: data_cache (per-DTE-window, overwrites snapshots)
+    dte_to_window = {3: '0-3', 7: '4-7', 14: '8-14', 30: '15-30', 45: '31-45'}
+    cache_rows = c.execute('''SELECT date, dte, data_json FROM data_cache
+                              WHERE ticker=? AND date >= ? ORDER BY date, dte''',
+                           (ticker, cutoff)).fetchall()
+    for date, dte, data_json_str in cache_rows:
+        d = json.loads(data_json_str)
+        window = dte_to_window.get(dte)
+        if not window:
+            continue
+        bps = d.get('btc_per_share', 1)
+        lvl = d.get('levels', {})
+        combined = d.get('combined_levels_btc') or {}
+        deribit = d.get('deribit_levels_btc') or {}
+
+        if combined:
+            cw = combined.get('call_wall')
+            pw = combined.get('put_wall')
+            gf = combined.get('gamma_flip')
+            regime = combined.get('regime', lvl.get('regime'))
+        else:
+            cw = lvl.get('call_wall', 0) / bps if bps else None
+            pw = lvl.get('put_wall', 0) / bps if bps else None
+            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            regime = lvl.get('regime')
+
+        ibit_cw = lvl.get('call_wall', 0) / bps if bps else None
+        ibit_pw = lvl.get('put_wall', 0) / bps if bps else None
+        deribit_cw = deribit.get('call_wall')
+        deribit_pw = deribit.get('put_wall')
+        venue_agree = False
+        if deribit_cw and ibit_cw and ibit_cw > 0:
+            venue_agree = abs(deribit_cw - ibit_cw) / ibit_cw < 0.03
+
+        if date not in data:
+            data[date] = {'spot': d.get('btc_spot'), 'windows': {}}
+        data[date]['windows'][window] = {
+            'call_wall': cw, 'put_wall': pw,
+            'gamma_flip': gf, 'regime': regime,
+            'venue_agree': venue_agree,
+            'deribit_cw': deribit_cw, 'deribit_pw': deribit_pw,
+            'ibit_cw': ibit_cw, 'ibit_pw': ibit_pw,
+        }
+
+    # Override layer: predictions (higher fidelity, takes priority)
     for r in rows:
         date = r[0]
         if date not in data:
