@@ -3461,9 +3461,18 @@ def run_analysis(ticker='IBIT', save=True):
                 'pcr_change': round(ibit_lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
             }
 
-        # Pattern pre-screen
+        # Pattern pre-screen (use BTC-space levels, not IBIT share-price levels)
+        pattern_levels = {
+            'call_wall': primary_lvl_btc.get('call_wall', 0),
+            'put_wall': primary_lvl_btc.get('put_wall', 0),
+            'gamma_flip': primary_lvl_btc.get('gamma_flip', 0),
+            'regime': primary_regime,
+            'net_gex_total': primary_net_gex,
+            'pcr': ibit_lvl.get('pcr', 0),
+            'gex_activity_ratio': ibit_lvl.get('gex_activity_ratio', 0),
+        }
         detected = detect_structural_patterns(
-            ibit_lvl,
+            pattern_levels,
             current_btc,
             venue_breakdown=summaries[key].get('venue_breakdown'),
             changes_vs_prev=summaries[key].get('changes_vs_prev'),
