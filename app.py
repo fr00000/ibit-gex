@@ -1498,25 +1498,29 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if (not deribit_df.empty and btc_spot) else None
 
     # Expected move (reuse cached chain instead of re-fetching)
+    # Try each expiration in order; skip any with a zero straddle (dead options)
     expected_move = None
-    try:
-        nearest_exp = selected_exps[0]
-        ch = cached_chains[nearest_exp]
-        atm_c = ch.calls.iloc[(ch.calls['strike'] - spot).abs().argsort()[:1]]
-        atm_p = ch.puts.iloc[(ch.puts['strike'] - spot).abs().argsort()[:1]]
-        straddle = (atm_c['bid'].values[0] + atm_c['ask'].values[0]) / 2 + \
-                   (atm_p['bid'].values[0] + atm_p['ask'].values[0]) / 2
-        exp_date = datetime.strptime(nearest_exp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        dte = max((exp_date - now).days, 1)
-        expected_move = {
-            'straddle': float(straddle), 'pct': float((straddle / spot) * 100),
-            'upper': float(spot + straddle), 'lower': float(spot - straddle),
-            'upper_btc': float((spot + straddle) / ref_per_share) if is_crypto else None,
-            'lower_btc': float((spot - straddle) / ref_per_share) if is_crypto else None,
-            'expiration': nearest_exp, 'dte': dte,
-        }
-    except Exception:
-        pass
+    for em_exp in selected_exps:
+        try:
+            ch = cached_chains[em_exp]
+            atm_c = ch.calls.iloc[(ch.calls['strike'] - spot).abs().argsort()[:1]]
+            atm_p = ch.puts.iloc[(ch.puts['strike'] - spot).abs().argsort()[:1]]
+            straddle = (atm_c['bid'].values[0] + atm_c['ask'].values[0]) / 2 + \
+                       (atm_p['bid'].values[0] + atm_p['ask'].values[0]) / 2
+            if straddle <= 0:
+                continue
+            exp_date = datetime.strptime(em_exp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dte = max((exp_date - now).days, 1)
+            expected_move = {
+                'straddle': float(straddle), 'pct': float((straddle / spot) * 100),
+                'upper': float(spot + straddle), 'lower': float(spot - straddle),
+                'upper_btc': float((spot + straddle) / ref_per_share) if is_crypto else None,
+                'lower_btc': float((spot - straddle) / ref_per_share) if is_crypto else None,
+                'expiration': em_exp, 'dte': dte,
+            }
+            break
+        except Exception as e:
+            continue
 
     # Level strength trajectory
     level_trajectory = {}
