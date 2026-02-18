@@ -1832,7 +1832,7 @@ def fetch_deribit_options(min_dte=0, max_dte=7):
         strike = float(parts[2])
         opt_type = 'call' if parts[3] == 'C' else 'put'
 
-        dte = (expiry_date - now_dt).days
+        dte = max((expiry_date - now_dt).total_seconds() / 86400.0, 0.0)
         if dte < min_dte or dte > max_dte:
             continue
 
@@ -2137,15 +2137,16 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
     conn.close()
 
-    etf_flows = fetch_farside_flows() if is_crypto else None
+    etf_flows = fetch_farside_flows() if (is_crypto and ticker_symbol == 'IBIT') else None
 
     # Collect options data
     strike_data = {}
     cached_chains = {}  # exp_str -> chain, reused for expected move
     for exp_str in selected_exps:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        T = max((exp_date - now).days / 365.0, 0.5 / 365)
-        dte_days = max((exp_date - now).days, 0)
+        dte_float = max((exp_date - now).total_seconds() / 86400.0, 0.0)
+        T = max(dte_float / 365.0, 0.5 / 365)
+        dte_days = int(dte_float)  # integer for display/labels only
         try:
             chain = ticker.option_chain(exp_str)
         except Exception:
@@ -2727,7 +2728,7 @@ def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, r
         put_dd = 0.0
         for exp_str, chain in cached_chains.items():
             exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            T = max((exp_date - now).days / 365.0, 0.5 / 365)
+            T = max((exp_date - now).total_seconds() / 86400.0 / 365.0, 0.5 / 365)
             for opt_type, df_chain, in [('call', chain.calls), ('put', chain.puts)]:
                 for _, row in df_chain.iterrows():
                     strike = row['strike']
@@ -3873,21 +3874,24 @@ def score_expired_predictions(conn):
     c = conn.cursor()
     today = datetime.now().strftime('%Y-%m-%d')
 
-    c.execute('''SELECT DISTINCT expiry_date FROM predictions
+    c.execute('''SELECT DISTINCT expiry_date, ticker FROM predictions
                  WHERE scored=0 AND expiry_date < ?''', (today,))
-    expired_dates = [r[0] for r in c.fetchall()]
+    expired = c.fetchall()
 
-    if not expired_dates:
+    if not expired:
         return 0
 
     scored_count = 0
-    for exp_date in expired_dates:
+    for exp_date, pred_ticker in expired:
+        # Derive candle symbol from ticker config
+        cfg = TICKER_CONFIG.get(pred_ticker)
+        candle_symbol = cfg['binance_symbol'] if cfg else 'BTCUSDT'
         exp_ts = int(datetime.strptime(exp_date, '%Y-%m-%d').timestamp())
         exp_candle = c.execute('''SELECT high, low, close FROM btc_candles
-                                  WHERE symbol='BTCUSDT' AND tf='1d'
+                                  WHERE symbol=? AND tf='1d'
                                   AND time >= ? AND time < ?
                                   ORDER BY time LIMIT 1''',
-                               (exp_ts, exp_ts + 86400)).fetchone()
+                               (candle_symbol, exp_ts, exp_ts + 86400)).fetchone()
 
         if not exp_candle:
             continue  # no candle data yet
@@ -3898,7 +3902,7 @@ def score_expired_predictions(conn):
                                     gamma_flip_btc, regime, em_upper_btc, em_lower_btc,
                                     charm_direction, venue_walls_agree, deribit_available
                              FROM predictions
-                             WHERE expiry_date=? AND scored=0''', (exp_date,)).fetchall()
+                             WHERE expiry_date=? AND ticker=? AND scored=0''', (exp_date, pred_ticker)).fetchall()
 
         for row in preds:
             (pred_id, analysis_date, spot_btc, cw, pw, gf, regime, em_up, em_lo,
@@ -3909,9 +3913,9 @@ def score_expired_predictions(conn):
 
             analysis_ts = int(datetime.strptime(analysis_date, '%Y-%m-%d').timestamp())
             window_candles = c.execute('''SELECT high, low FROM btc_candles
-                                         WHERE symbol='BTCUSDT' AND tf='1d'
+                                         WHERE symbol=? AND tf='1d'
                                          AND time >= ? AND time <= ?''',
-                                      (analysis_ts, exp_ts + 86400)).fetchall()
+                                      (candle_symbol, analysis_ts, exp_ts + 86400)).fetchall()
 
             if not window_candles:
                 continue
@@ -3944,9 +3948,9 @@ def score_expired_predictions(conn):
 
             # Charm: did next session open in predicted direction?
             next_day = c.execute('''SELECT open FROM btc_candles
-                                    WHERE symbol='BTCUSDT' AND tf='1d'
+                                    WHERE symbol=? AND tf='1d'
                                     AND time > ? ORDER BY time LIMIT 1''',
-                                 (analysis_ts,)).fetchone()
+                                 (candle_symbol, analysis_ts,)).fetchone()
             charm_correct = None
             if next_day and charm_dir and spot_btc:
                 next_open = next_day[0]
@@ -3966,10 +3970,10 @@ def score_expired_predictions(conn):
             # T+2 scoring: look up the day AFTER expiry
             t2_ts = exp_ts + 86400
             t2_candle = c.execute('''SELECT high, low, close FROM btc_candles
-                                     WHERE symbol='BTCUSDT' AND tf='1d'
+                                     WHERE symbol=? AND tf='1d'
                                      AND time >= ? AND time < ?
                                      ORDER BY time LIMIT 1''',
-                                  (t2_ts, t2_ts + 86400)).fetchone()
+                                  (candle_symbol, t2_ts, t2_ts + 86400)).fetchone()
 
             t2_high, t2_low, t2_close = (None, None, None)
             cw_held_t2, pw_held_t2, range_held_t2, regime_correct_t2 = (None, None, None, None)
@@ -3977,9 +3981,9 @@ def score_expired_predictions(conn):
                 t2_high, t2_low, t2_close = t2_candle
                 # T+2 window: analysis date through T+2
                 t2_window_candles = c.execute('''SELECT high, low FROM btc_candles
-                                                 WHERE symbol='BTCUSDT' AND tf='1d'
+                                                 WHERE symbol=? AND tf='1d'
                                                  AND time >= ? AND time <= ?''',
-                                              (analysis_ts, t2_ts + 86400)).fetchall()
+                                              (candle_symbol, analysis_ts, t2_ts + 86400)).fetchall()
                 if t2_window_candles:
                     t2_win_high = max(r[0] for r in t2_window_candles)
                     t2_win_low = min(r[1] for r in t2_window_candles)
@@ -4408,7 +4412,7 @@ The activity_ratio (gex_activity_ratio) = |Volume GEX / OI GEX|. Interpretation:
 
 Use activity_ratio to calibrate confidence in levels. A call wall with high activity_ratio is being actively defended. A call wall with low activity_ratio is a ghost level from old OI.
 
-Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
+Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the standard GEX sign convention (dealers short both calls and puts — the market-maker assumption). When confidence is high, positive GEX = stabilizing (dealers hedge by buying dips / selling rallies) and call/put walls act as resistance/support. When below 60%, speculative flow likely dominates — dealers may be NET LONG calls (not short), which inverts the mechanics: the call wall becomes a squeeze trigger rather than resistance, and regime labels may be unreliable. Always note the confidence level and any warnings in your analysis.
 
 ETF fund flows (etf_flows) show daily creation/redemption activity from Farside Investors. 'daily_flow_millions' is IBIT-specific flow; 'total_btc_etf_flow_millions' is the total across ALL BTC spot ETFs (IBIT, FBTC, ARKB, GBTC, etc.). Positive = inflows, negative = outflows. A streak of 3+ days in one direction is significant. IMPORTANT: Distinguish between IBIT-specific outflows and total BTC ETF outflows. If IBIT has outflows but total BTC ETFs have inflows, that's fund rotation (not bearish). If ALL BTC ETFs have outflows, that's genuine institutional exit (bearish). Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
 
@@ -4614,9 +4618,9 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
     # Attach BTC price and timestamp metadata
     btc_price = live_ref_price
     if not btc_price:
-        for dte in dtes:
-            if dte in results and results[dte].get('btc_spot'):
-                btc_price = results[dte]['btc_spot']
+        for label, _, _ in dtes:
+            if label in results and results[label].get('btc_spot'):
+                btc_price = results[label]['btc_spot']
                 break
     if btc_price is not None:
         analysis['_btc_price'] = btc_price
@@ -4817,6 +4821,7 @@ if __name__ == '__main__':
     init_db()
     log.info(f"GEX Terminal → http://{args.host}:{args.port}")
     # Start background refresh (skip reloader parent to avoid double threads)
-    if os.environ.get('WERKZEUG_RUN_MAIN') or not app.debug:
+    debug_mode = True  # must match the debug= arg below
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not debug_mode:
         start_bg_refresh()
-    app.run(host=args.host, port=args.port, debug=True)
+    app.run(host=args.host, port=args.port, debug=debug_mode)
