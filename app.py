@@ -3038,6 +3038,12 @@ def _bg_refresh():
     except Exception as e:
         log.error(f"[bg-refresh] Farside flow fetch error: {e}")
 
+    # Phase 0b: Fetch Coinglass data (funding rates, aggregate OI)
+    try:
+        fetch_coinglass_data()
+    except Exception as e:
+        log.error(f"[bg-refresh] Coinglass data fetch error: {e}")
+
     # Phase 1: Backfill candles for all tickers
     for tk, cfg in TICKER_CONFIG.items():
         symbol = cfg['binance_symbol']
@@ -3922,6 +3928,25 @@ def run_analysis(ticker='IBIT', save=True):
     summaries['_history_trends'] = history_trends
     if structure_trends:
         summaries['_structure_trends'] = structure_trends
+
+    # Macro regime score
+    try:
+        macro_conn = get_db()
+        macro = compute_macro_regime(macro_conn, ticker)
+        macro_conn.close()
+        summaries['_macro_regime'] = {
+            'score': macro['score'],
+            'bias': macro['bias'],
+            'swing_signal': macro['swing_signal'],
+            'high_conviction': macro['high_conviction'],
+            'signals': macro['signals'],
+            'structural_entry': macro.get('structural_entry'),
+            'invalidation': macro.get('invalidation'),
+            'coinglass_available': macro['coinglass_available'],
+        }
+    except Exception as e:
+        log.warning(f"[analysis] Macro regime computation failed: {e}")
+
     for label, min_d, max_d in dtes:
         d = results[label]
         bps = d['btc_per_share']
@@ -4263,6 +4288,24 @@ If a previous analysis is provided, use it to:
 - Update your thesis based on how positioning evolved
 - Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
+MACRO REGIME SCORE (when present):
+_macro_regime contains the swing-trade regime score from -100 (topping) to +100 (bottoming).
+
+Score interpretation:
+- Score > 50 (SWING LONG): Bottoming conditions. Bias toward long setups at structural support.
+- Score < -50 (SWING SHORT): Topping conditions. Bias toward short setups at structural resistance.
+- Score -50 to +50 (NEUTRAL): No macro edge. Stick to tactical range-trading.
+- |Score| > 75 (HIGH CONVICTION): Strong directional bias. Mention structural_entry and invalidation.
+
+Key combinations:
+- regime_persistence + funding_rate agree -> strongest signal
+- wall_migration disagrees with regime_persistence -> flag conflict
+- aggregate_oi flush + negative funding -> textbook capitulation
+- aggregate_oi at peak + positive funding -> textbook crowded top
+
+Do NOT override tactical analysis with macro score. A macro bottom doesn't mean "buy today" -- it means "the structural floor is forming, look for tactical entry near that floor."
+When swing_signal is true, include structural_entry and invalidation in TRADE PLAN as a SWING SETUP.
+
 For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
 - Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful. If a delta flip DISAPPEARS in a longer window, that's a structural shift — call it out.
 - Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
@@ -4534,6 +4577,20 @@ def api_accuracy():
         'expiry_history': expiry_convergence,
         'recent': recent,
     }), mimetype='application/json')
+
+
+@app.route('/api/macro-regime')
+def api_macro_regime():
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    conn = get_db()
+    result = compute_macro_regime(conn, ticker)
+    conn.close()
+    return Response(json.dumps(result, cls=NumpyEncoder), mimetype='application/json')
+
+
+@app.route('/macro')
+def macro_page():
+    return render_template('macro.html')
 
 
 if __name__ == '__main__':
