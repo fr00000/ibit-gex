@@ -291,6 +291,14 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_expiry ON predictions(expiry_date, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_dte ON predictions(dte, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_ticker ON predictions(ticker, scored)')
+    c.execute('''CREATE TABLE IF NOT EXISTS coinglass_data (
+        date TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        value REAL,
+        extra_json TEXT,
+        UNIQUE(date, symbol, metric)
+    )''')
     # Migrate: add T+2 scoring columns to predictions
     pred_cols = {r[1] for r in c.execute('PRAGMA table_info(predictions)').fetchall()}
     for col, typ in [
