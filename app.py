@@ -1540,7 +1540,8 @@ def _compute_deribit_freshness():
     if cache_time == 0:
         return {'age_minutes': None, 'as_of': None}
     age_min = (time.time() - cache_time) / 60
-    as_of_str = datetime.fromtimestamp(cache_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    from zoneinfo import ZoneInfo
+    as_of_str = datetime.fromtimestamp(cache_time, tz=ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')
     return {
         'age_minutes': round(age_min, 0),
         'as_of': as_of_str,
