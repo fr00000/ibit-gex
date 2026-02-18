@@ -3346,12 +3346,6 @@ def _bg_refresh():
                                     log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
 
                         log.info(f"[bg-refresh] {tk} Deribit refresh complete")
-
-                        try:
-                            run_analysis(tk)
-                            log.info(f"[bg-refresh] {tk} AI analysis updated with fresh Deribit data")
-                        except Exception as e:
-                            log.error(f"[bg-refresh] {tk} AI analysis error after Deribit refresh: {e}")
                 except Exception as e:
                     log.error(f"[bg-refresh] {tk} Deribit freshness check error: {e}")
 
