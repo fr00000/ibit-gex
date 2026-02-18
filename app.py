@@ -102,6 +102,7 @@ TICKER_CONFIG = {
     },
 }
 
+COINGLASS_API_KEY = os.environ.get('COINGLASS_API_KEY')
 
 _rfr_cache = {'rate': None, 'date': None}
 
@@ -994,6 +995,112 @@ def fetch_farside_flows():
         'shares_outstanding': None,
         'total_btc_etf_flow': float(total_btc_etf_flow),
     }
+
+
+# ── COINGLASS: Aggregate funding rates & OI ─────────────────────────────────
+_coinglass_lock = threading.Lock()
+COINGLASS_BASE_URL = 'https://open-api-v3.coinglass.com/api'
+
+
+def fetch_coinglass_data():
+    """Fetch aggregate funding rate and OI from Coinglass API.
+    Stores daily snapshots in coinglass_data table. Graceful degradation if no API key."""
+    api_key = os.environ.get('COINGLASS_API_KEY')
+    if not api_key:
+        return  # Graceful - Phase 2 signals just return 0
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    with _coinglass_lock:
+        conn = get_db()
+        c = conn.cursor()
+
+        try:
+            # Skip if already fetched today
+            existing = c.execute(
+                'SELECT 1 FROM coinglass_data WHERE date=? AND symbol=? AND metric=? LIMIT 1',
+                (today, 'BTC', 'avg_funding_rate')
+            ).fetchone()
+            if existing:
+                conn.close()
+                return
+
+            headers = {'accept': 'application/json', 'CG-API-KEY': api_key}
+
+            # ── Endpoint 1: OI-Weighted Average Funding Rate ────────────
+            try:
+                url_fr = (
+                    f'{COINGLASS_BASE_URL}/futures/funding-rate/'
+                    f'oi-weight-ohlc-history?symbol=BTC&interval=h8&limit=90'
+                )
+                req = urllib.request.Request(url_fr, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    # Group 8-hour data points by date and compute daily averages
+                    daily_rates = {}
+                    for pt in body['data']:
+                        ts = pt.get('t', 0)
+                        rate = pt.get('c')
+                        if rate is None:
+                            continue
+                        # Timestamp is in milliseconds
+                        day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                        daily_rates.setdefault(day, []).append(float(rate))
+
+                    for day, rates in daily_rates.items():
+                        avg_rate = sum(rates) / len(rates)
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (day, 'BTC', 'avg_funding_rate', avg_rate,
+                             json.dumps({'samples': len(rates)}))
+                        )
+                    log.info(f"[coinglass] Stored funding rates for {len(daily_rates)} days")
+                else:
+                    log.warning(f"[coinglass] Funding rate response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] Funding rate fetch failed: {e}")
+
+            # ── Endpoint 2: Aggregated Open Interest History ────────────
+            try:
+                url_oi = (
+                    f'{COINGLASS_BASE_URL}/futures/open-interest/'
+                    f'ohlc-aggregated-history?symbol=BTC&interval=1d&limit=90'
+                )
+                req = urllib.request.Request(url_oi, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    count = 0
+                    for pt in body['data']:
+                        ts = pt.get('t', 0)
+                        oi_val = pt.get('c')
+                        if oi_val is None:
+                            continue
+                        day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (day, 'BTC', 'total_oi_usd', float(oi_val), None)
+                        )
+                        count += 1
+                    log.info(f"[coinglass] Stored OI data for {count} days")
+                else:
+                    log.warning(f"[coinglass] OI response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] OI fetch failed: {e}")
+
+            conn.commit()
+
+        except Exception as e:
+            log.warning(f"[coinglass] Unexpected error: {e}")
+        finally:
+            conn.close()
 
 
 def fetch_deribit_options(min_dte=0, max_dte=7):
