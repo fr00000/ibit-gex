@@ -1517,7 +1517,7 @@ def fetch_farside_flows():
 
 # ── COINGLASS: Aggregate funding rates & OI ─────────────────────────────────
 _coinglass_lock = threading.Lock()
-COINGLASS_BASE_URL = 'https://open-api-v3.coinglass.com/api'
+COINGLASS_BASE_URL = 'https://open-api-v4.coinglass.com/api'
 
 
 def fetch_coinglass_data():
@@ -1548,7 +1548,7 @@ def fetch_coinglass_data():
             # ── Endpoint 1: OI-Weighted Average Funding Rate ────────────
             try:
                 url_fr = (
-                    f'{COINGLASS_BASE_URL}/futures/funding-rate/'
+                    f'{COINGLASS_BASE_URL}/futures/fundingRate/'
                     f'oi-weight-ohlc-history?symbol=BTC&interval=h8&limit=90'
                 )
                 req = urllib.request.Request(url_fr, headers=headers)
@@ -1585,7 +1585,7 @@ def fetch_coinglass_data():
             # ── Endpoint 2: Aggregated Open Interest History ────────────
             try:
                 url_oi = (
-                    f'{COINGLASS_BASE_URL}/futures/open-interest/'
+                    f'{COINGLASS_BASE_URL}/futures/openInterest/'
                     f'ohlc-aggregated-history?symbol=BTC&interval=1d&limit=90'
                 )
                 req = urllib.request.Request(url_oi, headers=headers)
