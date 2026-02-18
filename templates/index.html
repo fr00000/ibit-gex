@@ -322,6 +322,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <span class="macro-badge neutral" id="macro-badge">NEUTRAL</span>
   <span class="hdr-sep"></span>
   <span id="macro-pills"></span>
+  <span id="macro-freshness" style="margin-left:auto;color:var(--t3);font-size:9px"></span>
   <a href="/macro" class="macro-link">OPEN MACRO &rarr;</a>
 </div>
 
@@ -1692,6 +1693,15 @@ async function loadMacro(){
       const title=!m.coinglass_available&&v.source==='coinglass'?'Add COINGLASS_API_KEY to .env':v.detail;
       return `<span class="pill ${cls}" title="${title.replace(/"/g,'&quot;')}">${display}</span>`;
     }).join(' ');
+
+    const frEl=document.getElementById('macro-freshness');
+    const fr=m.data_freshness;
+    if(fr){
+      const p=[];
+      if(fr.ibit)p.push('IBIT '+fr.ibit.as_of);
+      if(fr.deribit)p.push('DERIBIT '+fr.deribit.as_of);
+      frEl.textContent=p.join('  \u00b7  ');
+    }
   }catch(e){console.warn('Macro load failed:',e);}
 }
 
