@@ -79,7 +79,7 @@ class NumpyEncoder(json.JSONEncoder):
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 RISK_FREE_RATE_DEFAULT = 0.043
 STRIKE_RANGE_PCT = 0.35
-DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_research.db")
+DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
 
 # Non-overlapping DTE windows: each shows distinct positioning
 # (label, min_dte, max_dte)
