@@ -1548,8 +1548,8 @@ def fetch_coinglass_data():
             # ── Endpoint 1: OI-Weighted Average Funding Rate ────────────
             try:
                 url_fr = (
-                    f'{COINGLASS_BASE_URL}/futures/fundingRate/'
-                    f'oi-weight-ohlc-history?symbol=BTC&interval=h8&limit=90'
+                    f'{COINGLASS_BASE_URL}/futures/funding-rate/'
+                    f'oi-weight-history?symbol=BTC&interval=h8&limit=90'
                 )
                 req = urllib.request.Request(url_fr, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1559,8 +1559,8 @@ def fetch_coinglass_data():
                     # Group 8-hour data points by date and compute daily averages
                     daily_rates = {}
                     for pt in body['data']:
-                        ts = pt.get('t', 0)
-                        rate = pt.get('c')
+                        ts = pt.get('time', 0)
+                        rate = pt.get('close')
                         if rate is None:
                             continue
                         # Timestamp is in milliseconds
@@ -1585,8 +1585,8 @@ def fetch_coinglass_data():
             # ── Endpoint 2: Aggregated Open Interest History ────────────
             try:
                 url_oi = (
-                    f'{COINGLASS_BASE_URL}/futures/openInterest/'
-                    f'ohlc-aggregated-history?symbol=BTC&interval=1d&limit=90'
+                    f'{COINGLASS_BASE_URL}/futures/open-interest/'
+                    f'aggregated-history?symbol=BTC&interval=1d&limit=90'
                 )
                 req = urllib.request.Request(url_oi, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1595,8 +1595,8 @@ def fetch_coinglass_data():
                 if body.get('code') == '0' and body.get('data'):
                     count = 0
                     for pt in body['data']:
-                        ts = pt.get('t', 0)
-                        oi_val = pt.get('c')
+                        ts = pt.get('time', 0)
+                        oi_val = pt.get('close')
                         if oi_val is None:
                             continue
                         day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
