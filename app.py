@@ -3320,13 +3320,10 @@ def _bg_refresh():
             # IBIT OI is EOD-only so it won't change, but Deribit OI/IV updates 24/7
             if all_fresh and tk == 'IBIT':
                 try:
-                    _, latest_cached = get_latest_cache(tk, 3)  # 0-3d as reference
-                    deribit_stale = True
-                    if latest_cached:
-                        freshness = latest_cached.get('data_freshness', {}).get('deribit', {})
-                        age_min = freshness.get('age_minutes')
-                        if age_min is not None and age_min < 65:
-                            deribit_stale = False
+                    # Check live Deribit age from in-memory cache (not stored JSON which is stale)
+                    freshness = _compute_deribit_freshness()
+                    age_min = freshness.get('age_minutes')
+                    deribit_stale = age_min is None or age_min >= 65
 
                     if deribit_stale:
                         log.info(f"[bg-refresh] {tk} Deribit data stale, refreshing all windows...")
