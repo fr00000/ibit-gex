@@ -102,6 +102,7 @@ TICKER_CONFIG = {
     },
 }
 
+COINGLASS_API_KEY = os.environ.get('COINGLASS_API_KEY')
 
 _rfr_cache = {'rate': None, 'date': None}
 
@@ -291,6 +292,14 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_expiry ON predictions(expiry_date, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_dte ON predictions(dte, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_ticker ON predictions(ticker, scored)')
+    c.execute('''CREATE TABLE IF NOT EXISTS coinglass_data (
+        date TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        metric TEXT NOT NULL,
+        value REAL,
+        extra_json TEXT,
+        UNIQUE(date, symbol, metric)
+    )''')
     # Migrate: add T+2 scoring columns to predictions
     pred_cols = {r[1] for r in c.execute('PRAGMA table_info(predictions)').fetchall()}
     for col, typ in [
@@ -755,6 +764,697 @@ def summarize_structure_trends(conn, ticker, days=7):
     }
 
 
+# ── Macro Regime Scoring ─────────────────────────────────────────────────
+
+def _compute_funding_signal(c):
+    """Signal 6: Aggregate Funding Rate (-13 to +13). Returns (score, detail, history)."""
+    rows = c.execute(
+        '''SELECT date, value FROM coinglass_data
+           WHERE symbol='BTC' AND metric='avg_funding_rate'
+           ORDER BY date DESC LIMIT 30'''
+    ).fetchall()
+
+    if not rows or len(rows) < 7:
+        return 0, 'Insufficient funding data', []
+
+    history = [{'date': r[0], 'rate': r[1]} for r in rows]
+    history.reverse()  # Oldest first for charts
+
+    rates_7d = [r[1] for r in rows[:7]]
+    rates_30d = [r[1] for r in rows[:30]]
+    avg_7d = sum(rates_7d) / len(rates_7d)
+    avg_30d = sum(rates_30d) / len(rates_30d)
+
+    # Add 7d moving avg to history
+    for i, h in enumerate(history):
+        start = max(0, i - 6)
+        vals = [history[j]['rate'] for j in range(start, i + 1)]
+        h['avg_7d'] = sum(vals) / len(vals)
+
+    score = 0
+    detail = f'7d avg: {avg_7d:.4%}, 30d avg: {avg_30d:.4%}'
+
+    # Normal BTC funding is slightly positive (0.005-0.015%) - thresholds account for asymmetry
+    if avg_7d < -0.0001:  # < -0.01%
+        if avg_7d > avg_30d:  # Reverting toward 0
+            score = 13
+            detail += ' | Deeply negative, reverting up'
+        else:
+            score = 8
+            detail += ' | Deeply negative, still falling'
+    elif avg_7d > 0.0003:  # > 0.03%
+        if avg_7d < avg_30d:  # Reverting toward 0
+            score = -13
+            detail += ' | Deeply positive, reverting down'
+        else:
+            score = -8
+            detail += ' | Deeply positive, still rising'
+
+    return score, detail, history
+
+
+def _compute_oi_signal(c):
+    """Signal 7: Aggregate Futures OI (-13 to +13). Returns (score, detail, history)."""
+    rows = c.execute(
+        '''SELECT date, value FROM coinglass_data
+           WHERE symbol='BTC' AND metric='total_oi_usd'
+           ORDER BY date DESC LIMIT 90'''
+    ).fetchall()
+
+    if not rows or len(rows) < 7:
+        return 0, 'Insufficient OI data', []
+
+    history = [{'date': r[0], 'oi_usd': r[1]} for r in rows]
+    history.reverse()  # Oldest first
+
+    oi_current = rows[0][1]
+    oi_90d_peak = max(r[1] for r in rows)
+    change_from_peak = (oi_current - oi_90d_peak) / oi_90d_peak * 100
+
+    for h in history:
+        h['peak_pct'] = (h['oi_usd'] - oi_90d_peak) / oi_90d_peak * 100
+
+    # 7d slope
+    if len(rows) >= 7:
+        oi_7d_ago = rows[6][1]
+        oi_7d_slope = 'rising' if oi_current > oi_7d_ago * 1.02 else (
+            'falling' if oi_current < oi_7d_ago * 0.98 else 'flat')
+    else:
+        oi_7d_slope = 'unknown'
+
+    # Cross-reference funding for topping condition
+    funding_rows = c.execute(
+        '''SELECT value FROM coinglass_data
+           WHERE symbol='BTC' AND metric='avg_funding_rate'
+           ORDER BY date DESC LIMIT 7'''
+    ).fetchall()
+    funding_7d_avg = sum(r[0] for r in funding_rows) / len(funding_rows) if funding_rows else 0
+
+    score = 0
+    detail = f'OI ${oi_current/1e9:.1f}B, {change_from_peak:+.1f}% from 90d peak, 7d {oi_7d_slope}'
+
+    if change_from_peak < -20:
+        if oi_7d_slope in ('flat', 'rising'):
+            score = 13
+            detail += ' | Flushed + stabilizing'
+        else:
+            score = 6
+            detail += ' | Flush in progress'
+    elif change_from_peak > -5:  # Within 5% of peak
+        if funding_7d_avg > 0:
+            score = -13
+            detail += f' | Near peak + positive funding ({funding_7d_avg:.4%})'
+        else:
+            score = -6
+            detail += f' | Near peak, shorts crowded ({funding_7d_avg:.4%})'
+
+    return score, detail, history
+
+
+def _compute_score_history(conn, ticker, days=30):
+    """Recompute full macro score (all 8 signals) for each of the last N days."""
+    c = conn.cursor()
+    cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
+    btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
+
+    # ── Pre-load all data once ────────────────────────────────────────────
+    lookback = days + 30  # Extra rows for signal lookback windows
+
+    all_snapshots = c.execute(
+        'SELECT date, regime, net_gex FROM snapshots WHERE ticker=? ORDER BY date DESC LIMIT ?',
+        (ticker, lookback)
+    ).fetchall()
+
+    all_cache = c.execute(
+        'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT ?',
+        (ticker, lookback)
+    ).fetchall()
+
+    all_flows = c.execute(
+        '''SELECT date, daily_flow_dollars, total_btc_etf_flow
+           FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT ?''',
+        (ticker, lookback)
+    ).fetchall()
+
+    all_funding = c.execute(
+        'SELECT date, value FROM coinglass_data WHERE symbol=? AND metric=? ORDER BY date DESC LIMIT 90',
+        ('BTC', 'avg_funding_rate')
+    ).fetchall()
+
+    all_oi = c.execute(
+        'SELECT date, value FROM coinglass_data WHERE symbol=? AND metric=? ORDER BY date DESC LIMIT 90',
+        ('BTC', 'total_oi_usd')
+    ).fetchall()
+
+    # Get dates we want scores for (oldest first)
+    dates = list(dict.fromkeys(r[0] for r in all_snapshots[:days]))
+    dates.reverse()
+
+    # ── Pre-parse cache JSON once, keyed by date ──────────────────────────
+    parsed_cache = {}  # date -> {call_wall, put_wall, deribit_cw, deribit_pw, ibit_cw, ibit_pw}
+    for row in all_cache:
+        if row[0] in parsed_cache:
+            continue
+        try:
+            d = json.loads(row[1])
+            comb = d.get('combined_levels_btc') or {}
+            levels = d.get('levels', {})
+            deribit = d.get('deribit_levels_btc') or {}
+            cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+            pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+            parsed_cache[row[0]] = {
+                'call_wall': cw, 'put_wall': pw,
+                'ibit_cw': levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0,
+                'ibit_pw': levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0,
+                'deribit_cw': deribit.get('call_wall', 0),
+                'deribit_pw': deribit.get('put_wall', 0),
+                'has_deribit': bool(comb and deribit),
+            }
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    score_history = []
+    for date_str in dates:
+        # ── Signal 1: Regime Persistence & Transition ─────────────────
+        snaps = [r for r in all_snapshots if r[0] <= date_str][:days]
+        regime_s = 0
+        if snaps:
+            total = len(snaps)
+            neg_count = sum(1 for r in snaps if r[1] == 'negative_gamma')
+            pos_count = total - neg_count
+            neg_pct = neg_count / total
+            pos_pct = pos_count / total
+
+            if neg_pct > 0.70:
+                regime_s = 8
+            elif pos_pct > 0.70:
+                regime_s = -8
+
+            # Transition bonus
+            if len(snaps) >= 4:
+                recent_regime = snaps[0][1]
+                recent_streak = 1
+                for i in range(1, min(4, len(snaps))):
+                    if snaps[i][1] == recent_regime:
+                        recent_streak += 1
+                    else:
+                        break
+                if recent_streak <= 3:
+                    old_count = 0
+                    for i in range(recent_streak, len(snaps)):
+                        if snaps[i][1] != recent_regime:
+                            old_count += 1
+                        else:
+                            break
+                    if old_count >= 20:
+                        regime_s = 12 if recent_regime == 'positive_gamma' else -12
+
+        # ── Signal 2: Wall Migration ──────────────────────────────────
+        wall_s = 0
+        cache_dates = sorted(dt for dt in parsed_cache if dt <= date_str)
+        wall_entries = [parsed_cache[dt] for dt in cache_dates if parsed_cache[dt]['call_wall'] and parsed_cache[dt]['put_wall']]
+
+        if len(wall_entries) >= 14:
+            first_7 = wall_entries[:7]
+            last_7 = wall_entries[-7:]
+            avg_pw_f = sum(w['put_wall'] for w in first_7) / 7
+            avg_pw_l = sum(w['put_wall'] for w in last_7) / 7
+            avg_cw_f = sum(w['call_wall'] for w in first_7) / 7
+            avg_cw_l = sum(w['call_wall'] for w in last_7) / 7
+            pw_chg = (avg_pw_l - avg_pw_f) / avg_pw_f if avg_pw_f else 0
+            cw_chg = (avg_cw_l - avg_cw_f) / avg_cw_f if avg_cw_f else 0
+            wall_s = (6 if pw_chg > 0.02 else (-6 if pw_chg < -0.02 else 0)) + \
+                     (6 if cw_chg > 0.02 else (-6 if cw_chg < -0.02 else 0))
+
+        # ── Signal 3: Range Compression ───────────────────────────────
+        comp_s = 0
+        if len(wall_entries) >= 10:
+            ranges = [w['call_wall'] - w['put_wall'] for w in wall_entries if w['call_wall'] > w['put_wall']]
+            if ranges:
+                current_range = ranges[-1]  # Most recent
+                sorted_ranges = sorted(ranges)
+                below = sum(1 for r in sorted_ranges if r < current_range)
+                percentile = (below / len(sorted_ranges)) * 100
+                if percentile <= 20:
+                    cur_regime = snaps[0][1] if snaps else None
+                    if cur_regime == 'positive_gamma':
+                        comp_s = -12
+                    elif cur_regime == 'negative_gamma':
+                        comp_s = 12
+
+        # ── Signal 4: ETF Flow Momentum ───────────────────────────────
+        flow_s = 0
+        flows_up_to = [r for r in all_flows if r[0] <= date_str]
+        if flows_up_to:
+            flow_vals = [(r[2] if r[2] is not None else r[1]) or 0 for r in flows_up_to]
+            flow_10d = sum(flow_vals[:10]) if len(flow_vals) >= 10 else sum(flow_vals)
+
+            if len(flow_vals) >= 15:
+                flow_30d = sum(flow_vals[:30]) if len(flow_vals) >= 30 else sum(flow_vals)
+                f5_recent = sum(flow_vals[:5])
+                f5_prior = sum(flow_vals[5:10])
+                if f5_prior < 0 and f5_recent > 0:
+                    flow_s = 12
+                elif f5_prior > 0 and f5_recent < 0:
+                    flow_s = -12
+                elif flow_30d != 0:
+                    pace_10d = flow_10d / min(10, len(flow_vals))
+                    pace_30d = flow_30d / min(30, len(flow_vals))
+                    if flow_10d > 0 and pace_10d > pace_30d:
+                        flow_s = 8
+                    elif flow_10d < 0 and abs(pace_10d) > abs(pace_30d):
+                        flow_s = -8
+                    elif pace_30d != 0:
+                        flow_s = max(-8, min(8, int((pace_10d / pace_30d) * 8)))
+
+        # ── Signal 5: Venue Wall Convergence ──────────────────────────
+        venue_s = 0
+        if cache_dates:
+            latest = parsed_cache[cache_dates[-1]]
+            if latest['has_deribit']:
+                ibit_pw = latest['ibit_pw']
+                ibit_cw = latest['ibit_cw']
+                d_pw = latest['deribit_pw']
+                d_cw = latest['deribit_cw']
+
+                if ibit_pw and d_pw and ibit_pw > 0:
+                    pw_diff = abs(ibit_pw - d_pw) / ibit_pw
+                    if pw_diff <= 0.02 and len(wall_entries) >= 7:
+                        pw_rising = wall_entries[-1]['put_wall'] > wall_entries[0]['put_wall'] * 1.02
+                        venue_s += 12 if pw_rising else 6
+
+                if ibit_cw and d_cw and ibit_cw > 0:
+                    cw_diff = abs(ibit_cw - d_cw) / ibit_cw
+                    if cw_diff <= 0.02 and len(wall_entries) >= 7:
+                        cw_falling = wall_entries[-1]['call_wall'] < wall_entries[0]['call_wall'] * 0.98
+                        venue_s -= 12 if cw_falling else 6
+
+                venue_s = max(-12, min(12, venue_s))
+
+        # ── Signal 6: Funding Rate ────────────────────────────────────
+        funding_s = 0
+        fr = [r for r in all_funding if r[0] <= date_str]
+        if len(fr) >= 7:
+            avg_7d = sum(r[1] for r in fr[:7]) / 7
+            avg_30d = sum(r[1] for r in fr[:30]) / min(30, len(fr))
+            if avg_7d < -0.0001:
+                funding_s = 13 if avg_7d > avg_30d else 8
+            elif avg_7d > 0.0003:
+                funding_s = -13 if avg_7d < avg_30d else -8
+
+        # ── Signal 7: Open Interest ───────────────────────────────────
+        oi_s = 0
+        oi = [r for r in all_oi if r[0] <= date_str]
+        if len(oi) >= 7:
+            oi_current = oi[0][1]
+            oi_peak = max(r[1] for r in oi)
+            chg_from_peak = (oi_current - oi_peak) / oi_peak * 100 if oi_peak else 0
+
+            oi_7d_ago = oi[6][1]
+            oi_slope = 'rising' if oi_current > oi_7d_ago * 1.02 else (
+                'falling' if oi_current < oi_7d_ago * 0.98 else 'flat')
+
+            fr_for_oi = [r for r in all_funding if r[0] <= date_str][:7]
+            funding_avg = sum(r[1] for r in fr_for_oi) / len(fr_for_oi) if fr_for_oi else 0
+
+            if chg_from_peak < -20:
+                oi_s = 13 if oi_slope in ('flat', 'rising') else 6
+            elif chg_from_peak > -5:
+                oi_s = -13 if funding_avg > 0 else -6
+
+        # ── Signal 8: Liquidation (stub) ──────────────────────────────
+        day_total = max(-100, min(100,
+            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s))
+
+        score_history.append({
+            'date': date_str,
+            'total_score': day_total,
+            'regime': regime_s,
+            'walls': wall_s,
+            'compression': comp_s,
+            'flow': flow_s,
+            'venue': venue_s,
+            'funding': funding_s,
+            'oi': oi_s,
+            'liquidation': 0,
+        })
+
+    return score_history
+
+
+def compute_macro_regime(conn, ticker, days=30):
+    """Compute macro regime score from -100 (top) to +100 (bottom).
+    Returns dict with overall score, per-signal breakdown, and swing recommendation."""
+    c = conn.cursor()
+    cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
+    btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # ── Signal 1: Regime Persistence & Transition (-12 to +12) ───────────
+    regime_score = 0
+    regime_detail = ''
+    regime_history = []
+
+    rows = c.execute(
+        'SELECT date, regime, net_gex FROM snapshots WHERE ticker=? ORDER BY date DESC LIMIT ?',
+        (ticker, days)
+    ).fetchall()
+
+    if rows:
+        regime_history = [{'date': r[0], 'regime': r[1], 'net_gex': r[2]} for r in rows]
+        total = len(rows)
+        neg_count = sum(1 for r in rows if r[1] == 'negative_gamma')
+        pos_count = total - neg_count
+
+        flips = sum(1 for i in range(1, len(rows)) if rows[i][1] != rows[i-1][1])
+
+        neg_pct = neg_count / total if total > 0 else 0
+        pos_pct = pos_count / total if total > 0 else 0
+
+        if neg_pct > 0.70:
+            regime_score = 8
+            regime_detail = f'{neg_count}/{total} days negative gamma ({neg_pct:.0%})'
+        elif pos_pct > 0.70:
+            regime_score = -8
+            regime_detail = f'{pos_count}/{total} days positive gamma ({pos_pct:.0%})'
+        else:
+            regime_detail = f'Oscillating: {pos_count} pos / {neg_count} neg, {flips} flips'
+
+        # Transition bonus: persistent regime just flipped
+        if len(rows) >= 4:
+            recent_regime = rows[0][1]
+            recent_streak = 1
+            for i in range(1, min(4, len(rows))):
+                if rows[i][1] == recent_regime:
+                    recent_streak += 1
+                else:
+                    break
+
+            if recent_streak <= 3:
+                old_regime_count = 0
+                for i in range(recent_streak, len(rows)):
+                    if rows[i][1] != recent_regime:
+                        old_regime_count += 1
+                    else:
+                        break
+
+                if old_regime_count >= 20:
+                    if recent_regime == 'positive_gamma':
+                        regime_score = 12
+                        regime_detail += f' | TRANSITION: {old_regime_count}d neg->pos (streak {recent_streak}d)'
+                    else:
+                        regime_score = -12
+                        regime_detail += f' | TRANSITION: {old_regime_count}d pos->neg (streak {recent_streak}d)'
+
+    # ── Signal 2: Structural Wall Migration (-12 to +12) ─────────────────
+    wall_migration_score = 0
+    wall_detail = ''
+    wall_history = []
+
+    cache_rows = c.execute(
+        'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT ?',
+        (ticker, days)
+    ).fetchall()
+
+    if len(cache_rows) >= 14:
+        for row in cache_rows:
+            try:
+                d = json.loads(row[1])
+                comb = d.get('combined_levels_btc') or {}
+                levels = d.get('levels', {})
+                cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+                pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+                if cw and pw:
+                    wall_history.append({'date': row[0], 'call_wall': cw, 'put_wall': pw})
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        wall_history.reverse()  # Oldest first
+
+        if len(wall_history) >= 14:
+            first_7 = wall_history[:7]
+            last_7 = wall_history[-7:]
+
+            avg_pw_first = sum(w['put_wall'] for w in first_7) / 7
+            avg_pw_last = sum(w['put_wall'] for w in last_7) / 7
+            avg_cw_first = sum(w['call_wall'] for w in first_7) / 7
+            avg_cw_last = sum(w['call_wall'] for w in last_7) / 7
+
+            pw_change = (avg_pw_last - avg_pw_first) / avg_pw_first if avg_pw_first else 0
+            cw_change = (avg_cw_last - avg_cw_first) / avg_cw_first if avg_cw_first else 0
+
+            pw_part = 6 if pw_change > 0.02 else (-6 if pw_change < -0.02 else 0)
+            cw_part = 6 if cw_change > 0.02 else (-6 if cw_change < -0.02 else 0)
+            pw_dir = 'rising' if pw_change > 0.02 else ('falling' if pw_change < -0.02 else 'stable')
+            cw_dir = 'rising' if cw_change > 0.02 else ('falling' if cw_change < -0.02 else 'stable')
+
+            wall_migration_score = pw_part + cw_part
+            wall_detail = f'Put wall {pw_dir} ({pw_change:+.1%}), Call wall {cw_dir} ({cw_change:+.1%})'
+
+    if not wall_detail:
+        wall_detail = f'Insufficient data ({len(cache_rows)} days of 31-45d cache)'
+
+    # ── Signal 3: Range Compression + Regime Context (-12 to +12) ────────
+    compression_score = 0
+    compression_detail = ''
+
+    if len(cache_rows) >= 10:
+        ranges = []
+        for row in cache_rows:
+            try:
+                d = json.loads(row[1])
+                comb = d.get('combined_levels_btc') or {}
+                levels = d.get('levels', {})
+                cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+                pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+                if cw and pw and cw > pw:
+                    ranges.append(cw - pw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if ranges:
+            current_range = ranges[0]  # Most recent (desc order from query)
+            sorted_ranges = sorted(ranges)
+            # Find percentile position
+            below = sum(1 for r in sorted_ranges if r < current_range)
+            percentile = (below / len(sorted_ranges)) * 100
+
+            if percentile <= 20:
+                current_regime = rows[0][1] if rows else None
+                if current_regime == 'positive_gamma':
+                    compression_score = -12
+                    compression_detail = f'{percentile:.0f}th pctl range + positive gamma -> breaks DOWN'
+                elif current_regime == 'negative_gamma':
+                    compression_score = 12
+                    compression_detail = f'{percentile:.0f}th pctl range + negative gamma -> breaks UP'
+                else:
+                    compression_detail = f'{percentile:.0f}th pctl range, oscillating regime'
+            else:
+                compression_detail = f'{percentile:.0f}th pctl range (not compressed)'
+
+    if not compression_detail:
+        compression_detail = 'Insufficient data for range analysis'
+
+    # ── Signal 4: ETF Flow Momentum (-12 to +12) ────────────────────────
+    etf_flow_score = 0
+    flow_detail = ''
+    flow_history = []
+
+    flow_rows = c.execute(
+        '''SELECT date, daily_flow_dollars, total_btc_etf_flow
+           FROM etf_flows WHERE ticker=? ORDER BY date DESC LIMIT ?''',
+        (ticker, days)
+    ).fetchall()
+
+    if flow_rows:
+        flow_history = [
+            {'date': r[0], 'ibit_flow': r[1], 'total_flow': r[2], 'cumulative_10d': None}
+            for r in flow_rows
+        ]
+        flow_history.reverse()  # Oldest first
+
+        # Compute cumulative 10d for history
+        for i, fh in enumerate(flow_history):
+            start = max(0, i - 9)
+            cum = sum(
+                (flow_history[j].get('total_flow') or flow_history[j].get('ibit_flow') or 0)
+                for j in range(start, i + 1)
+            )
+            fh['cumulative_10d'] = cum
+
+        # Use total_btc_etf_flow, fall back to daily_flow_dollars
+        flows = []
+        for r in flow_rows:
+            val = r[2] if r[2] is not None else r[1]
+            flows.append(val or 0)
+
+        flow_10d = sum(flows[:10]) if len(flows) >= 10 else sum(flows)
+        flow_30d = sum(flows[:30]) if len(flows) >= 30 else sum(flows)
+
+        if len(flows) >= 15:
+            flow_5d_recent = sum(flows[:5])
+            flow_5d_prior = sum(flows[5:10])
+
+            if flow_5d_prior < 0 and flow_5d_recent > 0:
+                etf_flow_score = 12
+                flow_detail = f'Flow reversal: prior ${flow_5d_prior/1e6:.0f}M -> recent ${flow_5d_recent/1e6:.0f}M'
+            elif flow_5d_prior > 0 and flow_5d_recent < 0:
+                etf_flow_score = -12
+                flow_detail = f'Flow reversal: prior ${flow_5d_prior/1e6:.0f}M -> recent ${flow_5d_recent/1e6:.0f}M'
+            elif flow_30d != 0:
+                pace_10d = flow_10d / min(10, len(flows))
+                pace_30d = flow_30d / min(30, len(flows))
+
+                if flow_10d > 0 and pace_10d > pace_30d:
+                    etf_flow_score = 8
+                    flow_detail = f'Accelerating inflows: 10d ${flow_10d/1e6:.0f}M'
+                elif flow_10d < 0 and abs(pace_10d) > abs(pace_30d):
+                    etf_flow_score = -8
+                    flow_detail = f'Accelerating outflows: 10d ${flow_10d/1e6:.0f}M'
+                else:
+                    ratio = pace_10d / pace_30d if pace_30d != 0 else 0
+                    etf_flow_score = max(-8, min(8, int(ratio * 8)))
+                    flow_detail = f'10d flow ${flow_10d/1e6:.0f}M, 10d/30d ratio {ratio:.2f}'
+            else:
+                flow_detail = 'Flat flows'
+        elif flows:
+            flow_detail = f'Only {len(flows)} days of flow data'
+
+    if not flow_detail:
+        flow_detail = 'No ETF flow data'
+
+    # ── Signal 5: Venue Wall Convergence (-12 to +12) ────────────────────
+    venue_score = 0
+    venue_detail = ''
+
+    latest_cache = c.execute(
+        'SELECT data_json FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT 1',
+        (ticker,)
+    ).fetchone()
+
+    if latest_cache:
+        try:
+            d = json.loads(latest_cache[0])
+            comb = d.get('combined_levels_btc') or {}
+            deribit = d.get('deribit_levels_btc') or {}
+            levels = d.get('levels', {})
+
+            if comb and deribit:
+                ibit_cw = levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0
+                ibit_pw = levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0
+                deribit_cw = deribit.get('call_wall', 0)
+                deribit_pw = deribit.get('put_wall', 0)
+
+                if ibit_pw and deribit_pw and ibit_pw > 0:
+                    pw_diff_pct = abs(ibit_pw - deribit_pw) / ibit_pw
+                    if pw_diff_pct <= 0.02:
+                        if wall_history and len(wall_history) >= 7:
+                            pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
+                            if pw_rising:
+                                venue_score += 12
+                                venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) + rising'
+                            else:
+                                venue_score += 6
+                                venue_detail = f'Put walls converging ({pw_diff_pct:.1%}), stable/falling'
+
+                if ibit_cw and deribit_cw and ibit_cw > 0:
+                    cw_diff_pct = abs(ibit_cw - deribit_cw) / ibit_cw
+                    if cw_diff_pct <= 0.02:
+                        if wall_history and len(wall_history) >= 7:
+                            cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
+                            if cw_falling:
+                                venue_score -= 12
+                                venue_detail += f'{" | " if venue_detail else ""}Call walls converging ({cw_diff_pct:.1%}) + falling'
+                            else:
+                                venue_score -= 6
+                                venue_detail += f'{" | " if venue_detail else ""}Call walls converging ({cw_diff_pct:.1%}), stable/rising'
+
+                venue_score = max(-12, min(12, venue_score))
+
+                if not venue_detail:
+                    venue_detail = 'Venue walls not converging'
+            else:
+                venue_detail = 'Deribit data not available'
+        except (json.JSONDecodeError, TypeError) as e:
+            venue_detail = f'Parse error: {e}'
+    else:
+        venue_detail = 'No 31-45d cache data'
+
+    # ── Phase 2 signals ──────────────────────────────────────────────────
+    funding_score, funding_detail, funding_history = _compute_funding_signal(c)
+    oi_score, oi_detail, oi_hist = _compute_oi_signal(c)
+
+    # Signal 8: Liquidation intensity (stub, needs calibration)
+    liquidation_score = 0
+
+    # ── Final Score ──────────────────────────────────────────────────────
+    total_score = (regime_score + wall_migration_score + compression_score
+                   + etf_flow_score + venue_score
+                   + funding_score + oi_score + liquidation_score)
+    total_score = max(-100, min(100, total_score))
+
+    # ── Score History ────────────────────────────────────────────────────
+    score_history = _compute_score_history(conn, ticker, days)
+
+    # ── Structural entry / invalidation ──────────────────────────────────
+    structural_entry = None
+    invalidation = None
+    if abs(total_score) > 50:
+        if total_score > 50 and wall_history:
+            pw = wall_history[-1]['put_wall']
+            structural_entry = f'${pw:,.0f} zone (31-45d put wall convergence)'
+            invalidation = f'Below ${pw * 0.97:,.0f} (new low below structural floor)'
+        elif total_score < -50 and wall_history:
+            cw = wall_history[-1]['call_wall']
+            structural_entry = f'${cw:,.0f} zone (31-45d call wall convergence)'
+            invalidation = f'Above ${cw * 1.03:,.0f} (new high above structural ceiling)'
+
+    return {
+        'score': total_score,
+        'bias': 'BOTTOMING' if total_score > 30 else 'TOPPING' if total_score < -30 else 'NEUTRAL',
+        'swing_signal': total_score > 50 or total_score < -50,
+        'high_conviction': abs(total_score) > 75,
+        'signals': {
+            'regime_persistence': {'score': regime_score, 'max': 12, 'detail': regime_detail},
+            'wall_migration': {'score': wall_migration_score, 'max': 12, 'detail': wall_detail},
+            'range_compression': {'score': compression_score, 'max': 12, 'detail': compression_detail},
+            'etf_flow_momentum': {'score': etf_flow_score, 'max': 12, 'detail': flow_detail},
+            'venue_convergence': {'score': venue_score, 'max': 12, 'detail': venue_detail},
+            'funding_rate': {'score': funding_score, 'max': 13, 'detail': funding_detail, 'source': 'coinglass'},
+            'aggregate_oi': {'score': oi_score, 'max': 13, 'detail': oi_detail, 'source': 'coinglass'},
+            'liquidation': {'score': liquidation_score, 'max': 1, 'detail': 'stub', 'source': 'coinglass'},
+        },
+        'history': {
+            'wall_migration': wall_history,
+            'regime_history': regime_history,
+            'etf_flows': flow_history,
+            'funding_rates': funding_history,
+            'oi_history': oi_hist,
+            'score_components_daily': score_history,
+        },
+        'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
+        'structural_entry': structural_entry,
+        'invalidation': invalidation,
+        'timestamp': datetime.now().isoformat(),
+        'data_freshness': _get_data_freshness(c, ticker),
+    }
+
+
+def _get_data_freshness(c, ticker):
+    """Extract IBIT/Deribit data freshness from the latest data_cache entry."""
+    row = c.execute(
+        'SELECT data_json FROM data_cache WHERE ticker=? ORDER BY date DESC LIMIT 1',
+        (ticker,)
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        d = json.loads(row[0])
+        return d.get('data_freshness')
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 class _FarsideTableParser(HTMLParser):
     """Parse the Farside Investors BTC ETF flow HTML table."""
     def __init__(self):
@@ -986,6 +1686,112 @@ def fetch_farside_flows():
         'shares_outstanding': None,
         'total_btc_etf_flow': float(total_btc_etf_flow),
     }
+
+
+# ── COINGLASS: Aggregate funding rates & OI ─────────────────────────────────
+_coinglass_lock = threading.Lock()
+COINGLASS_BASE_URL = 'https://open-api-v4.coinglass.com/api'
+
+
+def fetch_coinglass_data():
+    """Fetch aggregate funding rate and OI from Coinglass API.
+    Stores daily snapshots in coinglass_data table. Graceful degradation if no API key."""
+    api_key = os.environ.get('COINGLASS_API_KEY')
+    if not api_key:
+        return  # Graceful - Phase 2 signals just return 0
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    with _coinglass_lock:
+        conn = get_db()
+        c = conn.cursor()
+
+        try:
+            # Skip if already fetched today
+            existing = c.execute(
+                'SELECT 1 FROM coinglass_data WHERE date=? AND symbol=? AND metric=? LIMIT 1',
+                (today, 'BTC', 'avg_funding_rate')
+            ).fetchone()
+            if existing:
+                conn.close()
+                return
+
+            headers = {'accept': 'application/json', 'CG-API-KEY': api_key}
+
+            # ── Endpoint 1: OI-Weighted Average Funding Rate ────────────
+            try:
+                url_fr = (
+                    f'{COINGLASS_BASE_URL}/futures/funding-rate/'
+                    f'oi-weight-history?symbol=BTC&interval=h8&limit=90'
+                )
+                req = urllib.request.Request(url_fr, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    # Group 8-hour data points by date and compute daily averages
+                    daily_rates = {}
+                    for pt in body['data']:
+                        ts = pt.get('time', 0)
+                        rate = pt.get('close')
+                        if rate is None:
+                            continue
+                        # Timestamp is in milliseconds
+                        day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                        daily_rates.setdefault(day, []).append(float(rate))
+
+                    for day, rates in daily_rates.items():
+                        avg_rate = sum(rates) / len(rates)
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (day, 'BTC', 'avg_funding_rate', avg_rate,
+                             json.dumps({'samples': len(rates)}))
+                        )
+                    log.info(f"[coinglass] Stored funding rates for {len(daily_rates)} days")
+                else:
+                    log.warning(f"[coinglass] Funding rate response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] Funding rate fetch failed: {e}")
+
+            # ── Endpoint 2: Aggregated Open Interest History ────────────
+            try:
+                url_oi = (
+                    f'{COINGLASS_BASE_URL}/futures/open-interest/'
+                    f'aggregated-history?symbol=BTC&interval=1d&limit=90'
+                )
+                req = urllib.request.Request(url_oi, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    count = 0
+                    for pt in body['data']:
+                        ts = pt.get('time', 0)
+                        oi_val = pt.get('close')
+                        if oi_val is None:
+                            continue
+                        day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (day, 'BTC', 'total_oi_usd', float(oi_val), None)
+                        )
+                        count += 1
+                    log.info(f"[coinglass] Stored OI data for {count} days")
+                else:
+                    log.warning(f"[coinglass] OI response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] OI fetch failed: {e}")
+
+            conn.commit()
+
+        except Exception as e:
+            log.warning(f"[coinglass] Unexpected error: {e}")
+        finally:
+            conn.close()
 
 
 def fetch_deribit_options(min_dte=0, max_dte=7):
@@ -2421,6 +3227,12 @@ def _bg_refresh():
     except Exception as e:
         log.error(f"[bg-refresh] Farside flow fetch error: {e}")
 
+    # Phase 0b: Fetch Coinglass data (funding rates, aggregate OI)
+    try:
+        fetch_coinglass_data()
+    except Exception as e:
+        log.error(f"[bg-refresh] Coinglass data fetch error: {e}")
+
     # Phase 1: Backfill candles for all tickers
     for tk, cfg in TICKER_CONFIG.items():
         symbol = cfg['binance_symbol']
@@ -3305,6 +4117,25 @@ def run_analysis(ticker='IBIT', save=True):
     summaries['_history_trends'] = history_trends
     if structure_trends:
         summaries['_structure_trends'] = structure_trends
+
+    # Macro regime score
+    try:
+        macro_conn = get_db()
+        macro = compute_macro_regime(macro_conn, ticker)
+        macro_conn.close()
+        summaries['_macro_regime'] = {
+            'score': macro['score'],
+            'bias': macro['bias'],
+            'swing_signal': macro['swing_signal'],
+            'high_conviction': macro['high_conviction'],
+            'signals': macro['signals'],
+            'structural_entry': macro.get('structural_entry'),
+            'invalidation': macro.get('invalidation'),
+            'coinglass_available': macro['coinglass_available'],
+        }
+    except Exception as e:
+        log.warning(f"[analysis] Macro regime computation failed: {e}")
+
     for label, min_d, max_d in dtes:
         d = results[label]
         bps = d['btc_per_share']
@@ -3646,6 +4477,24 @@ If a previous analysis is provided, use it to:
 - Update your thesis based on how positioning evolved
 - Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
 
+MACRO REGIME SCORE (when present):
+_macro_regime contains the swing-trade regime score from -100 (topping) to +100 (bottoming).
+
+Score interpretation:
+- Score > 50 (SWING LONG): Bottoming conditions. Bias toward long setups at structural support.
+- Score < -50 (SWING SHORT): Topping conditions. Bias toward short setups at structural resistance.
+- Score -50 to +50 (NEUTRAL): No macro edge. Stick to tactical range-trading.
+- |Score| > 75 (HIGH CONVICTION): Strong directional bias. Mention structural_entry and invalidation.
+
+Key combinations:
+- regime_persistence + funding_rate agree -> strongest signal
+- wall_migration disagrees with regime_persistence -> flag conflict
+- aggregate_oi flush + negative funding -> textbook capitulation
+- aggregate_oi at peak + positive funding -> textbook crowded top
+
+Do NOT override tactical analysis with macro score. A macro bottom doesn't mean "buy today" -- it means "the structural floor is forming, look for tactical entry near that floor."
+When swing_signal is true, include structural_entry and invalidation in TRADE PLAN as a SWING SETUP.
+
 For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
 - Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful. If a delta flip DISAPPEARS in a longer window, that's a structural shift — call it out.
 - Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
@@ -3917,6 +4766,20 @@ def api_accuracy():
         'expiry_history': expiry_convergence,
         'recent': recent,
     }), mimetype='application/json')
+
+
+@app.route('/api/macro-regime')
+def api_macro_regime():
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    conn = get_db()
+    result = compute_macro_regime(conn, ticker)
+    conn.close()
+    return Response(json.dumps(result, cls=NumpyEncoder), mimetype='application/json')
+
+
+@app.route('/macro')
+def macro_page():
+    return render_template('macro.html')
 
 
 if __name__ == '__main__':
