@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Macro Regime Analysis</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #06080c;
+  --bg2: #0b0e14;
+  --bg3: #10141c;
+  --bg4: #161b26;
+  --border: #1c2230;
+  --border2: #262e3e;
+  --t1: #dce0e8;
+  --t2: #8892a4;
+  --t3: #4a5568;
+  --green: #00dc82;
+  --green2: #00b86b;
+  --green-bg: rgba(0,220,130,0.07);
+  --green-bd: rgba(0,220,130,0.20);
+  --red: #ff4060;
+  --red2: #d63050;
+  --red-bg: rgba(255,64,96,0.07);
+  --red-bd: rgba(255,64,96,0.20);
+  --amber: #ffb020;
+  --amber-bg: rgba(255,176,32,0.07);
+  --blue: #3890ff;
+  --blue-bg: rgba(56,144,255,0.06);
+  --purple: #a78bfa;
+  --mono: 'IBM Plex Mono', 'Consolas', monospace;
+  --sans: 'Outfit', system-ui, sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{height:100%}
+body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px;line-height:1.4;min-height:100%;overflow-y:auto;overflow-x:hidden;
+  scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+body::-webkit-scrollbar{width:6px}
+body::-webkit-scrollbar-track{background:transparent}
+body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+/* LOADING */
+#loading{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:9999;transition:opacity .3s,visibility .3s}
+#loading.hidden{opacity:0;visibility:hidden;pointer-events:none}
+.spin{width:24px;height:24px;border:2px solid var(--border2);border-top-color:var(--blue);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+#loading .lt{color:var(--t3);font-size:11px;letter-spacing:.5px}
+
+/* HEADER */
+.hdr{height:48px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:16px;flex-shrink:0;position:sticky;top:0;z-index:100}
+.hdr-back{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.5px;color:var(--t3);text-decoration:none;transition:color .15s;display:flex;align-items:center;gap:4px}
+.hdr-back:hover{color:var(--blue)}
+.hdr-sep{width:1px;height:22px;background:var(--border2)}
+.hdr-title{font-family:var(--sans);font-weight:800;font-size:15px;letter-spacing:-.3px;color:var(--t1)}
+.hdr-tabs{display:flex;gap:2px;background:var(--bg3);border-radius:3px;padding:2px}
+.hdr-tab{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.5px;padding:3px 12px;border-radius:2px;border:none;background:none;color:var(--t3);cursor:pointer;transition:all .15s}
+.hdr-tab:hover{color:var(--t2)}
+.hdr-tab.active{background:var(--blue);color:var(--bg)}
+.hdr-score{display:flex;align-items:center;gap:10px;margin-left:8px}
+.hdr-score-num{font-family:var(--sans);font-size:48px;font-weight:800;letter-spacing:-2px;line-height:1}
+.hdr-bias{font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:3px 10px;border-radius:3px}
+.bias-bottoming{background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)}
+.bias-topping{background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)}
+.bias-neutral{background:var(--bg3);color:var(--t3);border:1px solid var(--border)}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:12px}
+.hdr-ts{color:var(--t3);font-size:10px}
+
+/* CONTAINER */
+.container{max-width:1600px;margin:0 auto;padding:16px 20px 40px}
+
+/* GAUGE */
+.gauge-section{background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:16px 20px;margin-bottom:16px}
+.gauge-labels{display:flex;justify-content:space-between;font-size:9px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;margin-bottom:8px}
+.gauge-labels .lbl-short{color:var(--red)}
+.gauge-labels .lbl-neutral{color:var(--t3)}
+.gauge-labels .lbl-long{color:var(--green)}
+.gauge-track{position:relative;height:28px;border-radius:4px;background:linear-gradient(90deg,
+  #7f1d1d 0%,
+  var(--red) 20%,
+  var(--red2) 30%,
+  var(--t3) 45%,
+  var(--t3) 55%,
+  var(--green2) 70%,
+  var(--green) 80%,
+  #065f46 100%
+);overflow:visible}
+.gauge-marker{position:absolute;top:-6px;width:3px;height:40px;background:var(--t1);border-radius:2px;transform:translateX(-50%);transition:left .5s ease;box-shadow:0 0 8px rgba(255,255,255,0.3)}
+.gauge-marker::after{content:'';position:absolute;bottom:-6px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-top:6px solid var(--t1)}
+.gauge-ticks{display:flex;justify-content:space-between;margin-top:6px;font-size:9px;color:var(--t3);font-weight:500}
+.gauge-swing-info{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;gap:20px;font-size:10px}
+.gauge-swing-info .si-label{color:var(--t3);margin-right:6px}
+.gauge-swing-info .si-value{font-weight:600}
+
+/* SIGNAL TABLE */
+.signals-section{background:var(--bg2);border:1px solid var(--border);border-radius:4px;margin-bottom:16px;overflow:hidden}
+.signals-title{font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--t3);padding:12px 16px 8px;border-bottom:1px solid var(--border)}
+.signal-row{display:grid;grid-template-columns:200px 60px 50px 1fr 1fr;gap:12px;align-items:center;padding:8px 16px;border-bottom:1px solid rgba(28,34,48,0.5);font-size:11px;transition:background .15s}
+.signal-row:last-child{border-bottom:none}
+.signal-row:hover{background:var(--bg3)}
+.signal-name{font-weight:600;display:flex;align-items:center;gap:8px}
+.signal-badge{font-size:8px;font-weight:700;letter-spacing:.5px;padding:1px 5px;border-radius:2px;background:var(--purple);color:var(--bg);opacity:.8}
+.signal-score{font-weight:700;font-family:var(--sans);font-size:13px}
+.signal-max{color:var(--t3);font-size:10px}
+.signal-bar{position:relative;height:14px;background:var(--bg3);border-radius:2px;overflow:hidden}
+.signal-bar-fill{position:absolute;top:0;height:100%;border-radius:2px;transition:width .5s ease,left .5s ease}
+.signal-bar-center{position:absolute;top:0;left:50%;width:1px;height:100%;background:var(--t3);opacity:.4}
+.signal-detail{color:var(--t2);font-size:10px;line-height:1.4}
+.signal-dimmed{opacity:.35}
+.signal-dimmed .signal-detail{color:var(--t3);font-style:italic}
+
+/* CHART GRID */
+.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.chart-card{background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:12px 16px;height:320px;display:flex;flex-direction:column}
+.chart-card-title{font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:8px;flex-shrink:0;display:flex;align-items:center;gap:6px}
+.chart-card-title::before{content:'';display:inline-block;width:6px;height:6px;border-radius:1px}
+.chart-card:nth-child(1) .chart-card-title::before{background:var(--blue)}
+.chart-card:nth-child(2) .chart-card-title::before{background:var(--amber)}
+.chart-card:nth-child(3) .chart-card-title::before{background:var(--green)}
+.chart-card:nth-child(4) .chart-card-title::before{background:var(--green2)}
+.chart-card:nth-child(5) .chart-card-title::before{background:var(--purple)}
+.chart-card:nth-child(6) .chart-card-title::before{background:var(--red)}
+.chart-wrap{position:relative;flex:1;min-height:0}
+.chart-wrap canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
+.chart-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:11px;font-style:italic;background:var(--bg3);border-radius:3px;padding:20px;text-align:center;line-height:1.6}
+
+/* SWING BOX */
+.swing-box{border-radius:4px;padding:16px 20px;margin-bottom:16px;display:none}
+.swing-box.visible{display:block}
+.swing-box.swing-long{background:var(--green-bg);border:2px solid var(--green-bd)}
+.swing-box.swing-short{background:var(--red-bg);border:2px solid var(--red-bd)}
+.swing-direction{font-family:var(--sans);font-size:22px;font-weight:800;letter-spacing:-.5px;margin-bottom:6px}
+.swing-long .swing-direction{color:var(--green)}
+.swing-short .swing-direction{color:var(--red)}
+.swing-conviction{font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;margin-bottom:10px;padding:2px 8px;border-radius:2px;display:inline-block}
+.swing-long .swing-conviction{background:rgba(0,220,130,0.15);color:var(--green)}
+.swing-short .swing-conviction{background:rgba(255,64,96,0.15);color:var(--red)}
+.swing-levels{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}
+.swing-level{font-size:11px}
+.swing-level .sl-label{color:var(--t3);font-size:9px;font-weight:600;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+.swing-level .sl-val{font-weight:600;font-size:13px}
+
+/* RESPONSIVE */
+@media(max-width:1000px){
+  .charts-grid{grid-template-columns:1fr}
+  .signal-row{grid-template-columns:150px 50px 40px 100px 1fr;gap:8px;font-size:10px}
+  .hdr{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px}
+  .hdr-score-num{font-size:36px}
+}
+@media(max-width:700px){
+  .signal-row{grid-template-columns:1fr;gap:4px}
+  .signal-bar{max-width:200px}
+  .hdr-score-num{font-size:28px}
+  .container{padding:10px}
+}
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="spin"></div>
+  <div class="lt">LOADING MACRO REGIME</div>
+</div>
+
+<!-- HEADER -->
+<div class="hdr">
+  <a href="/" class="hdr-back">&larr; BACK TO DASHBOARD</a>
+  <div class="hdr-sep"></div>
+  <div class="hdr-title">MACRO REGIME</div>
+  <div class="hdr-sep"></div>
+  <div class="hdr-tabs">
+    <button class="hdr-tab active" data-ticker="IBIT" onclick="switchTicker('IBIT')">IBIT</button>
+    <button class="hdr-tab" data-ticker="ETHA" onclick="switchTicker('ETHA')">ETHA</button>
+  </div>
+  <div class="hdr-score">
+    <span id="score-num" class="hdr-score-num" style="color:var(--t3)">--</span>
+    <span id="score-bias" class="hdr-bias bias-neutral">--</span>
+  </div>
+  <div class="hdr-right">
+    <span id="hdr-freshness" class="hdr-ts"></span>
+    <span id="hdr-ts" class="hdr-ts">--</span>
+  </div>
+</div>
+
+<!-- MAIN CONTENT -->
+<div class="container">
+
+  <!-- SCORE GAUGE -->
+  <div class="gauge-section">
+    <div class="gauge-labels">
+      <span class="lbl-short">SWING SHORT</span>
+      <span class="lbl-neutral">NEUTRAL</span>
+      <span class="lbl-long">SWING LONG</span>
+    </div>
+    <div class="gauge-track">
+      <div id="gauge-marker" class="gauge-marker" style="left:50%"></div>
+    </div>
+    <div class="gauge-ticks">
+      <span>-100</span>
+      <span>-75</span>
+      <span>-50</span>
+      <span>-25</span>
+      <span>0</span>
+      <span>+25</span>
+      <span>+50</span>
+      <span>+75</span>
+      <span>+100</span>
+    </div>
+    <div id="gauge-swing-info" class="gauge-swing-info" style="display:none">
+      <div><span class="si-label">Entry:</span><span id="si-entry" class="si-value">--</span></div>
+      <div><span class="si-label">Invalidation:</span><span id="si-invalidation" class="si-value">--</span></div>
+    </div>
+  </div>
+
+  <!-- SIGNAL BREAKDOWN -->
+  <div class="signals-section">
+    <div class="signals-title">Signal Breakdown</div>
+    <div id="signals-table"></div>
+  </div>
+
+  <!-- CHARTS -->
+  <div class="charts-grid">
+    <div class="chart-card">
+      <div class="chart-card-title">Macro Score Over Time</div>
+      <div class="chart-wrap"><canvas id="chart-score"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">Regime History</div>
+      <div class="chart-wrap"><canvas id="chart-regime"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">Structural Wall Migration</div>
+      <div class="chart-wrap"><canvas id="chart-walls"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">ETF Flows</div>
+      <div class="chart-wrap"><canvas id="chart-flows"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">Aggregate Funding Rate</div>
+      <div id="chart-funding-wrap" class="chart-wrap"><canvas id="chart-funding"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">Aggregate Open Interest</div>
+      <div id="chart-oi-wrap" class="chart-wrap"><canvas id="chart-oi"></canvas></div>
+    </div>
+  </div>
+
+  <!-- SWING SETUP BOX -->
+  <div id="swing-box" class="swing-box">
+    <div id="swing-direction" class="swing-direction"></div>
+    <div id="swing-conviction" class="swing-conviction"></div>
+    <div class="swing-levels">
+      <div class="swing-level">
+        <div class="sl-label">Structural Entry</div>
+        <div id="swing-entry" class="sl-val">--</div>
+      </div>
+      <div class="swing-level">
+        <div class="sl-label">Invalidation</div>
+        <div id="swing-invalidation" class="sl-val">--</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ── State ─────────────────────────────────────────────────────────────── */
+let currentTicker = 'IBIT';
+let refreshTimer = null;
+const charts = {};
+
+const SIGNAL_NAMES = {
+  regime_persistence: 'Regime Persistence',
+  wall_migration: 'Wall Migration',
+  range_compression: 'Range Compression',
+  etf_flow_momentum: 'ETF Flow Momentum',
+  venue_convergence: 'Venue Convergence',
+  funding_rate: 'Funding Rate',
+  aggregate_oi: 'Aggregate OI',
+  liquidation: 'Liquidation Intensity',
+};
+
+/* ── Helpers ───────────────────────────────────────────────────────────── */
+function scoreColor(score) {
+  if (score > 30) return 'var(--green)';
+  if (score < -30) return 'var(--red)';
+  return 'var(--t3)';
+}
+
+function biasClass(bias) {
+  if (bias === 'BOTTOMING') return 'bias-bottoming';
+  if (bias === 'TOPPING') return 'bias-topping';
+  return 'bias-neutral';
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  const parts = d.split('-');
+  if (parts.length === 3) return parts[1] + '/' + parts[2];
+  return d;
+}
+
+function destroyChart(key) {
+  if (charts[key]) { charts[key].destroy(); charts[key] = null; }
+}
+
+function chartDefaults() {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 400 },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: '#10141c',
+        borderColor: '#262e3e',
+        borderWidth: 1,
+        titleFont: { family: "'IBM Plex Mono', monospace", size: 10 },
+        bodyFont: { family: "'IBM Plex Mono', monospace", size: 10 },
+        padding: 8,
+      }
+    },
+    scales: {
+      x: {
+        ticks: { color: '#4a5568', font: { family: "'IBM Plex Mono', monospace", size: 9 }, maxRotation: 0, maxTicksLimit: 8 },
+        grid: { color: 'rgba(28,34,48,0.6)', drawBorder: false },
+      },
+      y: {
+        ticks: { color: '#4a5568', font: { family: "'IBM Plex Mono', monospace", size: 9 } },
+        grid: { color: 'rgba(28,34,48,0.6)', drawBorder: false },
+      }
+    }
+  };
+}
+
+/* ── Ticker Switching ──────────────────────────────────────────────────── */
+function switchTicker(tk) {
+  if (tk === currentTicker) return;
+  currentTicker = tk;
+  document.querySelectorAll('.hdr-tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.ticker === tk)
+  );
+  loadData();
+}
+
+/* ── Update Header ─────────────────────────────────────────────────────── */
+function updateHeader(data) {
+  const scoreEl = document.getElementById('score-num');
+  const biasEl = document.getElementById('score-bias');
+  const tsEl = document.getElementById('hdr-ts');
+
+  scoreEl.textContent = data.score != null ? (data.score > 0 ? '+' : '') + data.score : '--';
+  scoreEl.style.color = scoreColor(data.score || 0);
+  biasEl.textContent = data.bias || '--';
+  biasEl.className = 'hdr-bias ' + biasClass(data.bias);
+
+  if (data.timestamp) {
+    const d = new Date(data.timestamp);
+    tsEl.textContent = d.toLocaleString();
+  }
+
+  const freshEl = document.getElementById('hdr-freshness');
+  const fr = data.data_freshness;
+  if (fr) {
+    const parts = [];
+    if (fr.ibit) parts.push(`IBIT ${fr.ibit.as_of || '?'}`);
+    if (fr.deribit) parts.push(`DERIBIT ${fr.deribit.as_of || '?'}`);
+    freshEl.textContent = parts.join('  ·  ');
+  } else {
+    freshEl.textContent = '';
+  }
+}
+
+/* ── Update Gauge ──────────────────────────────────────────────────────── */
+function updateGauge(data) {
+  const marker = document.getElementById('gauge-marker');
+  const pct = ((data.score || 0) + 100) / 200 * 100;
+  marker.style.left = Math.max(1, Math.min(99, pct)) + '%';
+
+  const swingInfo = document.getElementById('gauge-swing-info');
+  if (data.swing_signal && (data.structural_entry || data.invalidation)) {
+    swingInfo.style.display = 'flex';
+    document.getElementById('si-entry').textContent = data.structural_entry || '--';
+    document.getElementById('si-invalidation').textContent = data.invalidation || '--';
+  } else {
+    swingInfo.style.display = 'none';
+  }
+}
+
+/* ── Update Signal Table ───────────────────────────────────────────────── */
+function updateSignals(data) {
+  const container = document.getElementById('signals-table');
+  container.innerHTML = '';
+
+  if (!data.signals) return;
+
+  const keys = Object.keys(data.signals);
+  keys.forEach(key => {
+    const sig = data.signals[key];
+    const isCoinglass = sig.source === 'coinglass';
+    const dimmed = isCoinglass && !data.coinglass_available;
+
+    const row = document.createElement('div');
+    row.className = 'signal-row' + (dimmed ? ' signal-dimmed' : '');
+
+    // Name
+    const nameEl = document.createElement('div');
+    nameEl.className = 'signal-name';
+    nameEl.textContent = SIGNAL_NAMES[key] || key;
+    if (isCoinglass && data.coinglass_available) {
+      const badge = document.createElement('span');
+      badge.className = 'signal-badge';
+      badge.textContent = 'COINGLASS';
+      nameEl.appendChild(badge);
+    }
+    row.appendChild(nameEl);
+
+    // Score
+    const scoreEl = document.createElement('div');
+    scoreEl.className = 'signal-score';
+    const sc = sig.score || 0;
+    scoreEl.textContent = (sc > 0 ? '+' : '') + sc;
+    scoreEl.style.color = sc > 0 ? 'var(--green)' : sc < 0 ? 'var(--red)' : 'var(--t3)';
+    row.appendChild(scoreEl);
+
+    // Max
+    const maxEl = document.createElement('div');
+    maxEl.className = 'signal-max';
+    maxEl.textContent = '\u00B1' + (sig.max || 0);
+    row.appendChild(maxEl);
+
+    // Bar
+    const barWrap = document.createElement('div');
+    barWrap.className = 'signal-bar';
+    const center = document.createElement('div');
+    center.className = 'signal-bar-center';
+    barWrap.appendChild(center);
+
+    const fill = document.createElement('div');
+    fill.className = 'signal-bar-fill';
+    const maxVal = sig.max || 12;
+    const pct = Math.abs(sc) / maxVal * 50;
+    if (sc > 0) {
+      fill.style.left = '50%';
+      fill.style.width = Math.min(pct, 50) + '%';
+      fill.style.background = 'var(--green)';
+    } else if (sc < 0) {
+      fill.style.width = Math.min(pct, 50) + '%';
+      fill.style.left = (50 - Math.min(pct, 50)) + '%';
+      fill.style.background = 'var(--red)';
+    } else {
+      fill.style.left = '50%';
+      fill.style.width = '0%';
+    }
+    fill.style.opacity = '0.6';
+    barWrap.appendChild(fill);
+    row.appendChild(barWrap);
+
+    // Detail
+    const detailEl = document.createElement('div');
+    detailEl.className = 'signal-detail';
+    if (dimmed) {
+      detailEl.textContent = 'API key required';
+    } else {
+      detailEl.textContent = sig.detail || '--';
+    }
+    row.appendChild(detailEl);
+
+    container.appendChild(row);
+  });
+}
+
+/* ── Chart 1: Macro Score Over Time ────────────────────────────────────── */
+function renderScoreChart(history) {
+  destroyChart('score');
+  const canvas = document.getElementById('chart-score');
+  const data = history.score_components_daily || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const scores = data.map(d => d.total_score);
+
+  const opts = chartDefaults();
+  opts.scales.y.min = -100;
+  opts.scales.y.max = 100;
+  opts.plugins.annotation = undefined;
+
+  charts.score = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Macro Score',
+          data: scores,
+          borderColor: '#3890ff',
+          backgroundColor: 'rgba(56,144,255,0.08)',
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          fill: false,
+          tension: 0.3,
+        },
+        {
+          label: '+50 zone',
+          data: labels.map(() => 50),
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(0,220,130,0.06)',
+          fill: { target: { value: 100 } },
+          pointRadius: 0,
+          borderWidth: 0,
+        },
+        {
+          label: '-50 zone',
+          data: labels.map(() => -50),
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(255,64,96,0.06)',
+          fill: { target: { value: -100 } },
+          pointRadius: 0,
+          borderWidth: 0,
+        },
+      ]
+    },
+    options: opts
+  });
+}
+
+/* ── Chart 2: Regime History ───────────────────────────────────────────── */
+function renderRegimeChart(history) {
+  destroyChart('regime');
+  const canvas = document.getElementById('chart-regime');
+  const data = history.regime_history || [];
+  if (!data.length) return;
+
+  // Data comes newest-first; reverse for chart display
+  const sorted = [...data].reverse();
+  const labels = sorted.map(d => fmtDate(d.date));
+  const colors = sorted.map(d => d.regime === 'negative_gamma' ? 'rgba(255,64,96,0.7)' : 'rgba(0,220,130,0.7)');
+  const values = sorted.map(d => d.regime === 'negative_gamma' ? -1 : 1);
+
+  const opts = chartDefaults();
+  opts.scales.y.display = false;
+
+  charts.regime = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Regime',
+        data: values,
+        backgroundColor: colors,
+        borderRadius: 2,
+        barPercentage: 0.9,
+        categoryPercentage: 0.9,
+      }]
+    },
+    options: opts
+  });
+}
+
+/* ── Chart 3: Structural Wall Migration ────────────────────────────────── */
+function renderWallsChart(history) {
+  destroyChart('walls');
+  const canvas = document.getElementById('chart-walls');
+  const data = history.wall_migration || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const putWalls = data.map(d => d.put_wall);
+  const callWalls = data.map(d => d.call_wall);
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => '$' + (v / 1000).toFixed(0) + 'k'
+  };
+
+  charts.walls = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Put Wall',
+          data: putWalls,
+          borderColor: '#00dc82',
+          backgroundColor: 'rgba(0,220,130,0.08)',
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          tension: 0.3,
+        },
+        {
+          label: 'Call Wall',
+          data: callWalls,
+          borderColor: '#ff4060',
+          backgroundColor: 'rgba(255,64,96,0.08)',
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          tension: 0.3,
+        }
+      ]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: '#4a5568',
+            font: { family: "'IBM Plex Mono', monospace", size: 9 },
+            boxWidth: 12,
+            boxHeight: 2,
+            padding: 12,
+          }
+        }
+      }
+    }
+  });
+}
+
+/* ── Chart 4: ETF Flows ────────────────────────────────────────────────── */
+function renderFlowsChart(history) {
+  destroyChart('flows');
+  const canvas = document.getElementById('chart-flows');
+  const data = history.etf_flows || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const dailyFlow = data.map(d => {
+    const v = d.total_flow != null ? d.total_flow : d.ibit_flow;
+    return (v || 0) / 1e6;
+  });
+  const cumulative = data.map(d => d.cumulative_10d != null ? d.cumulative_10d / 1e6 : null);
+  const barColors = dailyFlow.map(v => v >= 0 ? 'rgba(0,220,130,0.6)' : 'rgba(255,64,96,0.6)');
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => '$' + v.toFixed(0) + 'M'
+  };
+  opts.scales.y2 = {
+    position: 'right',
+    ticks: { color: '#4a5568', font: { family: "'IBM Plex Mono', monospace", size: 9 }, callback: v => '$' + v.toFixed(0) + 'M' },
+    grid: { display: false },
+  };
+
+  charts.flows = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          type: 'bar',
+          label: 'Daily Flow',
+          data: dailyFlow,
+          backgroundColor: barColors,
+          borderRadius: 2,
+          barPercentage: 0.8,
+          yAxisID: 'y',
+          order: 2,
+        },
+        {
+          type: 'line',
+          label: 'Cumulative 10d',
+          data: cumulative,
+          borderColor: '#3890ff',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+          yAxisID: 'y2',
+          order: 1,
+        }
+      ]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: '#4a5568',
+            font: { family: "'IBM Plex Mono', monospace", size: 9 },
+            boxWidth: 12,
+            boxHeight: 2,
+            padding: 12,
+          }
+        }
+      }
+    }
+  });
+}
+
+/* ── Chart 5: Funding Rate ─────────────────────────────────────────────── */
+function renderFundingChart(history, coinglassAvailable) {
+  destroyChart('funding');
+  const wrap = document.getElementById('chart-funding-wrap');
+  const canvas = document.getElementById('chart-funding');
+
+  if (!coinglassAvailable) {
+    canvas.style.display = 'none';
+    let ph = wrap.querySelector('.chart-placeholder');
+    if (!ph) {
+      ph = document.createElement('div');
+      ph.className = 'chart-placeholder';
+      wrap.appendChild(ph);
+    }
+    ph.textContent = 'Add COINGLASS_API_KEY to enable funding rate data';
+    return;
+  }
+
+  canvas.style.display = '';
+  const ph = wrap.querySelector('.chart-placeholder');
+  if (ph) ph.remove();
+
+  const data = history.funding_rates || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const rates = data.map(d => d.rate * 100);
+  const avg7d = data.map(d => d.avg_7d != null ? d.avg_7d * 100 : null);
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => v.toFixed(3) + '%'
+  };
+
+  charts.funding = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Daily Rate',
+          data: rates,
+          borderColor: '#a78bfa',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          tension: 0.3,
+        },
+        {
+          label: '7d MA',
+          data: avg7d,
+          borderColor: 'rgba(167,139,250,0.4)',
+          borderWidth: 1.5,
+          borderDash: [4, 3],
+          pointRadius: 0,
+          tension: 0.3,
+        }
+      ]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: '#4a5568',
+            font: { family: "'IBM Plex Mono', monospace", size: 9 },
+            boxWidth: 12,
+            boxHeight: 2,
+            padding: 12,
+          }
+        }
+      }
+    }
+  });
+}
+
+/* ── Chart 6: Aggregate OI ─────────────────────────────────────────────── */
+function renderOIChart(history, coinglassAvailable) {
+  destroyChart('oi');
+  const wrap = document.getElementById('chart-oi-wrap');
+  const canvas = document.getElementById('chart-oi');
+
+  if (!coinglassAvailable) {
+    canvas.style.display = 'none';
+    let ph = wrap.querySelector('.chart-placeholder');
+    if (!ph) {
+      ph = document.createElement('div');
+      ph.className = 'chart-placeholder';
+      wrap.appendChild(ph);
+    }
+    ph.textContent = 'Add COINGLASS_API_KEY to enable open interest data';
+    return;
+  }
+
+  canvas.style.display = '';
+  const ph = wrap.querySelector('.chart-placeholder');
+  if (ph) ph.remove();
+
+  const data = history.oi_history || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const oi = data.map(d => d.oi_usd / 1e9);
+  const peak = Math.max(...oi);
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => '$' + v.toFixed(1) + 'B'
+  };
+
+  charts.oi = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Total OI',
+          data: oi,
+          borderColor: '#ff4060',
+          backgroundColor: 'rgba(255,64,96,0.06)',
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          fill: true,
+          tension: 0.3,
+        },
+        {
+          label: '90d Peak',
+          data: labels.map(() => peak),
+          borderColor: 'rgba(255,64,96,0.3)',
+          borderWidth: 1,
+          borderDash: [6, 4],
+          pointRadius: 0,
+          fill: false,
+        }
+      ]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        legend: {
+          display: true,
+          position: 'top',
+          align: 'end',
+          labels: {
+            color: '#4a5568',
+            font: { family: "'IBM Plex Mono', monospace", size: 9 },
+            boxWidth: 12,
+            boxHeight: 2,
+            padding: 12,
+          }
+        }
+      }
+    }
+  });
+}
+
+/* ── Update Swing Box ──────────────────────────────────────────────────── */
+function updateSwingBox(data) {
+  const box = document.getElementById('swing-box');
+  if (!data.swing_signal) {
+    box.classList.remove('visible');
+    return;
+  }
+
+  const isLong = data.score > 0;
+  box.className = 'swing-box visible ' + (isLong ? 'swing-long' : 'swing-short');
+
+  document.getElementById('swing-direction').textContent =
+    isLong ? 'SWING LONG' : 'SWING SHORT';
+
+  document.getElementById('swing-conviction').textContent =
+    data.high_conviction ? 'HIGH CONVICTION' : 'STANDARD';
+
+  document.getElementById('swing-entry').textContent =
+    data.structural_entry || '--';
+  document.getElementById('swing-invalidation').textContent =
+    data.invalidation || '--';
+}
+
+/* ── Load Data ─────────────────────────────────────────────────────────── */
+async function loadData() {
+  try {
+    const resp = await fetch('/api/macro-regime?ticker=' + currentTicker);
+    if (!resp.ok) throw new Error('API returned ' + resp.status);
+    const data = await resp.json();
+
+    updateHeader(data);
+    updateGauge(data);
+    updateSignals(data);
+    updateSwingBox(data);
+
+    const history = data.history || {};
+    renderScoreChart(history);
+    renderRegimeChart(history);
+    renderWallsChart(history);
+    renderFlowsChart(history);
+    renderFundingChart(history, data.coinglass_available);
+    renderOIChart(history, data.coinglass_available);
+
+    document.getElementById('loading').classList.add('hidden');
+  } catch (e) {
+    console.error('Failed to load macro data:', e);
+    document.getElementById('loading').classList.add('hidden');
+  }
+}
+
+/* ── Init ──────────────────────────────────────────────────────────────── */
+loadData();
+refreshTimer = setInterval(loadData, 5 * 60 * 1000);
+</script>
+</body>
+</html>
