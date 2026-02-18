@@ -178,6 +178,7 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
     <span id="score-bias" class="hdr-bias bias-neutral">--</span>
   </div>
   <div class="hdr-right">
+    <span id="hdr-freshness" class="hdr-ts"></span>
     <span id="hdr-ts" class="hdr-ts">--</span>
   </div>
 </div>
@@ -358,6 +359,17 @@ function updateHeader(data) {
   if (data.timestamp) {
     const d = new Date(data.timestamp);
     tsEl.textContent = d.toLocaleString();
+  }
+
+  const freshEl = document.getElementById('hdr-freshness');
+  const fr = data.data_freshness;
+  if (fr) {
+    const parts = [];
+    if (fr.ibit) parts.push(`IBIT ${fr.ibit.as_of || '?'}`);
+    if (fr.deribit) parts.push(`DERIBIT ${fr.deribit.as_of || '?'}`);
+    freshEl.textContent = parts.join('  ·  ');
+  } else {
+    freshEl.textContent = '';
   }
 }
 
