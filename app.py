@@ -1441,18 +1441,11 @@ def compute_macro_regime(conn, ticker, days=30):
 
 
 def _get_data_freshness(c, ticker):
-    """Extract IBIT/Deribit data freshness from the latest data_cache entry."""
-    row = c.execute(
-        'SELECT data_json FROM data_cache WHERE ticker=? ORDER BY date DESC LIMIT 1',
-        (ticker,)
-    ).fetchone()
-    if not row:
-        return None
-    try:
-        d = json.loads(row[0])
-        return d.get('data_freshness')
-    except (json.JSONDecodeError, TypeError):
-        return None
+    """Compute live IBIT/Deribit data freshness."""
+    return {
+        'ibit': _compute_ibit_freshness(),
+        'deribit': _compute_deribit_freshness(),
+    }
 
 
 class _FarsideTableParser(HTMLParser):
