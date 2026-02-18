@@ -1547,7 +1547,7 @@ def _compute_deribit_freshness():
     if cache_time == 0:
         return {'age_minutes': None, 'as_of': None}
     age_min = (time.time() - cache_time) / 60
-    as_of_str = datetime.fromtimestamp(cache_time).strftime('%Y-%m-%d %H:%M UTC')
+    as_of_str = datetime.fromtimestamp(cache_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     return {
         'age_minutes': round(age_min, 0),
         'as_of': as_of_str,
@@ -3179,13 +3179,14 @@ def set_cached_data(ticker, dte, data):
     conn.close()
 
 
-def fetch_with_cache(ticker, dte, min_dte=0):
-    """Return cached data if fresh, otherwise check Yahoo for new OI."""
+def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
+    """Return cached data if fresh, otherwise check Yahoo for new OI.
+    force_refresh=True bypasses date check and OI comparison (used for Deribit refresh)."""
     today = datetime.now().strftime('%Y-%m-%d')
     cache_date, cached = get_latest_cache(ticker, dte)
 
-    # Already confirmed today's data (and min_dte matches)
-    if cached and cache_date == today:
+    # Already confirmed today's data (and min_dte matches) — unless force_refresh
+    if cached and cache_date == today and not force_refresh:
         cached_min = cached.get('dte_window', {}).get('min', 0)
         if cached_min == min_dte:
             return cached
@@ -3194,22 +3195,24 @@ def fetch_with_cache(ticker, dte, min_dte=0):
     check_key = (ticker, dte, min_dte)
     with _yahoo_check_lock:
         last_check = _last_yahoo_check.get(check_key)
-        if cached and last_check and (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
+        if cached and last_check and not force_refresh and \
+           (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
             return cached
 
-    # Fetch from Yahoo
+    # Fetch from Yahoo (+ Deribit if applicable)
     data = fetch_and_analyze(ticker, dte, min_dte)
     with _yahoo_check_lock:
         _last_yahoo_check[check_key] = datetime.now()
 
     # Compare OI to detect if data actually changed
-    if cached:
+    # When force_refresh, always save (Deribit data changed even if IBIT didn't)
+    if cached and not force_refresh:
         old_oi = (cached['levels']['total_call_oi'], cached['levels']['total_put_oi'])
         new_oi = (data['levels']['total_call_oi'], data['levels']['total_put_oi'])
         if old_oi == new_oi:
             return cached  # Still stale, serve previous cache
 
-    # New data (or first run) — save as today
+    # New data (or first run or force_refresh) — save as today
     set_cached_data(ticker, dte, data)
     return data
 
@@ -3312,6 +3315,45 @@ def _bg_refresh():
                         log.info(f"[bg-refresh] {tk} AI analysis complete and cached")
                     except Exception as e:
                         log.error(f"[bg-refresh] {tk} AI analysis error: {e}")
+
+            # Deribit intraday refresh: re-fetch hourly to keep Deribit data fresh
+            # IBIT OI is EOD-only so it won't change, but Deribit OI/IV updates 24/7
+            if all_fresh and tk == 'IBIT':
+                try:
+                    _, latest_cached = get_latest_cache(tk, 3)  # 0-3d as reference
+                    deribit_stale = True
+                    if latest_cached:
+                        freshness = latest_cached.get('data_freshness', {}).get('deribit', {})
+                        age_min = freshness.get('age_minutes')
+                        if age_min is not None and age_min < 65:
+                            deribit_stale = False
+
+                    if deribit_stale:
+                        log.info(f"[bg-refresh] {tk} Deribit data stale, refreshing all windows...")
+                        with _deribit_lock:
+                            _deribit_cache['time'] = 0
+
+                        with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
+                            futures = {
+                                pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
+                                for label, min_d, max_d in REFRESH_DTES
+                            }
+                            for fut in as_completed(futures):
+                                try:
+                                    fut.result()
+                                except Exception as e:
+                                    w = futures[fut]
+                                    log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
+
+                        log.info(f"[bg-refresh] {tk} Deribit refresh complete")
+
+                        try:
+                            run_analysis(tk)
+                            log.info(f"[bg-refresh] {tk} AI analysis updated with fresh Deribit data")
+                        except Exception as e:
+                            log.error(f"[bg-refresh] {tk} AI analysis error after Deribit refresh: {e}")
+                except Exception as e:
+                    log.error(f"[bg-refresh] {tk} Deribit freshness check error: {e}")
 
             # 6 AM ET anchor: IBIT OI is from last close, Deribit is live,
             # prediction is forward-looking for the trading day.
