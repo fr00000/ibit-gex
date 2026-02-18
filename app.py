@@ -79,7 +79,7 @@ class NumpyEncoder(json.JSONEncoder):
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 RISK_FREE_RATE_DEFAULT = 0.043
 STRIKE_RANGE_PCT = 0.35
-DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")
+DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_research.db")
 
 # Non-overlapping DTE windows: each shows distinct positioning
 # (label, min_dte, max_dte)
@@ -291,6 +291,15 @@ def init_db():
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_expiry ON predictions(expiry_date, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_dte ON predictions(dte, scored)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_pred_ticker ON predictions(ticker, scored)')
+    # Migrate: add T+2 scoring columns to predictions
+    pred_cols = {r[1] for r in c.execute('PRAGMA table_info(predictions)').fetchall()}
+    for col, typ in [
+        ('btc_high_t2', 'REAL'), ('btc_low_t2', 'REAL'), ('btc_close_t2', 'REAL'),
+        ('call_wall_held_t2', 'INTEGER'), ('put_wall_held_t2', 'INTEGER'),
+        ('range_held_t2', 'INTEGER'), ('regime_correct_t2', 'INTEGER'),
+    ]:
+        if col not in pred_cols:
+            c.execute(f'ALTER TABLE predictions ADD COLUMN {col} {typ}')
     conn.commit()
     conn.close()
 
@@ -346,8 +355,8 @@ def get_history(conn, ticker, days=10):
 
 
 def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
-    """Compress 10 days of snapshots into trend signals for AI analysis."""
-    history = get_history(conn, ticker, 10)
+    """Compress 30 days of snapshots into trend signals for AI analysis."""
+    history = get_history(conn, ticker, 30)
     if not history or len(history) < 2:
         return None
 
@@ -372,6 +381,27 @@ def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
         'streak_days': streak,
         'prior_regime': prior_regime,
         'regime_history': regime_abbrev,
+    }
+
+    # ── Regime persistence (30-day window) ──
+    regime_signs = [1 if h[7] == 'positive_gamma' else -1 for h in history]
+    n_positive = sum(1 for s in regime_signs if s > 0)
+    n_negative = len(regime_signs) - n_positive
+    dominant_count = max(n_positive, n_negative)
+    persistence_pct = round(dominant_count / len(regime_signs) * 100) if regime_signs else 0
+    sign_flips = sum(1 for i in range(1, len(regime_signs)) if regime_signs[i] != regime_signs[i-1])
+
+    # Net GEX magnitudes for the 30-day window
+    net_gex_vals_30d = [h[8] for h in history if h[8] is not None]
+    avg_gex_magnitude = abs(sum(net_gex_vals_30d) / len(net_gex_vals_30d)) if net_gex_vals_30d else 0
+
+    regime_streak['persistence_30d'] = {
+        'positive_days': n_positive,
+        'negative_days': n_negative,
+        'persistence_pct': persistence_pct,
+        'sign_flips': sign_flips,
+        'avg_gex_magnitude': round(avg_gex_magnitude),
+        'is_persistent': persistence_pct >= 70 and sign_flips <= 5,
     }
 
     # ── Helper: per-share ratio for each row ──
@@ -1191,6 +1221,16 @@ def _compute_levels_from_df(df, spot, etf_flows=None):
     levels['total_put_oi'] = int(df['put_oi'].sum())
     levels['pcr'] = levels['total_put_oi'] / max(levels['total_call_oi'], 1)
 
+    # Volume-weighted GEX: what dealers are DOING today vs what they HAVE
+    if 'call_vol_gex' in df.columns:
+        levels['volume_gex_total'] = float(df['call_vol_gex'].sum() + df['put_vol_gex'].sum())
+        oi_gex = levels['net_gex_total']
+        vol_gex = levels['volume_gex_total']
+        levels['gex_activity_ratio'] = round(abs(vol_gex / oi_gex), 2) if oi_gex != 0 else 0.0
+    else:
+        levels['volume_gex_total'] = 0.0
+        levels['gex_activity_ratio'] = 0.0
+
     # Active GEX totals and walls
     active_col = 'active_gex' if 'active_gex' in df.columns else 'net_gex'
     levels['active_gex_total'] = float(df[active_col].sum())
@@ -1330,6 +1370,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 vanna = bs_vanna(spot, strike, T, rfr, iv)
                 charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
                 gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
+                vol = row.get('volume', 0)
+                if pd.isna(vol):
+                    vol = 0
+                vol = int(vol)
+                vol_gex = sign * gamma * vol * 100 * spot ** 2 * 0.01
                 dealer_delta = -delta * oi * 100 * spot  # dollar notional
                 # Dealer vanna exposure: how dealer delta changes with IV
                 # Vanna is identical for calls/puts (put-call parity), and dealers
@@ -1340,20 +1385,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 # Positive dealer_charm = dealers BUY delta (bullish overnight).
                 dealer_charm = -charm * oi * 100 / 365.0 * spot  # dollar notional
 
-                vol = row.get('volume', 0)
-                if pd.isna(vol):
-                    vol = 0
-                vol = int(vol)
-
                 if strike not in strike_data:
                     strike_data[strike] = {'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
                                            'call_delta': 0, 'put_delta': 0,
                                            'call_vanna': 0, 'put_vanna': 0,
                                            'call_charm': 0, 'put_charm': 0,
                                            'call_volume': 0, 'put_volume': 0,
+                                           'call_vol_gex': 0, 'put_vol_gex': 0,
                                            'expiry_gex': {}}
                 strike_data[strike][f'{opt_type}_oi'] += oi
                 strike_data[strike][f'{opt_type}_gex'] += gex
+                strike_data[strike][f'{opt_type}_vol_gex'] += vol_gex
                 strike_data[strike][f'{opt_type}_volume'] += vol
                 strike_data[strike][f'{opt_type}_delta'] += dealer_delta
                 strike_data[strike][f'{opt_type}_vanna'] += dealer_vanna
@@ -1387,6 +1429,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
             'call_volume': d['call_volume'], 'put_volume': d['put_volume'],
             'total_volume': d['call_volume'] + d['put_volume'],
+            'call_vol_gex': d.get('call_vol_gex', 0), 'put_vol_gex': d.get('put_vol_gex', 0),
             'expiry_gex': expiry_gex,
         })
     df = pd.DataFrame(rows)
@@ -3081,6 +3124,37 @@ def score_expired_predictions(conn):
 
             venue_agree_held = range_held if venue_agree else None
 
+            # T+2 scoring: look up the day AFTER expiry
+            t2_ts = exp_ts + 86400
+            t2_candle = c.execute('''SELECT high, low, close FROM btc_candles
+                                     WHERE symbol='BTCUSDT' AND tf='1d'
+                                     AND time >= ? AND time < ?
+                                     ORDER BY time LIMIT 1''',
+                                  (t2_ts, t2_ts + 86400)).fetchone()
+
+            t2_high, t2_low, t2_close = (None, None, None)
+            cw_held_t2, pw_held_t2, range_held_t2, regime_correct_t2 = (None, None, None, None)
+            if t2_candle:
+                t2_high, t2_low, t2_close = t2_candle
+                # T+2 window: analysis date through T+2
+                t2_window_candles = c.execute('''SELECT high, low FROM btc_candles
+                                                 WHERE symbol='BTCUSDT' AND tf='1d'
+                                                 AND time >= ? AND time <= ?''',
+                                              (analysis_ts, t2_ts + 86400)).fetchall()
+                if t2_window_candles:
+                    t2_win_high = max(r[0] for r in t2_window_candles)
+                    t2_win_low = min(r[1] for r in t2_window_candles)
+                    cw_held_t2 = 1 if (cw and t2_win_high <= cw * 1.01) else 0 if cw else None
+                    pw_held_t2 = 1 if (pw and t2_win_low >= pw * 0.99) else 0 if pw else None
+                    range_held_t2 = 1 if (cw_held_t2 == 1 and pw_held_t2 == 1) else (
+                        0 if (cw_held_t2 is not None and pw_held_t2 is not None) else None)
+                    t2_range_pct = (t2_win_high - t2_win_low) / spot_btc * 100
+                    t2_daily = t2_range_pct / max(dte_days + 1, 1)
+                    if regime == 'positive_gamma':
+                        regime_correct_t2 = 1 if t2_daily < 2.0 else 0
+                    elif regime == 'negative_gamma':
+                        regime_correct_t2 = 1 if t2_daily > 1.0 else 0
+
             c.execute('''UPDATE predictions SET
                 scored=1, scored_date=?,
                 btc_high_on_expiry=?, btc_low_on_expiry=?, btc_close_on_expiry=?,
@@ -3088,7 +3162,9 @@ def score_expired_predictions(conn):
                 call_wall_held=?, put_wall_held=?, range_held=?, em_held=?,
                 regime_correct=?, charm_correct=?, venue_agree_held=?,
                 max_breach_call_pct=?, max_breach_put_pct=?, realized_range_pct=?,
-                call_wall_error_pct=?, put_wall_error_pct=?
+                call_wall_error_pct=?, put_wall_error_pct=?,
+                btc_high_t2=?, btc_low_t2=?, btc_close_t2=?,
+                call_wall_held_t2=?, put_wall_held_t2=?, range_held_t2=?, regime_correct_t2=?
                 WHERE id=?''', (
                 today, exp_high, exp_low, exp_close,
                 win_high, win_low,
@@ -3096,12 +3172,96 @@ def score_expired_predictions(conn):
                 regime_correct, charm_correct, venue_agree_held,
                 max_breach_call, max_breach_put, realized_range_pct,
                 call_wall_error, put_wall_error,
+                t2_high, t2_low, t2_close,
+                cw_held_t2, pw_held_t2, range_held_t2, regime_correct_t2,
                 pred_id,
             ))
             scored_count += 1
 
     conn.commit()
     return scored_count
+
+
+def detect_structural_patterns(levels, spot_btc, venue_breakdown=None, changes_vs_prev=None):
+    """Rule-based pattern pre-screen with concrete thresholds.
+    Returns list of detected pattern dicts."""
+    patterns = []
+    net_gex = levels.get('net_gex_total', 0)
+    gamma_flip = levels.get('gamma_flip', 0)
+    call_wall = levels.get('call_wall', 0)
+    put_wall = levels.get('put_wall', 0)
+    regime = levels.get('regime', '')
+    pcr = levels.get('pcr', 0)
+    activity = levels.get('gex_activity_ratio', 0)
+
+    # Pattern 1: Gamma squeeze setup
+    if gamma_flip and spot_btc:
+        flip_dist_pct = abs(spot_btc - gamma_flip) / spot_btc * 100
+        if regime == 'negative_gamma' and flip_dist_pct < 2.0 and pcr < 0.7:
+            patterns.append({
+                'pattern': 'gamma_squeeze_setup',
+                'signal': 'Spot within 2% of gamma flip in negative gamma with call-heavy flow',
+                'flip_distance_pct': round(flip_dist_pct, 2),
+            })
+
+    # Pattern 2: Wall pinning (near expiry)
+    if call_wall and put_wall and spot_btc:
+        cw_dist = abs(spot_btc - call_wall) / spot_btc * 100
+        pw_dist = abs(spot_btc - put_wall) / spot_btc * 100
+        nearest_wall = min(cw_dist, pw_dist)
+        if nearest_wall < 0.5:
+            pinned_to = 'call_wall' if cw_dist < pw_dist else 'put_wall'
+            patterns.append({
+                'pattern': 'wall_pinning',
+                'signal': f'Spot within 0.5% of {pinned_to} — gravitational pull likely',
+                'distance_pct': round(nearest_wall, 2),
+                'pinned_to': pinned_to,
+            })
+
+    # Pattern 3: Venue convergence (high conviction)
+    if venue_breakdown:
+        ibit = venue_breakdown.get('ibit', {})
+        deribit = venue_breakdown.get('deribit', {})
+        ibit_cw = ibit.get('call_wall_btc')
+        deribit_cw = deribit.get('call_wall_btc')
+        ibit_pw = ibit.get('put_wall_btc')
+        deribit_pw = deribit.get('put_wall_btc')
+
+        if ibit_cw and deribit_cw and spot_btc:
+            cw_diff = abs(ibit_cw - deribit_cw) / spot_btc * 100
+            if cw_diff < 1.0:
+                patterns.append({
+                    'pattern': 'venue_convergence_resistance',
+                    'signal': f'IBIT + Deribit call walls within {cw_diff:.1f}% — high conviction resistance',
+                    'ibit_cw': ibit_cw, 'deribit_cw': deribit_cw,
+                })
+        if ibit_pw and deribit_pw and spot_btc:
+            pw_diff = abs(ibit_pw - deribit_pw) / spot_btc * 100
+            if pw_diff < 1.0:
+                patterns.append({
+                    'pattern': 'venue_convergence_support',
+                    'signal': f'IBIT + Deribit put walls within {pw_diff:.1f}% — high conviction support',
+                    'ibit_pw': ibit_pw, 'deribit_pw': deribit_pw,
+                })
+
+    # Pattern 4: Regime transition
+    if changes_vs_prev and changes_vs_prev.get('regime_changed'):
+        patterns.append({
+            'pattern': 'regime_transition',
+            'signal': f"Regime flipped from {changes_vs_prev.get('regime_prev')} to {regime} — mixed signals, reduce sizing",
+            'prev_regime': changes_vs_prev.get('regime_prev'),
+            'new_regime': regime,
+        })
+
+    # Pattern 5: High activity ratio (actively defended levels)
+    if activity > 1.5:
+        patterns.append({
+            'pattern': 'high_hedging_activity',
+            'signal': f'Activity ratio {activity:.1f}x — dealers actively hedging, levels are being tested today',
+            'activity_ratio': activity,
+        })
+
+    return patterns
 
 
 def run_analysis(ticker='IBIT', save=True):
@@ -3205,6 +3365,8 @@ def run_analysis(ticker='IBIT', save=True):
             'active_put_wall_btc': primary_active_pw,
             'positioning_confidence': primary_confidence,
             'positioning_warnings': primary_warnings,
+            'volume_gex_total': ibit_lvl.get('volume_gex_total', 0),
+            'gex_activity_ratio': ibit_lvl.get('gex_activity_ratio', 0),
             'levels': ibit_lvl,
             'expected_move': d['expected_move'],
             'breakout': {
@@ -3303,6 +3465,25 @@ def run_analysis(ticker='IBIT', save=True):
                 'pcr_change': round(ibit_lvl.get('pcr', 0) - prev_lvl.get('pcr', 0), 3),
             }
 
+        # Pattern pre-screen (use BTC-space levels, not IBIT share-price levels)
+        pattern_levels = {
+            'call_wall': primary_lvl_btc.get('call_wall', 0),
+            'put_wall': primary_lvl_btc.get('put_wall', 0),
+            'gamma_flip': primary_lvl_btc.get('gamma_flip', 0),
+            'regime': primary_regime,
+            'net_gex_total': primary_net_gex,
+            'pcr': ibit_lvl.get('pcr', 0),
+            'gex_activity_ratio': ibit_lvl.get('gex_activity_ratio', 0),
+        }
+        detected = detect_structural_patterns(
+            pattern_levels,
+            current_btc,
+            venue_breakdown=summaries[key].get('venue_breakdown'),
+            changes_vs_prev=summaries[key].get('changes_vs_prev'),
+        )
+        if detected:
+            summaries[key]['detected_patterns'] = detected
+
     # Prediction accuracy feedback (if enough data exists)
     try:
         conn = get_db()
@@ -3327,6 +3508,16 @@ def run_analysis(ticker='IBIT', save=True):
                     'regime_correct_pct': round((row[4] or 0) / total * 100),
                     'venue_agree_held_pct': round((row[5] or 0) / max(row[6] or 1, 1) * 100) if row[6] else None,
                 }
+                # T+2 accuracy
+                row_t2 = c.execute('''SELECT COUNT(*), SUM(call_wall_held_t2), SUM(put_wall_held_t2),
+                                             SUM(range_held_t2)
+                                      FROM predictions WHERE ticker=? AND dte >= ? AND dte <= ?
+                                      AND call_wall_held_t2 IS NOT NULL''',
+                                   (ticker, min_dte_b, max_dte_b)).fetchone()
+                total_t2 = row_t2[0] or 0
+                if total_t2 >= 5:
+                    accuracy[bucket_name]['t2_n'] = total_t2
+                    accuracy[bucket_name]['t2_range_held_pct'] = round((row_t2[3] or 0) / total_t2 * 100)
         if accuracy:
             summaries['_prediction_accuracy'] = accuracy
         conn.close()
@@ -3349,6 +3540,16 @@ This context is critical — a static snapshot is less useful than understanding
 
 Active GEX (active_gex_total) weights net GEX by the fraction of OI that is new since yesterday. It surfaces where FRESH dealer exposure is concentrated vs stale "zombie gamma" from old positions. Active call/put walls show where the freshest positioning is strongest.
 
+Volume GEX (volume_gex_total) weights gamma exposure by TODAY's trading volume instead of total open interest. It measures what dealers are ACTIVELY hedging right now, vs the structural positioning from OI-weighted GEX.
+
+The activity_ratio (gex_activity_ratio) = |Volume GEX / OI GEX|. Interpretation:
+- Ratio > 1.5: Dealers actively hedging well above their structural positioning — high conviction day, levels are being tested
+- Ratio 0.5-1.5: Normal hedging activity proportional to positioning
+- Ratio < 0.5: Stale positioning, low hedging activity — levels are less "defended" today, may not hold
+- Ratio near 0: Weekend/after-hours, no volume data
+
+Use activity_ratio to calibrate confidence in levels. A call wall with high activity_ratio is being actively defended. A call wall with low activity_ratio is a ghost level from old OI.
+
 Positioning confidence (positioning_confidence, 0-100%) indicates how much to trust the GEX sign convention (dealers long calls, short puts). When below 60%, the call wall may act as a squeeze trigger rather than resistance, and regime labels may be inverted. Always note the confidence level and any warnings in your analysis.
 
 ETF fund flows (etf_flows) show daily creation/redemption activity from Farside Investors. 'daily_flow_millions' is IBIT-specific flow; 'total_btc_etf_flow_millions' is the total across ALL BTC spot ETFs (IBIT, FBTC, ARKB, GBTC, etc.). Positive = inflows, negative = outflows. A streak of 3+ days in one direction is significant. IMPORTANT: Distinguish between IBIT-specific outflows and total BTC ETF outflows. If IBIT has outflows but total BTC ETFs have inflows, that's fund rotation (not bearish). If ALL BTC ETFs have outflows, that's genuine institutional exit (bearish). Cross-reference with GEX regime: inflows + positive gamma = strong range, outflows + negative gamma = breakdown risk.
@@ -3369,6 +3570,16 @@ data_freshness shows how stale each venue's data is. IBIT options data updates o
 
 venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
+DETECTED PATTERNS (when present):
+detected_patterns contains rule-based pre-screened structural patterns with concrete thresholds. These are NOT predictions — they're mechanical conditions that are currently true. Use them as starting points for your analysis:
+- gamma_squeeze_setup: Spot near flip point + negative gamma + call-heavy flow. Confirm or reject based on dealer delta and volume.
+- wall_pinning: Spot within 0.5% of a wall. Likely to pin if activity_ratio is high.
+- venue_convergence_resistance/support: Both IBIT and Deribit agree on a wall location. Highest conviction levels.
+- regime_transition: Regime just flipped. Signals are mixed until new regime establishes.
+- high_hedging_activity: Dealers actively trading. Levels are "live" today.
+
+You may agree or disagree with detected patterns — they're inputs to your reasoning, not conclusions. If no patterns are detected, that itself is informative (quiet market, no structural edge).
+
 PREDICTION ACCURACY (when present):
 _prediction_accuracy shows historical hit rates grouped by DTE at prediction time (0-1, 2-3, 4-7, 8-14, 15-30, 31-45 days before expiry). This is a convergence curve showing when predictions become trustworthy.
 Use this to calibrate confidence:
@@ -3382,13 +3593,21 @@ Note: significant_levels and breakout are derived from IBIT options data only. f
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
-Historical Trends (_history_trends): A compressed summary of the last 10 daily snapshots, shared across all timeframes. This is NOT per-DTE — it reflects the ticker's overall positioning evolution.
+Historical Trends (_history_trends): A compressed summary of the last 30 daily snapshots, shared across all timeframes. This is NOT per-DTE — it reflects the ticker's overall positioning evolution.
 - regime_streak: How many days the current gamma regime has held. A streak of 3+ days means the regime is established, not transitional. A streak of 1 means it just flipped — watch for reversion.
 - level_migration: Direction and magnitude of key level movements over 3d and 5d windows. Rising walls with a long streak = strong directional positioning. Stable walls held at a specific price = anchored range. Use consecutive_direction to gauge conviction.
 - gex_trend: Whether overall gamma exposure is building (market adding options, levels strengthening) or decaying (positions unwinding, levels weakening).
 - oi_trend: Call and put OI direction separately. Divergences matter: call OI building + put OI decaying = bullish positioning shift.
 - range_evolution: Whether the tradeable range (call wall to put wall) is expanding, contracting, or shifting directionally. 'Contracting' often precedes a breakout. 'Expanding_symmetric' means both sides being defended.
 - narrative: One-line summary of the dominant trend pattern.
+
+regime_streak now includes persistence_30d — a 30-day regime stability assessment:
+- persistence_pct: What % of the last 30 days had the same regime sign (e.g., 85% = strongly persistent)
+- sign_flips: How many times the regime switched in 30 days (≤5 = stable, >5 = choppy)
+- is_persistent: True when persistence ≥70% AND ≤5 flips — this means the regime is structural, not transitional
+- avg_gex_magnitude: Average absolute net GEX over 30 days — larger = stronger constraint
+
+When is_persistent is true, trust the regime label and trade it with conviction. When false, the regime is transitional — reduce sizing, expect whipsaws, and weight shorter-DTE signals more heavily. A persistent negative gamma regime means every rally faces mechanical selling; a persistent positive gamma regime means dips get bought mechanically.
 
 Use history_trends to contextualize today's snapshot. A call wall at $107K means different things if it's been there for 7 days (strong, tested resistance) vs if it jumped there overnight (new, untested). Always mention regime streak length and level migration direction in your analysis.
 
@@ -3446,6 +3665,17 @@ ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:*
 - "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short ~$33M notional creating a bid, but charm selling into $72.8M headwind caps upside speed."
 
 After the bottom line, state the EDGE in one sentence: why this setup has positive expected value. Reference the specific structural factor — venue convergence, regime history, dealer delta asymmetry, level trajectory — that makes this more than a coin flip. Example: "Edge: both venues agree on $68K put wall (HIGH CONVICTION) and positive gamma regime historically means-reverts within range."
+
+After the BOTTOM LINE and EDGE, include a structured causal mechanic:
+
+**MECHANIC:** WHO [identify the constrained actor and their positioning] → WHOM [who is affected by their forced action] → WHAT [the specific forced action and its price consequence]
+
+Examples:
+- "**MECHANIC:** WHO: Dealers short gamma at $104K call wall → WHOM: Directional longs above $104K → WHAT: Forced to sell rallies into $104K to maintain delta neutrality, capping upside and compressing range"
+- "**MECHANIC:** WHO: Deribit MMs long gamma below $98K put wall → WHOM: Short sellers targeting breakdown → WHAT: Forced to buy dips mechanically, creating a bid that absorbs selling pressure"
+- "**MECHANIC:** WHO: No dominant constraint — net GEX near zero, flip point at spot → WHOM: All participants → WHAT: No forced hedging flow; levels are informational, not structural. Reduce position sizing."
+
+The MECHANIC line forces you to identify whether there IS a structural constraint or not. If net GEX is near zero or positioning confidence is low, the correct MECHANIC is "no dominant constraint" — don't fabricate one. This is more valuable than a false signal.
 
 Then provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
