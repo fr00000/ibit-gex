@@ -355,7 +355,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="outlook-legend">
       <span><span style="color:rgba(255,64,96,0.9)">━</span> Call wall</span>
       <span><span style="color:rgba(0,220,130,0.9)">━</span> Put wall</span>
-      <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
+      <span><span style="color:rgba(255,176,32,0.4)">╌</span> γ Flip</span>
       <span><span style="color:rgba(255,255,255,0.9)">▲</span> Δ Flip</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
       <span><span style="color:rgba(168,139,250,0.4)">╌</span> EM</span>
@@ -1367,8 +1367,8 @@ function renderOutlook(data){
         {label:'EM Lower',data:emLowerPts,borderColor:'rgba(168,139,250,0.3)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0.3,order:10},
         {label:'Call Wall',data:callWallPts,borderColor:'rgba(255,64,96,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(255,64,96,1)',fill:false,tension:0.2,order:2},
         {label:'Put Wall',data:putWallPts,borderColor:'rgba(0,220,130,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(0,220,130,1)',fill:false,tension:0.2,order:2},
-        {label:'\u03b3 Flip',data:gammaFlipPts,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:3,pointBackgroundColor:'rgba(255,176,32,0.8)',fill:false,tension:0.2,order:3},
-        {label:'\u0394 Flip',data:deltaFlipPts,borderColor:'transparent',backgroundColor:'rgba(255,255,255,0.9)',pointRadius:6,pointStyle:'triangle',pointBorderColor:'rgba(255,255,255,1)',pointBorderWidth:1,showLine:false,fill:false,order:1},
+        {label:'\u03b3 Flip',data:gammaFlipPts,borderColor:'rgba(255,176,32,0.3)',borderWidth:1,borderDash:[5,3],pointRadius:2,pointBackgroundColor:'rgba(255,176,32,0.5)',fill:false,tension:0.2,order:3},
+        {label:'\u0394 Flip',data:deltaFlipPts,borderColor:'rgba(255,255,255,0.25)',borderWidth:1,borderDash:[4,3],backgroundColor:'rgba(255,255,255,0.9)',pointRadius:6,pointStyle:'triangle',pointBorderColor:'rgba(255,255,255,1)',pointBorderWidth:1,showLine:true,fill:false,tension:0.2,order:1},
         {label:'Venue Agree',data:venueAgreeCW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
         {label:'Venue Agree PW',data:venueAgreePW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
       ]
@@ -1462,13 +1462,6 @@ function renderOutlook(data){
           c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.7)':'rgba(0,220,130,0.7)';
           c.fillRect(x1,top,x2-x1,stripHeight);
         });
-      }
-    },{
-      id:'deltaFlipConnectors',
-      afterDatasetsDraw(chart){
-        const{ctx:c,scales:{x:xScale,y}}=chart;
-        c.save();
-        c.restore();
       }
     }]
   });
