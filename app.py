@@ -2312,8 +2312,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
     all_exps = list(ticker.options)
     now = datetime.now(timezone.utc)
-    cutoff_max = now + timedelta(days=max_dte)
-    cutoff_min = now + timedelta(days=min_dte)
+    cutoff_max = (now + timedelta(days=max_dte)).replace(hour=23, minute=59, second=59, microsecond=0)
+    cutoff_min = (now + timedelta(days=min_dte)).replace(hour=0, minute=0, second=0, microsecond=0)
     selected_exps = [
         e for e in all_exps
         if cutoff_min <= datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff_max
