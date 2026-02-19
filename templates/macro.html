@@ -121,6 +121,7 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 .chart-card:nth-child(4) .chart-card-title::before{background:var(--green2)}
 .chart-card:nth-child(5) .chart-card-title::before{background:var(--purple)}
 .chart-card:nth-child(6) .chart-card-title::before{background:var(--red)}
+.chart-card:nth-child(7) .chart-card-title::before{background:var(--amber)}
 .chart-wrap{position:relative;flex:1;min-height:0}
 .chart-wrap canvas{position:absolute;inset:0;width:100%!important;height:100%!important}
 .chart-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:11px;font-style:italic;background:var(--bg3);border-radius:3px;padding:20px;text-align:center;line-height:1.6}
@@ -244,6 +245,10 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
     <div class="chart-card">
       <div class="chart-card-title">Aggregate Open Interest</div>
       <div id="chart-oi-wrap" class="chart-wrap"><canvas id="chart-oi"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-card-title">Liquidation Volume</div>
+      <div id="chart-liq-wrap" class="chart-wrap"><canvas id="chart-liq"></canvas></div>
     </div>
   </div>
 
@@ -864,6 +869,70 @@ function renderOIChart(history, coinglassAvailable) {
   });
 }
 
+/* ── Chart 7: Liquidation Volume ──────────────────────────────────────── */
+function renderLiquidationChart(history, coinglassAvailable) {
+  destroyChart('liq');
+  const wrap = document.getElementById('chart-liq-wrap');
+  const canvas = document.getElementById('chart-liq');
+
+  if (!coinglassAvailable) {
+    canvas.style.display = 'none';
+    let ph = wrap.querySelector('.chart-placeholder');
+    if (!ph) {
+      ph = document.createElement('div');
+      ph.className = 'chart-placeholder';
+      wrap.appendChild(ph);
+    }
+    ph.textContent = 'Add COINGLASS_API_KEY to enable liquidation data';
+    return;
+  }
+
+  canvas.style.display = '';
+  const ph = wrap.querySelector('.chart-placeholder');
+  if (ph) ph.remove();
+
+  const data = history.liquidation_history || [];
+  if (!data.length) return;
+
+  const labels = data.map(d => fmtDate(d.date));
+  const vals = data.map(d => d.liq_usd);
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => '$' + (v / 1e6).toFixed(0) + 'M'
+  };
+
+  charts.liq = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Daily Liquidation',
+        data: vals,
+        backgroundColor: vals.map(v => v > avg * 2
+          ? 'rgba(255,82,82,0.7)' : 'rgba(255,167,38,0.4)'),
+        borderWidth: 0,
+        borderRadius: 2,
+      }]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        legend: { display: false },
+        tooltip: {
+          ...opts.plugins.tooltip,
+          callbacks: {
+            label: ctx => '$' + (ctx.raw / 1e6).toFixed(0) + 'M'
+          }
+        }
+      }
+    }
+  });
+}
+
 /* ── Update Swing Box ──────────────────────────────────────────────────── */
 function updateSwingBox(data) {
   const box = document.getElementById('swing-box');
@@ -906,6 +975,7 @@ async function loadData() {
     renderFlowsChart(history);
     renderFundingChart(history, data.coinglass_available);
     renderOIChart(history, data.coinglass_available);
+    renderLiquidationChart(history, data.coinglass_available);
 
     document.getElementById('loading').classList.add('hidden');
   } catch (e) {
