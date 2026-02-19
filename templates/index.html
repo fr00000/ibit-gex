@@ -356,7 +356,6 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span><span style="color:rgba(255,64,96,0.9)">━</span> Call wall</span>
       <span><span style="color:rgba(0,220,130,0.9)">━</span> Put wall</span>
       <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
-      <span><span style="color:rgba(255,255,255,0.7)">╌</span> Spot</span>
       <span><span style="color:rgba(255,255,255,0.9)">▲</span> Δ Flip</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
       <span><span style="color:rgba(168,139,250,0.4)">╌</span> EM</span>
@@ -1351,7 +1350,7 @@ function renderOutlook(data){
   const venueAgreeCW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.call_wall}:null).filter(Boolean);
   const venueAgreePW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.put_wall}:null).filter(Boolean);
 
-  const allVals=[spot,
+  const allVals=[
     ...wins.map(w=>w.call_wall),...wins.map(w=>w.put_wall),
     ...wins.map(w=>w.gamma_flip),...wins.map(w=>w.em_upper),...wins.map(w=>w.em_lower),
     ...wins.map(w=>w.delta_flip_btc)
@@ -1414,7 +1413,7 @@ function renderOutlook(data){
               const idx=xPositions.indexOf(xVal);
               const w=idx>=0?wins[idx]:null;
               if(!w)return '';
-              const lines=[`Spot: ${fB(spot)}`];
+              const lines=[];
               if(w.dealer_delta_dir)lines.push(`Dealers: net ${w.dealer_delta_dir}`);
               if(w.charm_dir)lines.push(`Charm: ${w.charm_dir}`);
               if(w.delta_flip_btc)lines.push(`\u0394 Flip: ${fB(w.delta_flip_btc)}`);
@@ -1462,44 +1461,13 @@ function renderOutlook(data){
           const x2=xScale.getPixelForValue(w.max_dte);
           c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.7)':'rgba(0,220,130,0.7)';
           c.fillRect(x1,top,x2-x1,stripHeight);
-          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.03)':'rgba(0,220,130,0.03)';
-          c.fillRect(x1,top+stripHeight,x2-x1,bottom-top-stripHeight);
         });
       }
     },{
-      id:'spotLine',
+      id:'deltaFlipConnectors',
       afterDatasetsDraw(chart){
-        const{ctx:c,chartArea:{left,right},scales:{x:xScale,y}}=chart;
-        const yPx=y.getPixelForValue(spot);
-        if(yPx==null||!isFinite(yPx))return;
+        const{ctx:c,scales:{x:xScale,y}}=chart;
         c.save();
-        // Delta flip vertical connectors (spot → flip price)
-        wins.forEach((w,i)=>{
-          if(!w.delta_flip_btc)return;
-          const xPx=xScale.getPixelForValue(xPositions[i]);
-          const flipYPx=y.getPixelForValue(w.delta_flip_btc);
-          if(!isFinite(flipYPx))return;
-          c.strokeStyle='rgba(255,255,255,0.15)';
-          c.lineWidth=1;
-          c.setLineDash([3,3]);
-          c.beginPath();
-          c.moveTo(xPx,yPx);
-          c.lineTo(xPx,flipYPx);
-          c.stroke();
-        });
-        // Spot horizontal line
-        c.strokeStyle='rgba(255,255,255,0.5)';
-        c.lineWidth=1.5;
-        c.setLineDash([8,4]);
-        c.beginPath();
-        c.moveTo(left,yPx);
-        c.lineTo(right,yPx);
-        c.stroke();
-        c.fillStyle='rgba(255,255,255,0.7)';
-        c.font='9px IBM Plex Mono';
-        c.textAlign='right';
-        c.textBaseline='bottom';
-        c.fillText('SPOT '+fB(spot),right-4,yPx-4);
         c.restore();
       }
     }]
