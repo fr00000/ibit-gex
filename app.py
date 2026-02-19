@@ -4309,14 +4309,12 @@ def detect_structural_patterns(levels, spot_btc, venue_breakdown=None, changes_v
     return patterns
 
 
-def run_analysis(ticker='IBIT', save=True):
-    """Run AI analysis across all DTEs. Returns analysis dict or raises."""
+def build_analysis_data(ticker='IBIT'):
+    """Build the analysis data summaries dict for a ticker.
+    Returns the same data blob that gets sent to the AI as prompt context."""
     cfg = TICKER_CONFIG.get(ticker)
     if not cfg:
         raise ValueError(f'Unknown ticker: {ticker}')
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if not api_key:
-        raise RuntimeError('ANTHROPIC_API_KEY not set')
 
     dtes = DTE_WINDOWS  # list of (label, min_dte, max_dte)
     results = {}
@@ -4588,6 +4586,21 @@ def run_analysis(ticker='IBIT', save=True):
     except Exception as e:
         log.error(f"[predictions] Accuracy query failed: {e}")
 
+    summaries['_live_ref_price'] = live_ref_price
+    return summaries
+
+
+def run_analysis(ticker='IBIT', save=True):
+    """Run AI analysis across all DTEs. Returns analysis dict or raises."""
+    cfg = TICKER_CONFIG.get(ticker)
+    if not cfg:
+        raise ValueError(f'Unknown ticker: {ticker}')
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise RuntimeError('ANTHROPIC_API_KEY not set')
+
+    summaries = build_analysis_data(ticker)
+    live_ref_price = summaries.pop('_live_ref_price', None)
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
     asset = cfg['asset_label']
@@ -4846,6 +4859,20 @@ def api_analysis():
     if prev:
         return Response(json.dumps(prev), mimetype='application/json')
     return Response(json.dumps({'status': 'pending'}), mimetype='application/json')
+
+
+@app.route('/api/analysis-data')
+def api_analysis_data():
+    """Return the raw data blob that would be sent to AI analysis."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+    try:
+        summaries = build_analysis_data(ticker)
+        summaries.pop('_live_ref_price', None)
+        return Response(json.dumps(summaries, cls=NumpyEncoder, indent=1), mimetype='application/json')
+    except Exception as e:
+        return Response(json.dumps({'error': str(e)}), mimetype='application/json'), 500
 
 
 @app.route('/api/analyze', methods=['POST'])

@@ -1209,6 +1209,7 @@ function renderAiPanel(){
   h+=`<div style="display:flex;gap:4px">`;
   if(aiUnsaved)h+=`<button class="ai-btn ai-btn-save" id="ai-save-btn" onclick="saveAnalysis()" title="Save analysis for today">SAVE</button>`;
   h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
+  h+=`<button class="ai-btn" id="ai-copy-data-btn" onclick="copyAnalysisData()" title="Copy raw data to clipboard">DATA</button>`;
   h+=`</div></div>`;
   if(aiData&&aiData._timestamp){
     h+=`<div style="font-size:9px;color:var(--t3);margin-bottom:4px">Updated ${esc(aiData._timestamp)}${aiData._btc_price?' · BTC '+fB(aiData._btc_price):''}</div>`;
@@ -1261,6 +1262,38 @@ async function runAnalysis(){
     console.error('Analysis error:',e);
     const b2=document.getElementById('ai-analyze-btn');
     if(b2){b2.disabled=false;b2.innerHTML='&#x21bb;'}
+  }
+}
+
+async function copyAnalysisData(){
+  const btn=document.getElementById('ai-copy-data-btn');
+  if(!btn)return;
+  btn.disabled=true;
+  btn.textContent='...';
+  try{
+    const resp=await fetch(`/api/analysis-data?ticker=${currentTicker}`);
+    const data=await resp.json();
+    if(data.error)throw new Error(data.error);
+    await navigator.clipboard.writeText(JSON.stringify(data,null,1));
+    btn.textContent='\u2713';
+    setTimeout(()=>{btn.disabled=false;btn.textContent='DATA'},2000);
+  }catch(e){
+    console.error('Copy data error:',e);
+    try{
+      const resp2=await fetch(`/api/analysis-data?ticker=${currentTicker}`);
+      const data2=await resp2.json();
+      const ta=document.createElement('textarea');
+      ta.value=JSON.stringify(data2,null,1);
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      btn.textContent='\u2713';
+      setTimeout(()=>{btn.disabled=false;btn.textContent='DATA'},2000);
+    }catch(e2){
+      btn.disabled=false;btn.textContent='FAIL';
+      setTimeout(()=>{btn.textContent='DATA'},2000);
+    }
   }
 }
 
