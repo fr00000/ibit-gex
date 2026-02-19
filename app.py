@@ -4788,7 +4788,7 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-opus-4-6",
-        max_tokens=8192,
+        max_tokens=16384,
         system=system_prompt,
         messages=[{
             "role": "user",
