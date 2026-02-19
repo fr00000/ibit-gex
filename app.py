@@ -3566,6 +3566,28 @@ def _bg_refresh():
                         log.info(f"[bg-refresh] {tk} post-close analysis running...")
                         run_analysis(tk)
                         log.info(f"[bg-refresh] {tk} post-close analysis complete")
+
+                        # Save predictions with fresh post-close data
+                        try:
+                            conn = get_db()
+                            c = conn.cursor()
+                            already_saved = c.execute(
+                                'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
+                                (today, tk)).fetchone()
+                            if not already_saved:
+                                pred_results = {}
+                                for label, min_d, max_d in DTE_WINDOWS:
+                                    _, cached = get_latest_cache(tk, max_d)
+                                    if cached:
+                                        pred_results[label] = cached
+                                cached_analysis = get_cached_analysis(tk)
+                                if pred_results:
+                                    save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
+                                    log.info(f"[predictions] Saved {tk} predictions (post-close snapshot)")
+                            conn.close()
+                        except Exception as e:
+                            log.error(f"[predictions] Post-close save failed for {tk}: {e}")
+
                     except Exception as e:
                         log.error(f"[bg-refresh] {tk} post-close analysis error: {e}")
 
@@ -3579,38 +3601,34 @@ def _bg_refresh():
                         try:
                             run_analysis(tk)
                             log.info(f"[bg-refresh] {tk} weekend analysis complete")
+
+                            # Save predictions with weekend data
+                            try:
+                                conn = get_db()
+                                c = conn.cursor()
+                                already_saved = c.execute(
+                                    'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
+                                    (today, tk)).fetchone()
+                                if not already_saved:
+                                    pred_results = {}
+                                    for label, min_d, max_d in DTE_WINDOWS:
+                                        _, cached = get_latest_cache(tk, max_d)
+                                        if cached:
+                                            pred_results[label] = cached
+                                    cached_analysis = get_cached_analysis(tk)
+                                    if pred_results:
+                                        save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
+                                        log.info(f"[predictions] Saved {tk} predictions (weekend snapshot)")
+                                conn.close()
+                            except Exception as e:
+                                log.error(f"[predictions] Weekend save failed for {tk}: {e}")
+
                         except Exception as e:
                             log.error(f"[bg-refresh] {tk} weekend analysis error: {e}")
                         post_close_done[tk] = today
 
             except Exception as e:
                 log.error(f"[bg-refresh] {tk} post-close check error: {e}")
-
-            # 6 AM ET anchor: IBIT OI is from last close, Deribit is live,
-            # prediction is forward-looking for the trading day.
-            try:
-                from zoneinfo import ZoneInfo
-                now_et = datetime.now(ZoneInfo('America/New_York'))
-                if now_et.hour == 6 and now_et.minute < 30:
-                    conn = get_db()
-                    c = conn.cursor()
-                    already_saved = c.execute(
-                        'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
-                        (today, tk)).fetchone()
-                    if not already_saved:
-                        # Gather results for all DTE windows
-                        pred_results = {}
-                        for label, min_d, max_d in DTE_WINDOWS:
-                            _, cached = get_latest_cache(tk, max_d)
-                            if cached:
-                                pred_results[label] = cached
-                        cached_analysis = get_cached_analysis(tk)
-                        if pred_results:
-                            save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
-                            log.info(f"[predictions] Saved {tk} predictions (6 AM ET snapshot)")
-                    conn.close()
-            except Exception as e:
-                log.error(f"[predictions] Save failed for {tk}: {e}")
 
         # Score any expired predictions
         try:
