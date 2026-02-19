@@ -1309,12 +1309,12 @@ function renderOutlook(data){
 
   const emUpperPts=wins.map((w,i)=>point(i,w.em_upper)).filter(Boolean);
   const emLowerPts=wins.map((w,i)=>point(i,w.em_lower)).filter(Boolean);
-  const callWallPts=wins.map((w,i)=>point(i,w.call_wall));
-  const putWallPts=wins.map((w,i)=>point(i,w.put_wall));
-  const gammaFlipPts=wins.map((w,i)=>point(i,w.gamma_flip));
-  const deltaFlipPts=wins.map((w,i)=>w.delta_flip_btc?{x:xPositions[i],y:w.delta_flip_btc}:null);
-  const venueAgreeCW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.call_wall}:null);
-  const venueAgreePW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.put_wall}:null);
+  const callWallPts=wins.map((w,i)=>point(i,w.call_wall)).filter(Boolean);
+  const putWallPts=wins.map((w,i)=>point(i,w.put_wall)).filter(Boolean);
+  const gammaFlipPts=wins.map((w,i)=>point(i,w.gamma_flip)).filter(Boolean);
+  const deltaFlipPts=wins.map((w,i)=>w.delta_flip_btc?{x:xPositions[i],y:w.delta_flip_btc}:null).filter(Boolean);
+  const venueAgreeCW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.call_wall}:null).filter(Boolean);
+  const venueAgreePW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.put_wall}:null).filter(Boolean);
 
   const allVals=[spot,
     ...wins.map(w=>w.call_wall),...wins.map(w=>w.put_wall),
