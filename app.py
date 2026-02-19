@@ -871,6 +871,100 @@ def _compute_oi_signal(c):
     return score, detail, history
 
 
+def _compute_liquidation_signal(c):
+    """Signal 8: Liquidation Intensity (-13 to +13). Returns (score, detail, history)."""
+    # Historical daily totals for chart
+    hist_rows = c.execute(
+        '''SELECT date, value FROM coinglass_data
+           WHERE symbol='BTC' AND metric='total_liquidation_usd'
+           ORDER BY date DESC LIMIT 90'''
+    ).fetchall()
+
+    history = [{'date': r[0], 'liq_usd': r[1]} for r in hist_rows] if hist_rows else []
+    history.reverse()  # Oldest first for charts
+
+    # Today's long/short snapshot
+    snap = c.execute(
+        '''SELECT value, extra_json FROM coinglass_data
+           WHERE symbol='BTC' AND metric='liquidation_snapshot'
+           ORDER BY date DESC LIMIT 1'''
+    ).fetchone()
+
+    if not snap or not snap[1]:
+        return 0, 'No liquidation data', history
+
+    total_24h = snap[0]
+    try:
+        extra = json.loads(snap[1])
+    except (json.JSONDecodeError, TypeError):
+        return 0, 'Bad liquidation snapshot', history
+
+    long_24h = extra.get('long_24h', 0)
+    short_24h = extra.get('short_24h', 0)
+
+    # 30-day average daily liquidation for intensity baseline
+    if len(hist_rows) >= 7:
+        avg_30d = sum(r[1] for r in hist_rows[:30]) / min(30, len(hist_rows))
+    else:
+        return 0, 'Insufficient liquidation history', history
+
+    # Intensity multiplier: how extreme is today vs rolling average
+    # 1x = normal, 2x = elevated, 3x+ = massive
+    intensity = total_24h / avg_30d if avg_30d > 0 else 0
+
+    # Dominant side
+    long_ratio = long_24h / total_24h if total_24h > 0 else 0.5
+    dominant_side = 'long' if long_ratio > 0.65 else ('short' if long_ratio < 0.35 else 'balanced')
+
+    # Cross-reference BTC 7d price slope from candles
+    candle_rows = c.execute(
+        '''SELECT close FROM btc_candles
+           WHERE symbol='BTCUSDT' AND tf='1d'
+           ORDER BY time DESC LIMIT 7'''
+    ).fetchall()
+
+    price_slope = 'unknown'
+    if candle_rows and len(candle_rows) >= 2:
+        latest = candle_rows[0][0]
+        oldest = candle_rows[-1][0]
+        pct_chg = (latest - oldest) / oldest * 100 if oldest else 0
+        if pct_chg > 2:
+            price_slope = 'rising'
+        elif pct_chg < -2:
+            price_slope = 'falling'
+        else:
+            price_slope = 'flat'
+
+    score = 0
+    detail = (f'24h: ${total_24h/1e6:.0f}M (L:${long_24h/1e6:.0f}M / S:${short_24h/1e6:.0f}M), '
+              f'{intensity:.1f}x avg, {dominant_side}, price 7d {price_slope}')
+
+    # Scoring: intensity determines magnitude, side + price direction determines sign
+    # Need both elevated intensity AND a dominant side to generate a signal
+    if intensity >= 2.0 and dominant_side != 'balanced':
+        # Scale: 2x avg = base score, 3x+ = max score
+        magnitude = 6 if intensity < 3.0 else 13
+
+        if dominant_side == 'long':
+            # Heavy long liquidation = longs getting flushed = bullish (capitulation)
+            if price_slope in ('flat', 'rising'):
+                score = magnitude  # Capitulation complete, bottom signal
+                detail += ' | Long capitulation + price stabilizing'
+            else:
+                score = max(6, magnitude - 4)  # Flush in progress, not done yet
+                detail += ' | Long flush in progress'
+        elif dominant_side == 'short':
+            # Heavy short liquidation = shorts getting squeezed = bearish (exhaustion)
+            if price_slope in ('flat', 'falling'):
+                score = -magnitude  # Squeeze exhaustion, top signal
+                detail += ' | Short squeeze exhaustion'
+            else:
+                score = -max(6, magnitude - 4)  # Squeeze in progress
+                detail += ' | Short squeeze in progress'
+
+    return score, detail, history
+
+
 def _compute_score_history(conn, ticker, days=30):
     """Recompute full macro score (all 8 signals) for each of the last N days."""
     c = conn.cursor()
@@ -904,6 +998,16 @@ def _compute_score_history(conn, ticker, days=30):
     all_oi = c.execute(
         'SELECT date, value FROM coinglass_data WHERE symbol=? AND metric=? ORDER BY date DESC LIMIT 90',
         ('BTC', 'total_oi_usd')
+    ).fetchall()
+
+    all_liquidation = c.execute(
+        'SELECT date, value, extra_json FROM coinglass_data WHERE symbol=? AND metric=? ORDER BY date DESC LIMIT 90',
+        ('BTC', 'total_liquidation_usd')
+    ).fetchall()
+
+    all_liq_snapshots = c.execute(
+        'SELECT date, value, extra_json FROM coinglass_data WHERE symbol=? AND metric=? ORDER BY date DESC LIMIT 90',
+        ('BTC', 'liquidation_snapshot')
     ).fetchall()
 
     # Get dates we want scores for (oldest first)
@@ -1064,6 +1168,7 @@ def _compute_score_history(conn, ticker, days=30):
 
         # ── Signal 7: Open Interest ───────────────────────────────────
         oi_s = 0
+        oi_slope = 'unknown'
         oi = [r for r in all_oi if r[0] <= date_str]
         if len(oi) >= 7:
             oi_current = oi[0][1]
@@ -1082,9 +1187,31 @@ def _compute_score_history(conn, ticker, days=30):
             elif chg_from_peak > -5:
                 oi_s = -13 if funding_avg > 0 else -6
 
-        # ── Signal 8: Liquidation (stub) ──────────────────────────────
+        # ── Signal 8: Liquidation Intensity ───────────────────────────
+        liq_s = 0
+        liq_snap = next((r for r in all_liq_snapshots if r[0] <= date_str), None)
+        liq_hist = [r for r in all_liquidation if r[0] <= date_str]
+        if liq_snap and liq_snap[2] and len(liq_hist) >= 7:
+            try:
+                liq_extra = json.loads(liq_snap[2])
+                long_24h = liq_extra.get('long_24h', 0)
+                short_24h = liq_extra.get('short_24h', 0)
+                total_24h = long_24h + short_24h
+                avg_30d = sum(r[1] for r in liq_hist[:30]) / min(30, len(liq_hist))
+                intensity = total_24h / avg_30d if avg_30d > 0 else 0
+                long_ratio = long_24h / total_24h if total_24h > 0 else 0.5
+
+                if intensity >= 2.0 and (long_ratio > 0.65 or long_ratio < 0.35):
+                    magnitude = 6 if intensity < 3.0 else 13
+                    if long_ratio > 0.65:  # Long dominant
+                        liq_s = magnitude if oi_slope != 'falling' else max(6, magnitude - 4)
+                    else:  # Short dominant
+                        liq_s = -magnitude if oi_slope != 'rising' else -max(6, magnitude - 4)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         day_total = max(-100, min(100,
-            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s))
+            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s + liq_s))
 
         score_history.append({
             'date': date_str,
@@ -1096,7 +1223,7 @@ def _compute_score_history(conn, ticker, days=30):
             'venue': venue_s,
             'funding': funding_s,
             'oi': oi_s,
-            'liquidation': 0,
+            'liquidation': liq_s,
         })
 
     return score_history
@@ -1384,8 +1511,7 @@ def compute_macro_regime(conn, ticker, days=30):
     funding_score, funding_detail, funding_history = _compute_funding_signal(c)
     oi_score, oi_detail, oi_hist = _compute_oi_signal(c)
 
-    # Signal 8: Liquidation intensity (stub, needs calibration)
-    liquidation_score = 0
+    liquidation_score, liquidation_detail, liquidation_history = _compute_liquidation_signal(c)
 
     # ── Final Score ──────────────────────────────────────────────────────
     total_score = (regime_score + wall_migration_score + compression_score
@@ -1422,7 +1548,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'venue_convergence': {'score': venue_score, 'max': 12, 'detail': venue_detail},
             'funding_rate': {'score': funding_score, 'max': 13, 'detail': funding_detail, 'source': 'coinglass'},
             'aggregate_oi': {'score': oi_score, 'max': 13, 'detail': oi_detail, 'source': 'coinglass'},
-            'liquidation': {'score': liquidation_score, 'max': 1, 'detail': 'stub', 'source': 'coinglass'},
+            'liquidation': {'score': liquidation_score, 'max': 13, 'detail': liquidation_detail, 'source': 'coinglass'},
         },
         'history': {
             'wall_migration': wall_history,
@@ -1430,6 +1556,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'etf_flows': flow_history,
             'funding_rates': funding_history,
             'oi_history': oi_hist,
+            'liquidation_history': liquidation_history,
             'score_components_daily': score_history,
         },
         'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
@@ -1779,6 +1906,73 @@ def fetch_coinglass_data():
 
             except Exception as e:
                 log.warning(f"[coinglass] OI fetch failed: {e}")
+
+            # ── Endpoint 3: Aggregated Liquidation History ──────────────
+            try:
+                url_liq = (
+                    f'{COINGLASS_BASE_URL}/futures/liquidation/'
+                    f'aggregated-history?symbol=BTC&interval=1d&limit=90'
+                )
+                req = urllib.request.Request(url_liq, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    count = 0
+                    for pt in body['data']:
+                        ts = pt.get('time', 0)
+                        liq_val = pt.get('close')
+                        if liq_val is None:
+                            continue
+                        day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (day, 'BTC', 'total_liquidation_usd', float(liq_val), None)
+                        )
+                        count += 1
+                    log.info(f"[coinglass] Stored liquidation history for {count} days")
+                else:
+                    log.warning(f"[coinglass] Liquidation history response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] Liquidation history fetch failed: {e}")
+
+            # ── Endpoint 4: Liquidation Coin List (current snapshot) ───
+            try:
+                url_snap = f'{COINGLASS_BASE_URL}/futures/liquidation/coin-list'
+                req = urllib.request.Request(url_snap, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode('utf-8'))
+
+                if body.get('code') == '0' and body.get('data'):
+                    for coin in body['data']:
+                        if coin.get('symbol') != 'BTC':
+                            continue
+                        long_24h = coin.get('longLiquidationUsd24h', 0) or 0
+                        short_24h = coin.get('shortLiquidationUsd24h', 0) or 0
+                        total_24h = long_24h + short_24h
+                        extra = {
+                            'long_24h': long_24h, 'short_24h': short_24h,
+                            'long_12h': coin.get('longLiquidationUsd12h', 0) or 0,
+                            'short_12h': coin.get('shortLiquidationUsd12h', 0) or 0,
+                            'long_4h': coin.get('longLiquidationUsd4h', 0) or 0,
+                            'short_4h': coin.get('shortLiquidationUsd4h', 0) or 0,
+                            'long_1h': coin.get('longLiquidationUsd1h', 0) or 0,
+                            'short_1h': coin.get('shortLiquidationUsd1h', 0) or 0,
+                        }
+                        c.execute(
+                            'INSERT OR REPLACE INTO coinglass_data '
+                            '(date, symbol, metric, value, extra_json) VALUES (?, ?, ?, ?, ?)',
+                            (today, 'BTC', 'liquidation_snapshot', float(total_24h), json.dumps(extra))
+                        )
+                        log.info(f"[coinglass] Stored BTC liquidation snapshot: ${total_24h/1e6:.0f}M (L:${long_24h/1e6:.0f}M / S:${short_24h/1e6:.0f}M)")
+                        break
+                else:
+                    log.warning(f"[coinglass] Liquidation coin-list response code: {body.get('code')}, msg: {body.get('msg')}")
+
+            except Exception as e:
+                log.warning(f"[coinglass] Liquidation snapshot fetch failed: {e}")
 
             conn.commit()
 
