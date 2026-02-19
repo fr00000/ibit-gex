@@ -356,7 +356,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span><span style="color:rgba(255,64,96,0.9)">━</span> Call wall</span>
       <span><span style="color:rgba(0,220,130,0.9)">━</span> Put wall</span>
       <span><span style="color:rgba(255,176,32,0.4)">╌</span> γ Flip</span>
-      <span><span style="color:rgba(255,255,255,0.9)">▲</span> Δ Flip</span>
+      <span><span style="color:rgba(192,132,252,0.9)">▲</span> Δ Flip</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
       <span><span style="color:rgba(168,139,250,0.4)">╌</span> EM</span>
       <span><span style="display:inline-block;width:12px;height:4px;background:rgba(0,220,130,0.7);border-radius:1px"></span> Pos γ</span>
@@ -1368,7 +1368,7 @@ function renderOutlook(data){
         {label:'Call Wall',data:callWallPts,borderColor:'rgba(255,64,96,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(255,64,96,1)',fill:false,tension:0.2,order:2},
         {label:'Put Wall',data:putWallPts,borderColor:'rgba(0,220,130,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(0,220,130,1)',fill:false,tension:0.2,order:2},
         {label:'\u03b3 Flip',data:gammaFlipPts,borderColor:'rgba(255,176,32,0.3)',borderWidth:1,borderDash:[5,3],pointRadius:2,pointBackgroundColor:'rgba(255,176,32,0.5)',fill:false,tension:0.2,order:3},
-        {label:'\u0394 Flip',data:deltaFlipPts,borderColor:'rgba(255,255,255,0.25)',borderWidth:1,borderDash:[4,3],backgroundColor:'rgba(255,255,255,0.9)',pointRadius:6,pointStyle:'triangle',pointBorderColor:'rgba(255,255,255,1)',pointBorderWidth:1,showLine:true,fill:false,tension:0.2,order:1},
+        {label:'\u0394 Flip',data:deltaFlipPts,borderColor:'rgba(192,132,252,0.3)',borderWidth:1,borderDash:[4,3],backgroundColor:'rgba(192,132,252,0.9)',pointRadius:4,pointStyle:'triangle',pointBorderColor:'rgba(192,132,252,1)',pointBorderWidth:1,showLine:true,fill:false,tension:0.2,order:1},
         {label:'Venue Agree',data:venueAgreeCW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
         {label:'Venue Agree PW',data:venueAgreePW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
       ]
