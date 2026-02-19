@@ -393,13 +393,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <canvas id="structure-chart"></canvas>
     <canvas id="heatmap-chart" style="display:none"></canvas>
     <div id="struct-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(0,220,130,0.12);border:1px solid rgba(0,220,130,0.55);border-radius:1px"></span>0-3d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(0,180,220,0.10);border:1px solid rgba(0,180,220,0.45);border-radius:1px"></span>4-7d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(56,144,255,0.08);border:1px solid rgba(56,144,255,0.35);border-radius:1px"></span>8-14d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(255,176,32,0.06);border:1px solid rgba(255,176,32,0.25);border-radius:1px"></span>15-30d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:6px;background:rgba(168,139,250,0.06);border:1px solid rgba(168,139,250,0.25);border-radius:1px"></span>31-45d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:2px;background:rgba(220,224,232,0.9)"></span>Spot</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.6)"></span>&gamma; Flip</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.8)"></span>0-3d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,180,220,0.8)"></span>4-7d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(56,144,255,0.8)"></span>8-14d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,176,32,0.8)"></span>15-30d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(168,139,250,0.8)"></span>31-45d</span>
+      <span style="display:flex;align-items:center;gap:3px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:0;border-top:2px solid #8892a4"></span>CW</span>
+      <span style="display:flex;align-items:center;gap:3px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:0;border-top:2px dashed #8892a4"></span>PW</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>Spot</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.5)"></span>&gamma; Flip</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>Venue agree</span>
     </div>
     <div id="heat-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
@@ -1566,40 +1568,51 @@ function renderStructure(data){
   const labels=dates.map(d=>d.slice(5));
   const datasets=[];
 
-  // Bands: widest first (31-45d) to narrowest (0-3d) — fill between CW and PW
+  // Call walls: solid lines, put walls: dashed lines — same color per window
   for(const w of STRUCT_WINDOWS){
+    // Call wall — solid line
     datasets.push({
       label:w.label+' CW',
       data:dates.map(d=>data[d]?.windows?.[w.key]?.call_wall||null),
-      borderColor:w.border,borderWidth:w.bw,pointRadius:0,
-      fill:false,spanGaps:true,tension:0,
+      borderColor:w.border.replace(/[\d.]+\)$/,'0.8)'),
+      borderWidth:w.bw+0.5,
+      pointRadius:0,
+      fill:false,
+      spanGaps:true,
+      tension:0.2,
     });
+    // Put wall — dashed line, same color
     datasets.push({
       label:w.label+' PW',
       data:dates.map(d=>data[d]?.windows?.[w.key]?.put_wall||null),
-      borderColor:w.border,borderWidth:w.bw,pointRadius:0,
-      fill:'-1',backgroundColor:w.bg,spanGaps:true,tension:0,
+      borderColor:w.border.replace(/[\d.]+\)$/,'0.8)'),
+      borderWidth:w.bw+0.5,
+      borderDash:[6,3],
+      pointRadius:0,
+      fill:false,
+      spanGaps:true,
+      tension:0.2,
     });
   }
 
-  // Gamma flip (0-3d) — dashed amber
+  // Gamma flip (0-3d) — dashed yellow, thinner
   datasets.push({
     label:'γ Flip',
     data:dates.map(d=>data[d]?.windows?.['0-3']?.gamma_flip||null),
-    borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[4,3],
-    pointRadius:0,fill:false,spanGaps:true,tension:0,
+    borderColor:'rgba(255,176,32,0.5)',borderWidth:1.5,borderDash:[3,3],
+    pointRadius:0,fill:false,spanGaps:true,tension:0.2,
   });
 
-  // Spot — solid white
+  // Spot — solid white, prominent
   datasets.push({
     label:'Spot',
     data:dates.map(d=>data[d]?.spot||null),
-    borderColor:'rgba(220,224,232,0.9)',borderWidth:2.5,
-    pointRadius:2,pointBackgroundColor:'rgba(220,224,232,0.9)',
-    fill:false,spanGaps:true,tension:0,
+    borderColor:'rgba(255,255,255,0.95)',borderWidth:2.5,
+    pointRadius:2,pointBackgroundColor:'rgba(255,255,255,0.95)',
+    fill:false,spanGaps:true,tension:0.2,
   });
 
-  // Venue agreement markers on 0-3d call wall and put wall
+  // Venue agreement markers
   const hasAgree=dates.some(d=>data[d]?.windows?.['0-3']?.venue_agree);
   if(hasAgree){
     datasets.push({
