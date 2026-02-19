@@ -359,9 +359,9 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span><span style="color:rgba(255,255,255,0.7)">╌</span> Spot</span>
       <span><span style="color:rgba(255,255,255,0.9)">▲</span> Δ Flip</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
-      <span><span style="background:rgba(168,139,250,0.08);padding:0 4px;border-radius:1px">░</span> EM</span>
-      <span><span style="background:rgba(0,220,130,0.1);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
-      <span><span style="background:rgba(255,64,96,0.1);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
+      <span><span style="color:rgba(168,139,250,0.4)">╌</span> EM</span>
+      <span><span style="display:inline-block;width:12px;height:4px;background:rgba(0,220,130,0.7);border-radius:1px"></span> Pos γ</span>
+      <span><span style="display:inline-block;width:12px;height:4px;background:rgba(255,64,96,0.7);border-radius:1px"></span> Neg γ</span>
     </div>
   </div>
   <div class="cell cell-gex">
@@ -1329,8 +1329,8 @@ function renderOutlook(data){
     type:'line',
     data:{
       datasets:[
-        {label:'EM Upper',data:emUpperPts,borderColor:'transparent',borderWidth:0,pointRadius:0,fill:false,tension:0.3,order:10},
-        {label:'EM Lower',data:emLowerPts,borderColor:'transparent',borderWidth:0,pointRadius:0,fill:'-1',backgroundColor:'rgba(168,139,250,0.06)',tension:0.3,order:10},
+        {label:'EM Upper',data:emUpperPts,borderColor:'rgba(168,139,250,0.3)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0.3,order:10},
+        {label:'EM Lower',data:emLowerPts,borderColor:'rgba(168,139,250,0.3)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0.3,order:10},
         {label:'Call Wall',data:callWallPts,borderColor:'rgba(255,64,96,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(255,64,96,1)',fill:false,tension:0.2,order:2},
         {label:'Put Wall',data:putWallPts,borderColor:'rgba(0,220,130,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(0,220,130,1)',fill:false,tension:0.2,order:2},
         {label:'\u03b3 Flip',data:gammaFlipPts,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:3,pointBackgroundColor:'rgba(255,176,32,0.8)',fill:false,tension:0.2,order:3},
@@ -1343,6 +1343,7 @@ function renderOutlook(data){
       responsive:true,
       maintainAspectRatio:false,
       animation:{duration:300},
+      layout:{padding:{bottom:4}},
       interaction:{mode:'nearest',intersect:false,axis:'x'},
       plugins:{
         legend:{display:false},
@@ -1420,20 +1421,38 @@ function renderOutlook(data){
       id:'regimeBand',
       beforeDatasetsDraw(chart){
         const{ctx:c,chartArea:{top,bottom},scales:{x:xScale}}=chart;
+        const stripHeight=4;
         wins.forEach((w,i)=>{
           const x1=xScale.getPixelForValue(w.min_dte);
           const x2=xScale.getPixelForValue(w.max_dte);
-          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.08)':'rgba(0,220,130,0.08)';
-          c.fillRect(x1,top,x2-x1,bottom-top);
+          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.7)':'rgba(0,220,130,0.7)';
+          c.fillRect(x1,top,x2-x1,stripHeight);
+          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.03)':'rgba(0,220,130,0.03)';
+          c.fillRect(x1,top+stripHeight,x2-x1,bottom-top-stripHeight);
         });
       }
     },{
       id:'spotLine',
       afterDatasetsDraw(chart){
-        const{ctx:c,chartArea:{left,right},scales:{y}}=chart;
+        const{ctx:c,chartArea:{left,right},scales:{x:xScale,y}}=chart;
         const yPx=y.getPixelForValue(spot);
         if(yPx==null||!isFinite(yPx))return;
         c.save();
+        // Delta flip vertical connectors (spot → flip price)
+        wins.forEach((w,i)=>{
+          if(!w.delta_flip_btc)return;
+          const xPx=xScale.getPixelForValue(xPositions[i]);
+          const flipYPx=y.getPixelForValue(w.delta_flip_btc);
+          if(!isFinite(flipYPx))return;
+          c.strokeStyle='rgba(255,255,255,0.15)';
+          c.lineWidth=1;
+          c.setLineDash([3,3]);
+          c.beginPath();
+          c.moveTo(xPx,yPx);
+          c.lineTo(xPx,flipYPx);
+          c.stroke();
+        });
+        // Spot horizontal line
         c.strokeStyle='rgba(255,255,255,0.5)';
         c.lineWidth=1.5;
         c.setLineDash([8,4]);
