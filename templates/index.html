@@ -353,15 +353,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span></div>
     <canvas id="outlook-chart"></canvas>
     <div class="outlook-legend">
-      <span><span style="color:rgba(255,64,96,0.7)">━</span> Call wall</span>
-      <span><span style="color:rgba(0,220,130,0.7)">━</span> Put wall</span>
+      <span><span style="color:rgba(255,64,96,0.9)">━</span> Call wall</span>
+      <span><span style="color:rgba(0,220,130,0.9)">━</span> Put wall</span>
       <span><span style="color:rgba(255,176,32,0.6)">╌</span> γ Flip</span>
-      <span><span style="color:rgba(136,146,164,0.4)">╌</span> Max pain</span>
-      <span><span style="color:rgba(168,139,250,0.5)">╌</span> EM</span>
-      <span><span style="color:rgba(255,255,255,0.6)">▶</span> Spot</span>
+      <span><span style="color:rgba(255,255,255,0.7)">╌</span> Spot</span>
+      <span><span style="color:rgba(255,255,255,0.9)">▲</span> Δ Flip</span>
       <span><span style="color:rgba(0,220,130,0.9)">◆</span> Venues agree</span>
-      <span><span style="background:rgba(0,220,130,0.06);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
-      <span><span style="background:rgba(255,64,96,0.06);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
+      <span><span style="background:rgba(168,139,250,0.08);padding:0 4px;border-radius:1px">░</span> EM</span>
+      <span><span style="background:rgba(0,220,130,0.1);padding:0 4px;border-radius:1px">░</span> Pos γ</span>
+      <span><span style="background:rgba(255,64,96,0.1);padding:0 4px;border-radius:1px">░</span> Neg γ</span>
     </div>
   </div>
   <div class="cell cell-gex">
@@ -1298,56 +1298,52 @@ function renderOutlook(data){
   const spot=data.spot;
   if(!wins.length||!spot)return;
 
-  const labels=wins.map(w=>w.label);
-
-  // Datasets
-  const callWall=wins.map(w=>w.call_wall);
-  const putWall=wins.map(w=>w.put_wall);
-  const gammaFlip=wins.map(w=>w.gamma_flip);
-  const maxPain=wins.map(w=>w.max_pain);
-  const emUpper=wins.map(w=>w.em_upper);
-  const emLower=wins.map(w=>w.em_lower);
-
-  // Regime background colors per window
-  const regimeBg=wins.map(w=>w.regime==='negative_gamma'?'rgba(255,64,96,0.06)':'rgba(0,220,130,0.06)');
-
-  // Venue agreement diamonds
-  const venueAgree=wins.map(w=>w.venue_agree?w.call_wall:null);
-
   if(outlookChart){outlookChart.destroy();outlookChart=null}
 
-  // Compute y-axis range: encompass all levels with padding
-  const allVals=[spot,...callWall,...putWall,...gammaFlip,...maxPain,...emUpper,...emLower].filter(v=>v!=null&&isFinite(v));
+  // Proportional x-axis: use DTE midpoint as numeric position
+  const xPositions=wins.map(w=>(w.min_dte+w.max_dte)/2);
+  const labels=wins.map(w=>w.label);
+
+  // Build datasets using {x, y} point format for linear scale
+  const point=(i,val)=>val!=null?{x:xPositions[i],y:val}:null;
+
+  const emUpperPts=wins.map((w,i)=>point(i,w.em_upper)).filter(Boolean);
+  const emLowerPts=wins.map((w,i)=>point(i,w.em_lower)).filter(Boolean);
+  const callWallPts=wins.map((w,i)=>point(i,w.call_wall));
+  const putWallPts=wins.map((w,i)=>point(i,w.put_wall));
+  const gammaFlipPts=wins.map((w,i)=>point(i,w.gamma_flip));
+  const deltaFlipPts=wins.map((w,i)=>w.delta_flip_btc?{x:xPositions[i],y:w.delta_flip_btc}:null);
+  const venueAgreeCW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.call_wall}:null);
+  const venueAgreePW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.put_wall}:null);
+
+  const allVals=[spot,
+    ...wins.map(w=>w.call_wall),...wins.map(w=>w.put_wall),
+    ...wins.map(w=>w.gamma_flip),...wins.map(w=>w.em_upper),...wins.map(w=>w.em_lower),
+    ...wins.map(w=>w.delta_flip_btc)
+  ].filter(v=>v!=null&&isFinite(v));
   const yMin=Math.min(...allVals);
   const yMax=Math.max(...allVals);
-  const yPad=(yMax-yMin)*0.12||1000;
+  const yPad=(yMax-yMin)*0.1||1000;
 
   outlookChart=new Chart(ctx,{
     type:'line',
     data:{
-      labels,
       datasets:[
-        // EM cone (upper boundary)
-        {label:'EM Upper',data:emUpper,borderColor:'rgba(168,139,250,0.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,fill:false,tension:0,order:5},
-        // EM cone (lower boundary)
-        {label:'EM Lower',data:emLower,borderColor:'rgba(168,139,250,0.5)',borderWidth:1,borderDash:[4,3],pointRadius:0,fill:'-1',backgroundColor:'rgba(168,139,250,0.04)',tension:0,order:5},
-        // Call wall
-        {label:'Call Wall',data:callWall,borderColor:'rgba(255,64,96,0.7)',borderWidth:2,pointRadius:3,pointBackgroundColor:'rgba(255,64,96,0.9)',fill:false,tension:0,order:2},
-        // Put wall
-        {label:'Put Wall',data:putWall,borderColor:'rgba(0,220,130,0.7)',borderWidth:2,pointRadius:3,pointBackgroundColor:'rgba(0,220,130,0.9)',fill:false,tension:0,order:2},
-        // Gamma flip
-        {label:'\u03b3 Flip',data:gammaFlip,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:2,pointBackgroundColor:'rgba(255,176,32,0.7)',fill:false,tension:0,order:3},
-        // Max pain
-        {label:'Max Pain',data:maxPain,borderColor:'rgba(136,146,164,0.4)',borderWidth:1,borderDash:[3,4],pointRadius:2,pointBackgroundColor:'rgba(136,146,164,0.5)',fill:false,tension:0,order:4},
-        // Venue agreement diamonds
-        {label:'Venue Agree',data:venueAgree,borderColor:'rgba(0,220,130,0.9)',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:wins.map(w=>w.venue_agree?5:0),pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
+        {label:'EM Upper',data:emUpperPts,borderColor:'transparent',borderWidth:0,pointRadius:0,fill:false,tension:0.3,order:10},
+        {label:'EM Lower',data:emLowerPts,borderColor:'transparent',borderWidth:0,pointRadius:0,fill:'-1',backgroundColor:'rgba(168,139,250,0.06)',tension:0.3,order:10},
+        {label:'Call Wall',data:callWallPts,borderColor:'rgba(255,64,96,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(255,64,96,1)',fill:false,tension:0.2,order:2},
+        {label:'Put Wall',data:putWallPts,borderColor:'rgba(0,220,130,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(0,220,130,1)',fill:false,tension:0.2,order:2},
+        {label:'\u03b3 Flip',data:gammaFlipPts,borderColor:'rgba(255,176,32,0.6)',borderWidth:1.5,borderDash:[5,3],pointRadius:3,pointBackgroundColor:'rgba(255,176,32,0.8)',fill:false,tension:0.2,order:3},
+        {label:'\u0394 Flip',data:deltaFlipPts,borderColor:'transparent',backgroundColor:'rgba(255,255,255,0.9)',pointRadius:6,pointStyle:'triangle',pointBorderColor:'rgba(255,255,255,1)',pointBorderWidth:1,showLine:false,fill:false,order:1},
+        {label:'Venue Agree',data:venueAgreeCW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
+        {label:'Venue Agree PW',data:venueAgreePW,borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',pointRadius:5,pointStyle:'rectRot',pointBorderWidth:0,showLine:false,fill:false,order:1},
       ]
     },
     options:{
       responsive:true,
       maintainAspectRatio:false,
       animation:{duration:300},
-      interaction:{mode:'index',intersect:false},
+      interaction:{mode:'nearest',intersect:false,axis:'x'},
       plugins:{
         legend:{display:false},
         tooltip:{
@@ -1358,26 +1354,34 @@ function renderOutlook(data){
           bodyFont:{family:'IBM Plex Mono',size:10},
           padding:8,
           callbacks:{
-            title(items){return items[0]?.label||''},
+            title(items){
+              const xVal=items[0]?.parsed?.x;
+              const idx=xPositions.indexOf(xVal);
+              return idx>=0?labels[idx]:'';
+            },
             label(item){
-              const w=wins[item.dataIndex];
-              if(!w)return '';
+              const xVal=item.parsed?.x;
+              const idx=xPositions.indexOf(xVal);
+              const w=idx>=0?wins[idx]:null;
               const ds=item.dataset.label;
-              if(ds==='EM Upper')return `EM Upper: ${fB(item.raw)}`;
-              if(ds==='EM Lower')return `EM Lower: ${fB(item.raw)}`;
-              if(ds==='Call Wall')return `Call Wall: ${fB(item.raw)} (${w.regime==='negative_gamma'?'NEG \u03b3':'POS \u03b3'})`;
-              if(ds==='Put Wall')return `Put Wall: ${fB(item.raw)}`;
-              if(ds==='\u03b3 Flip')return `\u03b3 Flip: ${fB(item.raw)}`;
-              if(ds==='Max Pain')return `Max Pain: ${fB(item.raw)}`;
-              if(ds==='Venue Agree'&&item.raw!=null)return '\u25c6 IBIT+Deribit walls agree';
+              if(ds==='EM Upper'||ds==='EM Lower')return '';
+              if(ds==='Call Wall')return `Call Wall: ${fB(item.parsed.y)} (${w?.regime==='negative_gamma'?'NEG \u03b3':'POS \u03b3'})`;
+              if(ds==='Put Wall')return `Put Wall: ${fB(item.parsed.y)}`;
+              if(ds==='\u03b3 Flip')return `\u03b3 Flip: ${fB(item.parsed.y)}`;
+              if(ds==='\u0394 Flip')return `\u0394 Flip: ${fB(item.parsed.y)} \u2014 dealer pressure reverses here`;
+              if(ds==='Venue Agree'&&item.parsed.y!=null)return '\u25c6 Venues agree (CW)';
+              if(ds==='Venue Agree PW'&&item.parsed.y!=null)return '\u25c6 Venues agree (PW)';
               return '';
             },
             afterBody(items){
-              const w=wins[items[0]?.dataIndex];
+              const xVal=items[0]?.parsed?.x;
+              const idx=xPositions.indexOf(xVal);
+              const w=idx>=0?wins[idx]:null;
               if(!w)return '';
-              const lines=[];
-              if(w.dealer_delta_dir)lines.push(`Dealers ${w.dealer_delta_dir}`);
+              const lines=[`Spot: ${fB(spot)}`];
+              if(w.dealer_delta_dir)lines.push(`Dealers: net ${w.dealer_delta_dir}`);
               if(w.charm_dir)lines.push(`Charm: ${w.charm_dir}`);
+              if(w.delta_flip_btc)lines.push(`\u0394 Flip: ${fB(w.delta_flip_btc)}`);
               return lines.join('\n');
             }
           }
@@ -1385,13 +1389,28 @@ function renderOutlook(data){
       },
       scales:{
         x:{
-          grid:{color:'rgba(28,34,48,0.5)',lineWidth:0.5},
-          ticks:{font:{family:'IBM Plex Mono',size:9},color:'#4a5568'}
+          type:'linear',
+          min:0,
+          max:46,
+          grid:{color:'rgba(28,34,48,0.3)',lineWidth:0.5},
+          ticks:{
+            font:{family:'IBM Plex Mono',size:9},
+            color:'#4a5568',
+            callback:function(value){
+              const idx=xPositions.indexOf(value);
+              return idx>=0?labels[idx]:'';
+            },
+            autoSkip:false,
+            stepSize:1,
+          },
+          afterBuildTicks:function(axis){
+            axis.ticks=xPositions.map(x=>({value:x}));
+          }
         },
         y:{
           min:Math.floor((yMin-yPad)/1000)*1000,
           max:Math.ceil((yMax+yPad)/1000)*1000,
-          grid:{color:'rgba(28,34,48,0.5)',lineWidth:0.5},
+          grid:{color:'rgba(28,34,48,0.3)',lineWidth:0.5},
           ticks:{font:{family:'IBM Plex Mono',size:9},color:'#4a5568',callback:v=>fB(v)},
           position:'right'
         }
@@ -1400,30 +1419,33 @@ function renderOutlook(data){
     plugins:[{
       id:'regimeBand',
       beforeDatasetsDraw(chart){
-        const{ctx:c,chartArea:{left,right,top,bottom},scales:{x}}=chart;
-        const wins2=data.windows;
-        wins2.forEach((w,i)=>{
-          const xc=x.getPixelForValue(i);
-          const half=(right-left)/wins2.length/2;
-          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.04)':'rgba(0,220,130,0.04)';
-          c.fillRect(xc-half,top,half*2,bottom-top);
+        const{ctx:c,chartArea:{top,bottom},scales:{x:xScale}}=chart;
+        wins.forEach((w,i)=>{
+          const x1=xScale.getPixelForValue(w.min_dte);
+          const x2=xScale.getPixelForValue(w.max_dte);
+          c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.08)':'rgba(0,220,130,0.08)';
+          c.fillRect(x1,top,x2-x1,bottom-top);
         });
       }
     },{
-      id:'spotLabel',
+      id:'spotLine',
       afterDatasetsDraw(chart){
-        const{ctx:c,chartArea:{right},scales:{y}}=chart;
+        const{ctx:c,chartArea:{left,right},scales:{y}}=chart;
         const yPx=y.getPixelForValue(spot);
         if(yPx==null||!isFinite(yPx))return;
         c.save();
-        // Small arrow on right edge + label
-        c.fillStyle='rgba(255,255,255,0.6)';
+        c.strokeStyle='rgba(255,255,255,0.5)';
+        c.lineWidth=1.5;
+        c.setLineDash([8,4]);
         c.beginPath();
-        c.moveTo(right,yPx);
-        c.lineTo(right+5,yPx-4);
-        c.lineTo(right+5,yPx+4);
-        c.closePath();
-        c.fill();
+        c.moveTo(left,yPx);
+        c.lineTo(right,yPx);
+        c.stroke();
+        c.fillStyle='rgba(255,255,255,0.7)';
+        c.font='9px IBM Plex Mono';
+        c.textAlign='right';
+        c.textBaseline='bottom';
+        c.fillText('SPOT '+fB(spot),right-4,yPx-4);
         c.restore();
       }
     }]
