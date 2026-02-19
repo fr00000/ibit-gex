@@ -3642,6 +3642,14 @@ def api_outlook():
 
         charm = flow.get('charm', {})
 
+        flip_points = cached.get('delta_flip_points', [])
+        delta_flip_btc = None
+        if flip_points:
+            delta_flip_btc = flip_points[0].get('price_btc')
+            if delta_flip_btc is None:
+                fp_ibit = flip_points[0].get('price_ibit', 0)
+                delta_flip_btc = fp_ibit / bps if bps and fp_ibit else None
+
         windows.append({
             'label': f'{min_d}-{max_d}d',
             'min_dte': min_d,
@@ -3649,7 +3657,6 @@ def api_outlook():
             'call_wall': cw,
             'put_wall': pw,
             'gamma_flip': gf,
-            'max_pain': mp,
             'regime': regime,
             'net_gex': net_gex,
             'em_upper': em.get('upper_btc'),
@@ -3661,6 +3668,7 @@ def api_outlook():
             'deribit_pw': deribit_pw,
             'dealer_delta_dir': dd_dir,
             'charm_dir': charm.get('direction'),
+            'delta_flip_btc': round(delta_flip_btc) if delta_flip_btc else None,
         })
 
     return Response(json.dumps({
