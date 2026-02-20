@@ -4573,6 +4573,29 @@ def build_analysis_data(ticker='IBIT'):
                 },
             }
 
+        # GEX distribution: condensed per-strike profile for AI analysis
+        # Gives the AI the shape of the curve, not just the peaks
+        gex_chart = d.get('gex_chart', [])
+        if gex_chart:
+            # Sort by absolute GEX to get the most impactful strikes
+            sorted_by_gex = sorted(gex_chart, key=lambda x: abs(x.get('net_gex', 0)), reverse=True)
+            # Take top 20 strikes, then re-sort by BTC price for readable output
+            top_strikes = sorted(sorted_by_gex[:20], key=lambda x: x.get('btc', 0))
+            summaries[key]['gex_distribution'] = [
+                {
+                    'btc': round(s['btc']),
+                    'net_gex': round(s['net_gex']),
+                    'ibit_gex': round(s.get('ibit_gex', 0)),
+                    'deribit_gex': round(s.get('deribit_gex', 0)),
+                    'call_oi': s.get('call_oi', 0),
+                    'put_oi': s.get('put_oi', 0),
+                    'total_volume': s.get('total_volume', 0),
+                }
+                for s in top_strikes
+            ]
+        else:
+            summaries[key]['gex_distribution'] = []
+
         # Add day-over-day level changes if previous data exists
         prev_date, prev_data = get_prev_cache(ticker, max_d)
         if prev_data:
@@ -4710,6 +4733,9 @@ venue_breakdown (when present) shows per-venue positioning. Use it to identify d
 - If Deribit has a big wall that IBIT doesn't → crypto-native positioning that TradFi hasn't hedged around; watch for convergence
 - If gamma flips differ between venues → note which venue is in positive vs negative gamma territory
 Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
+
+GEX DISTRIBUTION:
+gex_distribution shows the top 20 strikes by GEX magnitude for each window, sorted by BTC price. Use this to assess whether support/resistance is concentrated at a single strike (sharp wall) or spread across a zone (gradient). A put wall backed by one large strike is easier to break than negative GEX spread across 5 strikes. Pay attention to the ibit_gex vs deribit_gex split — if one venue dominates at a level, it's less robust than both venues contributing.
 
 DATA FRESHNESS:
 data_freshness shows how stale each venue's data is. IBIT options data updates once per day at US market close (4:15 PM ET) — age_hours tells you how many hours since that last close. Deribit data is near real-time (cached up to 60 minutes) — age_minutes tells you minutes since last fetch. If IBIT age_hours > 16 (e.g., weekend or overnight), note that IBIT levels may be stale while Deribit reflects current positioning. If in_market_hours is true, IBIT data is from the current or most recent session and is fresh. On weekends, IBIT data can be 40+ hours old — Deribit levels become more reliable for current positioning.
