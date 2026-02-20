@@ -385,13 +385,23 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   </div>
   <div class="cell cell-structure">
     <div class="cell-label">
-      <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Structure</span>
-      <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heatmap</span>
-      <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heatmap</span>
+      <span class="cell-tab active" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
+      <span class="cell-tab" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Walls</span>
+      <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
+      <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
     </div>
-    <canvas id="structure-chart"></canvas>
+    <canvas id="range-cone-chart"></canvas>
+    <canvas id="structure-chart" style="display:none"></canvas>
     <canvas id="heatmap-chart" style="display:none"></canvas>
-    <div id="struct-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+    <div id="range-cone-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(168,139,250,0.3)"></span>EM</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:rgba(0,220,130,0.5)"></span>+GEX</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:rgba(255,64,96,0.5)"></span>&minus;GEX</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="color:rgba(192,132,252,0.9);font-size:7px">&#9650;</span>&Delta; Flip</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:rgba(255,176,32,0.7)"></span>&gamma; Flip</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,255,255,0.5)"></span>Spot</span>
+    </div>
+    <div id="struct-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.8)"></span>0-3d</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,180,220,0.8)"></span>4-7d</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(56,144,255,0.8)"></span>8-14d</span>
@@ -1193,6 +1203,7 @@ async function loadData(){
     try{renderAiPanel()}catch(e){console.warn('AI:',e)}
     loadOutlook();
     loadStructure();
+    loadRangeCone();
     loadMacro();
 
   }catch(e){
@@ -1476,19 +1487,23 @@ const STRUCT_WINDOWS=[
   {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
 ];
 
-let structView='walls';
+let structView='range';
 let heatmapData=null;
 function setStructView(view){
   structView=view;
   document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
+  const isRange=view==='range';
   const isWalls=view==='walls';
+  const isHeat=!isRange&&!isWalls;
+  document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('structure-chart').style.display=isWalls?'':'none';
-  document.getElementById('heatmap-chart').style.display=isWalls?'none':'';
+  document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
+  document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
-  document.getElementById('heat-legend').style.display=isWalls?'none':'flex';
+  document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
   document.getElementById('heat-legend-gex').style.display=view==='heatmap-gex'?'flex':'none';
-  if(!isWalls) loadHeatmap();
+  if(isHeat) loadHeatmap();
 }
 async function loadHeatmap(){
   try{
@@ -1595,6 +1610,216 @@ async function loadStructure(){
     renderStructure(d);
   }catch(e){console.warn('Structure:',e)}
   heatmapData=null; // invalidate cache on refresh
+}
+
+async function loadRangeCone(){
+  try{
+    const r=await fetch(`/api/range-cone?ticker=${currentTicker}`);
+    const d=await r.json();
+    if(d.error||!d.windows||!d.windows.length)return;
+    renderRangeCone(d);
+  }catch(e){console.warn('RangeCone:',e)}
+}
+
+function renderRangeCone(data){
+  const canvas=document.getElementById('range-cone-chart');
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=canvas.clientWidth*dpr;canvas.height=canvas.clientHeight*dpr;
+  ctx.scale(dpr,dpr);
+  const W=canvas.clientWidth,H=canvas.clientHeight;
+
+  const wins=data.windows;
+  const spot=data.spot;
+  if(!wins.length||!spot)return;
+
+  const pad={top:12,right:50,bottom:22,left:8};
+  const plotW=W-pad.left-pad.right;
+  const plotH=H-pad.top-pad.bottom;
+
+  // Proportional x positions by DTE midpoint
+  const xMids=wins.map(w=>(w.min_dte+w.max_dte)/2);
+  const xMax=46;
+  const xPos=xMids.map(m=>pad.left+(m/xMax)*plotW);
+
+  // Column widths (proportional to DTE span, capped)
+  const colWidths=wins.map(w=>{
+    const span=w.max_dte-w.min_dte+1;
+    return Math.min((span/xMax)*plotW*0.8,plotW/5*0.7);
+  });
+
+  // Y range — include all data points
+  let allY=[spot];
+  wins.forEach(w=>{
+    if(w.em_upper)allY.push(w.em_upper);
+    if(w.em_lower)allY.push(w.em_lower);
+    if(w.delta_flip)allY.push(w.delta_flip);
+    if(w.gamma_flip)allY.push(w.gamma_flip);
+    w.gex_zones.forEach(z=>allY.push(z.btc));
+  });
+  allY=allY.filter(v=>v!=null&&isFinite(v));
+  const yDataMin=Math.min(...allY);
+  const yDataMax=Math.max(...allY);
+  const yPad=(yDataMax-yDataMin)*0.08||1000;
+  const yMin=yDataMin-yPad;
+  const yMax=yDataMax+yPad;
+
+  const yToPixel=v=>pad.top+(1-(v-yMin)/(yMax-yMin))*plotH;
+  const pixelToY=p=>yMax-(p-pad.top)/plotH*(yMax-yMin);
+
+  // Interpolate GEX at a given price from sorted zones
+  function interpolateGex(zones,price){
+    if(!zones.length)return 0;
+    if(price<=zones[0].btc){
+      const dist=zones[0].btc-price;
+      return zones[0].gex*Math.max(0,1-dist/2000);
+    }
+    if(price>=zones[zones.length-1].btc){
+      const dist=price-zones[zones.length-1].btc;
+      return zones[zones.length-1].gex*Math.max(0,1-dist/2000);
+    }
+    for(let j=0;j<zones.length-1;j++){
+      if(price>=zones[j].btc&&price<=zones[j+1].btc){
+        const t=(price-zones[j].btc)/(zones[j+1].btc-zones[j].btc);
+        return zones[j].gex*(1-t)+zones[j+1].gex*t;
+      }
+    }
+    return 0;
+  }
+
+  // Clear
+  ctx.fillStyle='#06080c';
+  ctx.fillRect(0,0,W,H);
+
+  // 1. Grid lines
+  ctx.strokeStyle='rgba(28,34,48,0.4)';
+  ctx.lineWidth=0.5;
+  const yTicks=6;
+  for(let i=0;i<=yTicks;i++){
+    const val=yMin+(yMax-yMin)*i/yTicks;
+    const y=yToPixel(val);
+    ctx.beginPath();ctx.moveTo(pad.left,y);ctx.lineTo(pad.left+plotW,y);ctx.stroke();
+  }
+
+  // 2. GEX heatmap columns (continuous vertical strips)
+  const rowStep=Math.max(1,plotH/200);
+  wins.forEach((w,i)=>{
+    if(!w.gex_zones.length)return;
+    const maxGex=Math.max(...w.gex_zones.map(z=>Math.abs(z.gex)));
+    if(maxGex===0)return;
+    const colW=colWidths[i];
+    const x0=xPos[i]-colW/2;
+    for(let py=pad.top;py<pad.top+plotH;py+=rowStep){
+      const price=pixelToY(py);
+      const gex=interpolateGex(w.gex_zones,price);
+      if(Math.abs(gex)<maxGex*0.02)continue; // skip near-zero
+      const intensity=Math.abs(gex)/maxGex;
+      const alpha=(0.03+0.55*intensity).toFixed(2);
+      ctx.fillStyle=gex>0
+        ?`rgba(0,220,130,${alpha})`
+        :`rgba(255,64,96,${alpha})`;
+      ctx.fillRect(x0,py,colW,rowStep);
+    }
+  });
+
+  // 3. Expected move cone fill (behind borders)
+  const emUpper=wins.filter(w=>w.em_upper!=null);
+  const emLower=wins.filter(w=>w.em_lower!=null);
+  if(emUpper.length>1&&emLower.length>1){
+    ctx.beginPath();
+    emUpper.forEach((w,i)=>{
+      const xi=xPos[wins.indexOf(w)];
+      i===0?ctx.moveTo(xi,yToPixel(w.em_upper)):ctx.lineTo(xi,yToPixel(w.em_upper));
+    });
+    for(let i=emLower.length-1;i>=0;i--){
+      const xi=xPos[wins.indexOf(emLower[i])];
+      ctx.lineTo(xi,yToPixel(emLower[i].em_lower));
+    }
+    ctx.closePath();
+    ctx.fillStyle='rgba(168,139,250,0.06)';
+    ctx.fill();
+  }
+
+  // 4. Expected move cone borders (dashed, on top of columns)
+  if(emUpper.length>1&&emLower.length>1){
+    ctx.save();
+    ctx.setLineDash([4,4]);
+    ctx.strokeStyle='rgba(168,139,250,0.3)';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    emUpper.forEach((w,i)=>{
+      const xi=xPos[wins.indexOf(w)];
+      i===0?ctx.moveTo(xi,yToPixel(w.em_upper)):ctx.lineTo(xi,yToPixel(w.em_upper));
+    });
+    ctx.stroke();
+    ctx.beginPath();
+    emLower.forEach((w,i)=>{
+      const xi=xPos[wins.indexOf(w)];
+      i===0?ctx.moveTo(xi,yToPixel(w.em_lower)):ctx.lineTo(xi,yToPixel(w.em_lower));
+    });
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 5. Spot line
+  const spotY=yToPixel(spot);
+  ctx.save();
+  ctx.setLineDash([5,4]);
+  ctx.strokeStyle='rgba(255,255,255,0.5)';
+  ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(pad.left,spotY);ctx.lineTo(pad.left+plotW,spotY);ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle='rgba(255,255,255,0.6)';
+  ctx.font='8px "IBM Plex Mono",monospace';
+  ctx.textAlign='left';ctx.textBaseline='middle';
+  ctx.fillText('SPOT',pad.left+2,spotY-6);
+
+  // 6. Delta flip markers (purple triangles)
+  wins.forEach((w,i)=>{
+    if(!w.delta_flip)return;
+    const x=xPos[i],y=yToPixel(w.delta_flip);
+    ctx.beginPath();
+    ctx.moveTo(x,y-5);ctx.lineTo(x-4,y+3);ctx.lineTo(x+4,y+3);
+    ctx.closePath();
+    ctx.fillStyle='rgba(192,132,252,0.9)';
+    ctx.fill();
+  });
+
+  // 7. Gamma flip markers (yellow dots)
+  wins.forEach((w,i)=>{
+    if(!w.gamma_flip)return;
+    const x=xPos[i],y=yToPixel(w.gamma_flip);
+    ctx.beginPath();
+    ctx.arc(x,y,3,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,176,32,0.7)';
+    ctx.fill();
+  });
+
+  // 8. Regime strip at top
+  wins.forEach((w,i)=>{
+    const x1=xPos[i]-colWidths[i]/2;
+    const x2=xPos[i]+colWidths[i]/2;
+    ctx.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.6)':'rgba(0,220,130,0.6)';
+    ctx.fillRect(x1,pad.top,x2-x1,3);
+  });
+
+  // 9. X-axis labels
+  ctx.fillStyle='#4a5568';
+  ctx.font='9px "IBM Plex Mono",monospace';
+  ctx.textAlign='center';ctx.textBaseline='top';
+  wins.forEach((w,i)=>{
+    ctx.fillText(w.label,xPos[i],H-pad.bottom+6);
+  });
+
+  // 10. Y-axis labels (right side, BTC prices)
+  ctx.fillStyle='#4a5568';
+  ctx.font='8px "IBM Plex Mono",monospace';
+  ctx.textAlign='left';ctx.textBaseline='middle';
+  for(let i=0;i<=yTicks;i++){
+    const val=yMin+(yMax-yMin)*i/yTicks;
+    const y=yToPixel(val);
+    ctx.fillText((val/1000).toFixed(1)+'K',pad.left+plotW+4,y);
+  }
 }
 
 function renderStructure(data){
