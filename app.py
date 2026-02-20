@@ -3746,6 +3746,75 @@ def api_outlook():
     }, cls=NumpyEncoder), mimetype='application/json')
 
 
+@app.route('/api/range-cone')
+def api_range_cone():
+    """Return per-window expected move, GEX zones, and flip levels for range cone chart."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+
+    windows = []
+    spot_btc = None
+
+    for dte_key, min_d, max_d in DTE_WINDOWS:
+        _, cached = get_latest_cache(ticker, dte_key)
+        if not cached:
+            continue
+
+        if spot_btc is None:
+            spot_btc = cached.get('btc_spot')
+
+        bps = cached.get('btc_per_share', 1)
+        em = cached.get('expected_move') or {}
+        combined = cached.get('combined_levels_btc') or {}
+
+        # GEX distribution from gex_chart — fields: btc, net_gex
+        gex_chart = cached.get('gex_chart', [])
+        gex_zones = []
+        for row in gex_chart:
+            btc_price = row.get('btc', 0)
+            net_gex = row.get('net_gex', 0)
+            if btc_price and net_gex:
+                gex_zones.append({'btc': round(btc_price), 'gex': round(net_gex)})
+        gex_zones.sort(key=lambda x: abs(x['gex']), reverse=True)
+        gex_zones = gex_zones[:15]
+        gex_zones.sort(key=lambda x: x['btc'])
+
+        # Delta flip
+        flip_points = cached.get('delta_flip_points', [])
+        delta_flip = None
+        if flip_points:
+            delta_flip = flip_points[0].get('price_btc')
+            if delta_flip is None:
+                fp_ibit = flip_points[0].get('price_ibit', 0)
+                delta_flip = fp_ibit / bps if bps and fp_ibit else None
+
+        # Gamma flip
+        gamma_flip = None
+        if combined:
+            gamma_flip = combined.get('gamma_flip')
+        else:
+            gf_ibit = cached.get('levels', {}).get('gamma_flip', 0)
+            gamma_flip = gf_ibit / bps if bps and gf_ibit else None
+
+        windows.append({
+            'label': f'{min_d}-{max_d}d',
+            'min_dte': min_d,
+            'max_dte': max_d,
+            'em_upper': em.get('upper_btc'),
+            'em_lower': em.get('lower_btc'),
+            'gex_zones': gex_zones,
+            'delta_flip': round(delta_flip) if delta_flip else None,
+            'gamma_flip': round(gamma_flip) if gamma_flip else None,
+            'regime': (combined.get('regime') or cached.get('levels', {}).get('regime')),
+        })
+
+    return Response(json.dumps({
+        'spot': spot_btc,
+        'windows': windows,
+    }, cls=NumpyEncoder), mimetype='application/json')
+
+
 @app.route('/api/structure')
 def api_structure():
     conn = get_db()
