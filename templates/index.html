@@ -339,13 +339,13 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       </select>
     </div>
     <div class="chart-legend">
-      <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#00dc82"></div>Call Wall<div class="chart-legend-tip">Strike with highest call GEX. Acts as resistance — dealers sell into rallies here. In positive gamma this is a hard ceiling.</div></div>
-      <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#ff4060"></div>Put Wall<div class="chart-legend-tip">Strike with most negative put GEX. Acts as support — dealers buy dips here. In positive gamma this is a hard floor.</div></div>
+      <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#ff4060"></div>Call Wall<div class="chart-legend-tip">Strike with highest call GEX. Acts as resistance — dealers sell into rallies here. In positive gamma this is a hard ceiling.</div></div>
+      <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#00dc82"></div>Put Wall<div class="chart-legend-tip">Strike with most negative put GEX. Acts as support — dealers buy dips here. In positive gamma this is a hard floor.</div></div>
       <div class="chart-legend-item"><div class="chart-legend-line" style="border-color:#ffb020;border-width:2px"></div>&#x3b3; Flip<div class="chart-legend-tip">Where net GEX crosses zero. Above = positive gamma (dealers dampen moves, range-bound). Below = negative gamma (dealers amplify moves, trending).</div></div>
       <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#a78bfa"></div>Max Pain<div class="chart-legend-tip">Strike where option holders lose the most at expiry. Price gravitates here into expiration as dealers unwind hedges. Strongest pull in positive gamma.</div></div>
       <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#3890ff88"></div>EM &#xb1;<div class="chart-legend-tip">Expected Move — the market's priced-in range from the ATM straddle (~68% probability). Price is expected to stay within these bounds by expiration.</div></div>
-      <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#00dc8244"></div>R1/R2<div class="chart-legend-tip">Secondary resistance levels — high-OI strikes above the call wall where dealer hedging creates friction against further upside.</div></div>
-      <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#ff406044"></div>S1/S2<div class="chart-legend-tip">Secondary support levels — high-OI strikes below the put wall where dealer hedging creates friction against further downside.</div></div>
+      <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#ff406044"></div>R1/R2<div class="chart-legend-tip">Secondary resistance levels — high-OI strikes above the call wall where dealer hedging creates friction against further upside.</div></div>
+      <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#00dc8244"></div>S1/S2<div class="chart-legend-tip">Secondary support levels — high-OI strikes below the put wall where dealer hedging creates friction against further downside.</div></div>
       <div class="chart-legend-item"><div class="chart-legend-line dashed" style="border-color:#c084fc88"></div>&#x394; Flip<div class="chart-legend-tip">Price where net dealer delta crosses zero. Above = dealers must sell (resistive). Below = dealers must buy (supportive). Distinct from gamma flip.</div></div>
     </div>
   </div>
@@ -490,16 +490,16 @@ function updateChartOverlay(data){
       support=(data.levels.support||[]).map(s=>s/bps);
       resistance=(data.levels.resistance||[]).map(r=>r/bps);
     }
-    addLine(cw,'#00dc82','Call Wall',1,2);
-    addLine(pw,'#ff4060','Put Wall',1,2);
+    addLine(cw,'#ff4060','Call Wall',1,2);
+    addLine(pw,'#00dc82','Put Wall',1,2);
     addLine(gf,'#ffb020','\u03b3 Flip',2,2);
     addLine(mp,'#a78bfa','MaxPain',1,3);
     if(data.expected_move){
       addLine(data.expected_move.upper_btc,'#3890ff44','EM+',1,3);
       addLine(data.expected_move.lower_btc,'#3890ff44','EM-',1,3);
     }
-    support.forEach((s,i)=>{if(s!==pw)addLine(s,'#ff406044',`S${i+1}`,1,3)});
-    resistance.forEach((r,i)=>{if(r!==cw)addLine(r,'#00dc8244',`R${i+1}`,1,3)});
+    support.forEach((s,i)=>{if(s!==pw)addLine(s,'#00dc8244',`S${i+1}`,1,3)});
+    resistance.forEach((r,i)=>{if(r!==cw)addLine(r,'#ff406044',`R${i+1}`,1,3)});
     if(currentSource!=='deribit'&&data.delta_flip_points&&data.delta_flip_points.length){
       data.delta_flip_points.forEach((fp,i)=>{
         addLine(fp.price_btc,'#c084fc',`\u0394 Flip${data.delta_flip_points.length>1?' '+(i+1):''}`,1,4);
@@ -699,7 +699,7 @@ function renderGEX(data){
     options:{
       responsive:true,maintainAspectRatio:false,
       plugins:{
-        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6}},
+        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6,generateLabels:function(chart){if(currentSource==='all'&&chart.data.datasets.length===2){return chart.data.datasets.map((ds,i)=>({text:ds.label,fillStyle:i===0?'rgba(0,220,130,0.8)':'rgba(0,220,130,0.4)',strokeStyle:'transparent',lineWidth:0,datasetIndex:i,hidden:!chart.isDatasetVisible(i)}));}return Chart.defaults.plugins.legend.labels.generateLabels(chart);}}},
         tooltip:{callbacks:{
           title:i=>i[0].label,
           afterBody:function(items){
@@ -897,7 +897,7 @@ function renderSidebar(data){
   // Key Levels
   h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--blue)"></span>Key Levels${srcLabel}</div>`;
   const traj=lv.level_trajectory||{};
-  [{n:'Call Wall',s:useLv.call_wall,c:'var(--green)',tk:'call_wall'},{n:'Gamma Flip',s:useLv.gamma_flip,c:'var(--amber)',tk:'gamma_flip'},{n:'Max Pain',s:useLv.max_pain,c:'var(--purple)',tk:null},{n:'Put Wall',s:useLv.put_wall,c:'var(--red)',tk:'put_wall'}].forEach(k=>{
+  [{n:'Call Wall',s:useLv.call_wall,c:'var(--red)',tk:'call_wall'},{n:'Gamma Flip',s:useLv.gamma_flip,c:'var(--amber)',tk:'gamma_flip'},{n:'Max Pain',s:useLv.max_pain,c:'var(--purple)',tk:null},{n:'Put Wall',s:useLv.put_wall,c:'var(--green)',tk:'put_wall'}].forEach(k=>{
     let badge='';
     if(!useBtcDirect&&k.tk&&traj[k.tk]){
       const t=traj[k.tk];
