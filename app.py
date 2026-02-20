@@ -3777,7 +3777,7 @@ def api_range_cone():
             if btc_price and net_gex:
                 gex_zones.append({'btc': round(btc_price), 'gex': round(net_gex)})
         gex_zones.sort(key=lambda x: abs(x['gex']), reverse=True)
-        gex_zones = gex_zones[:15]
+        gex_zones = gex_zones[:25]
         gex_zones.sort(key=lambda x: x['btc'])
 
         # Delta flip
