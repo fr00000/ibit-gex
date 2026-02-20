@@ -3440,6 +3440,8 @@ def _bg_refresh():
 
     # Phase 2: Main loop — GEX refresh + candle updates
     last_candle_update = 0
+    # Track whether post-close refresh has been done today for each ticker
+    post_close_done = {}  # {ticker: date_string}
     while True:
         # Update candles every 5 minutes for all tickers
         now = time.time()
@@ -3481,12 +3483,11 @@ def _bg_refresh():
                             log.error(f"[bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
 
             if all_fresh:
-                # Auto-run AI analysis if not cached, or re-run if ref asset moved >2%
+                # Re-run AI analysis only if ref asset moved >2% since last analysis
+                # (Primary analysis is triggered post-close at 4:20 PM ET)
                 cached_analysis = get_cached_analysis(tk)
                 should_run = False
-                if not cached_analysis:
-                    should_run = True
-                elif cached_analysis.get('_btc_price'):
+                if cached_analysis and cached_analysis.get('_btc_price'):
                     try:
                         current_price = yf.Ticker(cfg['ref_ticker']).info.get('regularMarketPrice')
                         if current_price:
@@ -3499,7 +3500,7 @@ def _bg_refresh():
                         pass
                 if should_run:
                     try:
-                        log.info(f"[bg-refresh] Running {tk} AI analysis...")
+                        log.info(f"[bg-refresh] Running {tk} AI analysis (>2% move)...")
                         run_analysis(tk)
                         log.info(f"[bg-refresh] {tk} AI analysis complete and cached")
                     except Exception as e:
@@ -3535,31 +3536,99 @@ def _bg_refresh():
                 except Exception as e:
                     log.error(f"[bg-refresh] {tk} Deribit freshness check error: {e}")
 
-            # 6 AM ET anchor: IBIT OI is from last close, Deribit is live,
-            # prediction is forward-looking for the trading day.
+            # Post-close analysis: force-refresh IBIT windows after market close
+            # Yahoo options data updates ~4:15 PM ET. We trigger at 4:20 PM ET.
             try:
                 from zoneinfo import ZoneInfo
                 now_et = datetime.now(ZoneInfo('America/New_York'))
-                if now_et.hour == 6 and now_et.minute < 30:
-                    conn = get_db()
-                    c = conn.cursor()
-                    already_saved = c.execute(
-                        'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
-                        (today, tk)).fetchone()
-                    if not already_saved:
-                        # Gather results for all DTE windows
-                        pred_results = {}
-                        for label, min_d, max_d in DTE_WINDOWS:
-                            _, cached = get_latest_cache(tk, max_d)
-                            if cached:
-                                pred_results[label] = cached
-                        cached_analysis = get_cached_analysis(tk)
-                        if pred_results:
-                            save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
-                            log.info(f"[predictions] Saved {tk} predictions (6 AM ET snapshot)")
-                    conn.close()
+                is_trading_day = now_et.weekday() < 5
+                post_close_window = (now_et.hour == 16 and now_et.minute >= 20) or now_et.hour == 17
+                already_done_today = post_close_done.get(tk) == today
+
+                if is_trading_day and post_close_window and not already_done_today:
+                    log.info(f"[bg-refresh] {tk} post-close refresh: re-fetching all windows with fresh IBIT data...")
+
+                    # Force-refresh all DTE windows to pull new IBIT close data
+                    with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
+                        futures = {
+                            pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
+                            for label, min_d, max_d in REFRESH_DTES
+                        }
+                        for fut in as_completed(futures):
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                w = futures[fut]
+                                log.error(f"[bg-refresh] {tk} post-close DTE {w[1]}-{w[2]} error: {e}")
+
+                    # Run analysis with fresh data
+                    try:
+                        log.info(f"[bg-refresh] {tk} post-close analysis running...")
+                        run_analysis(tk)
+                        log.info(f"[bg-refresh] {tk} post-close analysis complete")
+
+                        # Save predictions with fresh post-close data
+                        try:
+                            conn = get_db()
+                            c = conn.cursor()
+                            already_saved = c.execute(
+                                'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
+                                (today, tk)).fetchone()
+                            if not already_saved:
+                                pred_results = {}
+                                for label, min_d, max_d in DTE_WINDOWS:
+                                    _, cached = get_latest_cache(tk, max_d)
+                                    if cached:
+                                        pred_results[label] = cached
+                                cached_analysis = get_cached_analysis(tk)
+                                if pred_results:
+                                    save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
+                                    log.info(f"[predictions] Saved {tk} predictions (post-close snapshot)")
+                            conn.close()
+                        except Exception as e:
+                            log.error(f"[predictions] Post-close save failed for {tk}: {e}")
+
+                    except Exception as e:
+                        log.error(f"[bg-refresh] {tk} post-close analysis error: {e}")
+
+                    post_close_done[tk] = today
+
+                # Weekend analysis: run once per day using Deribit-refreshed data
+                elif not is_trading_day and not already_done_today:
+                    cached_analysis = get_cached_analysis(tk)
+                    if not cached_analysis:
+                        log.info(f"[bg-refresh] {tk} weekend analysis (Deribit-primary)...")
+                        try:
+                            run_analysis(tk)
+                            log.info(f"[bg-refresh] {tk} weekend analysis complete")
+
+                            # Save predictions with weekend data
+                            try:
+                                conn = get_db()
+                                c = conn.cursor()
+                                already_saved = c.execute(
+                                    'SELECT 1 FROM predictions WHERE analysis_date=? AND ticker=? LIMIT 1',
+                                    (today, tk)).fetchone()
+                                if not already_saved:
+                                    pred_results = {}
+                                    for label, min_d, max_d in DTE_WINDOWS:
+                                        _, cached = get_latest_cache(tk, max_d)
+                                        if cached:
+                                            pred_results[label] = cached
+                                    cached_analysis = get_cached_analysis(tk)
+                                    if pred_results:
+                                        save_predictions(tk, DTE_WINDOWS, pred_results, cached_analysis)
+                                        log.info(f"[predictions] Saved {tk} predictions (weekend snapshot)")
+                                conn.close()
+                            except Exception as e:
+                                log.error(f"[predictions] Weekend save failed for {tk}: {e}")
+
+                        except Exception as e:
+                            log.error(f"[bg-refresh] {tk} weekend analysis error: {e}")
+                        post_close_done[tk] = today
+
             except Exception as e:
-                log.error(f"[predictions] Save failed for {tk}: {e}")
+                log.error(f"[bg-refresh] {tk} post-close check error: {e}")
 
         # Score any expired predictions
         try:
