@@ -1665,6 +1665,27 @@ function renderRangeCone(data){
   const yMax=yDataMax+yPad;
 
   const yToPixel=v=>pad.top+(1-(v-yMin)/(yMax-yMin))*plotH;
+  const pixelToY=p=>yMax-(p-pad.top)/plotH*(yMax-yMin);
+
+  // Interpolate GEX at a given price from sorted zones
+  function interpolateGex(zones,price){
+    if(!zones.length)return 0;
+    if(price<=zones[0].btc){
+      const dist=zones[0].btc-price;
+      return zones[0].gex*Math.max(0,1-dist/2000);
+    }
+    if(price>=zones[zones.length-1].btc){
+      const dist=price-zones[zones.length-1].btc;
+      return zones[zones.length-1].gex*Math.max(0,1-dist/2000);
+    }
+    for(let j=0;j<zones.length-1;j++){
+      if(price>=zones[j].btc&&price<=zones[j+1].btc){
+        const t=(price-zones[j].btc)/(zones[j+1].btc-zones[j].btc);
+        return zones[j].gex*(1-t)+zones[j+1].gex*t;
+      }
+    }
+    return 0;
+  }
 
   // Clear
   ctx.fillStyle='#06080c';
@@ -1680,7 +1701,28 @@ function renderRangeCone(data){
     ctx.beginPath();ctx.moveTo(pad.left,y);ctx.lineTo(pad.left+plotW,y);ctx.stroke();
   }
 
-  // 2. Expected move cone (filled area)
+  // 2. GEX heatmap columns (continuous vertical strips)
+  const rowStep=Math.max(1,plotH/200);
+  wins.forEach((w,i)=>{
+    if(!w.gex_zones.length)return;
+    const maxGex=Math.max(...w.gex_zones.map(z=>Math.abs(z.gex)));
+    if(maxGex===0)return;
+    const colW=colWidths[i];
+    const x0=xPos[i]-colW/2;
+    for(let py=pad.top;py<pad.top+plotH;py+=rowStep){
+      const price=pixelToY(py);
+      const gex=interpolateGex(w.gex_zones,price);
+      if(Math.abs(gex)<maxGex*0.02)continue; // skip near-zero
+      const intensity=Math.abs(gex)/maxGex;
+      const alpha=(0.03+0.55*intensity).toFixed(2);
+      ctx.fillStyle=gex>0
+        ?`rgba(0,220,130,${alpha})`
+        :`rgba(255,64,96,${alpha})`;
+      ctx.fillRect(x0,py,colW,rowStep);
+    }
+  });
+
+  // 3. Expected move cone fill (behind borders)
   const emUpper=wins.filter(w=>w.em_upper!=null);
   const emLower=wins.filter(w=>w.em_lower!=null);
   if(emUpper.length>1&&emLower.length>1){
@@ -1696,8 +1738,10 @@ function renderRangeCone(data){
     ctx.closePath();
     ctx.fillStyle='rgba(168,139,250,0.06)';
     ctx.fill();
+  }
 
-    // Cone borders (dashed)
+  // 4. Expected move cone borders (dashed, on top of columns)
+  if(emUpper.length>1&&emLower.length>1){
     ctx.save();
     ctx.setLineDash([4,4]);
     ctx.strokeStyle='rgba(168,139,250,0.3)';
@@ -1717,25 +1761,7 @@ function renderRangeCone(data){
     ctx.restore();
   }
 
-  // 3. GEX zones per window
-  wins.forEach((w,i)=>{
-    if(!w.gex_zones.length)return;
-    const maxGex=Math.max(...w.gex_zones.map(z=>Math.abs(z.gex)));
-    if(maxGex===0)return;
-    const colW=colWidths[i];
-    w.gex_zones.forEach(z=>{
-      const intensity=Math.abs(z.gex)/maxGex;
-      const barW=colW*(0.3+0.7*intensity);
-      const y=yToPixel(z.btc);
-      const barH=Math.max(2,plotH/80);
-      ctx.fillStyle=z.gex>0
-        ?`rgba(0,220,130,${(0.15+0.55*intensity).toFixed(2)})`
-        :`rgba(255,64,96,${(0.15+0.55*intensity).toFixed(2)})`;
-      ctx.fillRect(xPos[i]-barW/2,y-barH/2,barW,barH);
-    });
-  });
-
-  // 4. Spot line
+  // 5. Spot line
   const spotY=yToPixel(spot);
   ctx.save();
   ctx.setLineDash([5,4]);
@@ -1748,7 +1774,7 @@ function renderRangeCone(data){
   ctx.textAlign='left';ctx.textBaseline='middle';
   ctx.fillText('SPOT',pad.left+2,spotY-6);
 
-  // 5. Delta flip markers (purple triangles)
+  // 6. Delta flip markers (purple triangles)
   wins.forEach((w,i)=>{
     if(!w.delta_flip)return;
     const x=xPos[i],y=yToPixel(w.delta_flip);
@@ -1759,7 +1785,7 @@ function renderRangeCone(data){
     ctx.fill();
   });
 
-  // 6. Gamma flip markers (yellow dots)
+  // 7. Gamma flip markers (yellow dots)
   wins.forEach((w,i)=>{
     if(!w.gamma_flip)return;
     const x=xPos[i],y=yToPixel(w.gamma_flip);
@@ -1769,7 +1795,7 @@ function renderRangeCone(data){
     ctx.fill();
   });
 
-  // 7. Regime strip at top
+  // 8. Regime strip at top
   wins.forEach((w,i)=>{
     const x1=xPos[i]-colWidths[i]/2;
     const x2=xPos[i]+colWidths[i]/2;
@@ -1777,7 +1803,7 @@ function renderRangeCone(data){
     ctx.fillRect(x1,pad.top,x2-x1,3);
   });
 
-  // 8. X-axis labels
+  // 9. X-axis labels
   ctx.fillStyle='#4a5568';
   ctx.font='9px "IBM Plex Mono",monospace';
   ctx.textAlign='center';ctx.textBaseline='top';
@@ -1785,7 +1811,7 @@ function renderRangeCone(data){
     ctx.fillText(w.label,xPos[i],H-pad.bottom+6);
   });
 
-  // 9. Y-axis labels (right side, BTC prices)
+  // 10. Y-axis labels (right side, BTC prices)
   ctx.fillStyle='#4a5568';
   ctx.font='8px "IBM Plex Mono",monospace';
   ctx.textAlign='left';ctx.textBaseline='middle';
