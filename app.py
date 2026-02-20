@@ -3153,16 +3153,16 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
         # Regime-adjusted behavior
         if regime == 'negative_gamma':
             if ltype == 'put_wall':
-                behavior = "REACTION — scalp long, not conviction" if is_major else "minor support — dealers sell into bounce"
+                behavior = "acceleration zone — dealers sell + gamma amplifies" if is_major else "minor acceleration zone"
             elif ltype == 'call_wall':
-                behavior = "REACTION — brief cap, watch for breakout" if is_major else "minor resistance"
+                behavior = "mechanical resistance — dealers sell + gamma stabilizes" if is_major else "minor resistance"
             else:
                 behavior = "OI magnet — gravitational pull near expiry"
         else:
             if ltype == 'put_wall':
-                behavior = "HARD FLOOR — lever long with confidence" if is_major else "support — dealers buy into weakness"
+                behavior = "mechanical support — dealers buy + gamma stabilizes" if is_major else "minor support"
             elif ltype == 'call_wall':
-                behavior = "HARD CEILING — lever short with confidence" if is_major else "resistance — dealers sell into strength"
+                behavior = "mechanical resistance — dealers sell + gamma stabilizes" if is_major else "minor resistance"
             else:
                 behavior = "OI magnet — gravitational pull near expiry"
 
@@ -4698,39 +4698,48 @@ Use this to identify:
 - Cross-window convergence: When convergence shows "converging" for a wall, all timeframes are agreeing — high conviction. "Diverging" means timeframes disagree — lower conviction on that level.
 - Regime creep: If regime_changes > 0 in mid-term windows (8-14d), the gamma regime is unstable and the current regime label is less trustworthy.
 
-Don't mechanically list per-window changes — synthesize them into a structural narrative. "Floors are rising across all timeframes" or "near-term ceiling is compressing while structural ceiling holds — breakout setup building."
+Don't mechanically list per-window changes — synthesize them into a structural narrative. "Floors are rising across all timeframes" or "near-term ceiling is compressing while structural ceiling holds."
 
 Dealer Delta Scenario Analysis (dealer_delta_briefing): Pre-computed dealer hedging pressure at hypothetical price levels across the key level grid. 'current_delta' shows dealer positioning at spot. 'flip_summary' identifies where dealer pressure reverses direction. 'acceleration_zone' shows where dealers are most reactive to price moves. Negative dealer delta = dealers must BUY to hedge = supportive (acts as a bid). Positive dealer delta = dealers must SELL = resistive (acts as an offer). Use this to identify price levels where dealer hedging creates natural support or resistance, independent of the GEX profile.
 
 When analyzing dealer delta alongside GEX levels, look for CONVERGENCE and DIVERGENCE:
-- CONVERGENCE (high conviction): Put wall at $98K + dealers net buyers at $98K + level STRENGTHENING = strong support. Trade it.
+- CONVERGENCE (high conviction): Put wall at $98K + dealers net buyers at $98K + level STRENGTHENING = strong mechanical support.
 - DIVERGENCE (caution): Call wall at $105K but dealers still net buyers at $105K = wall may not hold because dealer hedging flow supports upside through it.
 - ACCELERATION ZONES: Where dealer delta changes fastest (high acceleration), small price moves trigger large hedging flows. These are inflection points — price tends to move quickly through these zones rather than consolidate.
 - DELTA FLIP vs GAMMA FLIP: These are different concepts. Gamma flip = where net GEX crosses zero (regime change). Delta flip = where dealer hedging direction reverses. When they're at different prices, the zone between them is a transition zone with mixed signals.
 
-For each timeframe, provide:
-- What changed overnight and why it matters (if changes_vs_prev available)
-- Regime summary and implication (1-2 sentences)
-- Historical context: Reference regime streak, level migration trends, and range evolution from _history_trends. Is today's positioning a continuation or a change?
-- Key levels in BTC price with level trajectory status (STRENGTHENING/WEAKENING/STABLE) and dominant expiry if near-term. Example: "Call wall $108,200 (STRENGTHENING, driven by Feb 21 exp — 3 DTE)"
-- Dealer delta context: Are dealers net buyers or sellers at spot? Where does pressure flip? Which key levels have the strongest dealer hedging behind them? Reference specific BTC prices and delta magnitudes from dealer_delta_briefing and key_level_dealer_delta (dollar notional).
-- Dealer flow direction (charm/vanna implications)
-- Risk assessment — specifically note where dealer delta ACCELERATES (acceleration_zone), as these are prices where moves become self-reinforcing
-- Actionable setup (if any clear one exists) — incorporate both GEX levels AND dealer delta direction. A level is strongest when BOTH GEX and dealer delta agree (e.g., put wall + dealers buying = high-conviction support). Flag levels where they diverge.
+CRITICAL RULES FOR GEX DISTRIBUTION INTERPRETATION:
+- Negative GEX = dealers AMPLIFY moves at that strike. It is NOT support. It is NOT resistance. It is NOT a floor. When price hits a negative GEX strike, dealers' hedging makes the move BIGGER, not smaller.
+- A put wall in negative gamma territory is where the most negative GEX is concentrated. It's the point of maximum amplification to the downside — not a "floor" or "support." Price can accelerate through it.
+- Positive GEX = dealers DAMPEN moves at that strike. This IS stabilizing — dealers buy dips and sell rallies around positive GEX strikes, creating mean reversion.
+- "Support" only exists at strikes where dealers are FORCED BUYERS (positive GEX below spot, or dealer delta is net short/buying). A negative GEX put wall where dealers are net long (selling) is mechanical downside acceleration, not support.
+- When describing negative GEX zones below spot, use language like "amplification zone," "acceleration zone," or "negative gamma gradient" — never "support," "floor," or "absorption."
+- The only exception: a strike with massive OI concentration can act as a gravitational magnet near expiry (pin risk) regardless of GEX sign, because max-pain dynamics create directional charm flow. Note this when relevant but distinguish it from GEX-based mechanical support.
 
-If a previous analysis is provided, use it to:
-- Check prior calls factually: state what was predicted, what happened, right or wrong. Never use self-congratulatory language like "proved prescient", "correctly called", "nailed it". Just: "Prior put wall $68,216 — not tested. Prior call wall $71,807 — held, spot reversed at $70,305."
-- Update your thesis based on how positioning evolved
-- Maintain continuity — don't repeat the same analysis if nothing changed, focus on what's new
+For each timeframe, describe the POSITIONING LANDSCAPE — what dealers are forced to do and where. Do NOT provide trade setups, entry/exit levels, stop losses, or directional recommendations. The user trades their own setups; your job is to show them the mechanical picture.
+
+For each timeframe, provide:
+
+STRUCTURE: One-line summary of the positioning regime and its mechanical consequence. Example: "Negative gamma, dealers amplify moves both directions. $880 range compressed 75% in 3 days."
+
+WHAT CHANGED: Use changes_vs_prev and _history_trends as the SOLE source for level changes. Never compare to prior analysis text. State: level migrations (direction + magnitude from the data), regime changes, OI shifts, PCR changes. Example: "Call wall fell $2,590 to $70,345 (8-14d). Put wall rose $4,566 to $66,827. PCR up 0.34 to 1.25 — put-heavy shift."
+
+WALLS & DISTRIBUTION: Describe the GEX distribution shape using gex_distribution data. Is support a sharp single-strike wall or a broad gradient? Is resistance concentrated or distributed? Identify the transition zone where GEX flips sign. Always state whether each level is single-venue (IBIT or Deribit only) or venue-convergent. Example: "Put support is a 6-strike negative gamma gradient from $61K to $67K, deepening from -$1.6M to -$6.4M. No single hard floor — each level amplifies rather than absorbs. Positive gamma starts abruptly at $67,707 (+$2.6M IBIT) through $68,500 (+$5M Deribit)."
+
+DEALER POSITIONING: Net delta, flip points, acceleration zones. Where are dealers forced buyers vs sellers? Which levels have dealer delta convergence with GEX (high conviction) vs divergence (GEX wall but dealers push through it)?
+
+FLOWS: Charm/vanna overnight direction and magnitude. Which venue dominates overnight flow? Is the flow structural or expiry-driven (will it vanish after the nearest expiry)?
+
+KEY RISK: The single most important thing that could change this picture — expiry clearing walls, regime flip approaching, venue divergence resolving, etc.
 
 MACRO REGIME SCORE (when present):
 _macro_regime contains the swing-trade regime score from -100 (topping) to +100 (bottoming).
 
 Score interpretation:
-- Score > 50 (SWING LONG): Bottoming conditions. Bias toward long setups at structural support.
-- Score < -50 (SWING SHORT): Topping conditions. Bias toward short setups at structural resistance.
-- Score -50 to +50 (NEUTRAL): No macro edge. Stick to tactical range-trading.
-- |Score| > 75 (HIGH CONVICTION): Strong directional bias. Mention structural_entry and invalidation.
+- Score > 50 (SWING LONG): Bottoming conditions detected.
+- Score < -50 (SWING SHORT): Topping conditions detected.
+- Score -50 to +50 (NEUTRAL): No macro edge.
+- |Score| > 75 (HIGH CONVICTION): Strong directional signal. Note structural_entry and invalidation levels.
 
 Key combinations:
 - regime_persistence + funding_rate agree -> strongest signal
@@ -4738,45 +4747,36 @@ Key combinations:
 - aggregate_oi flush + negative funding -> textbook capitulation
 - aggregate_oi at peak + positive funding -> textbook crowded top
 
-Do NOT override tactical analysis with macro score. A macro bottom doesn't mean "buy today" -- it means "the structural floor is forming, look for tactical entry near that floor."
-When swing_signal is true, include structural_entry and invalidation in TRADE PLAN as a SWING SETUP.
+Do NOT provide trade recommendations based on macro score. Describe the macro backdrop and let the reader draw conclusions.
 
-For the "all" key: provide cross-timeframe alignment analysis — whether short-term and long-term signals agree, overall directional bias, and the highest-conviction trade setup. Highlight any divergences between short-term and long-term positioning changes. Specifically:
-- Do dealer delta flip points align across timeframes? If the 7d delta flips at $104K but 14d flips at $107K, that gap is meaningful. If a delta flip DISAPPEARS in a longer window, that's a structural shift — call it out.
-- Are level trajectories consistent? If the call wall is STRENGTHENING on short-term but WEAKENING on longer-term, the wall has a shelf life.
-- What is the highest-conviction zone where GEX levels, dealer delta direction, level trajectory, and ETF flows ALL agree?
-- What happens when near-term walls expire? Identify which longer-dated levels take over and how the range changes. If 0-3d walls expire Monday, the Tuesday range is defined by 4-7d levels — state those explicitly.
+For the "all" key: provide a CROSS-TIMEFRAME POSITIONING MAP.
 
-Structure the cross-timeframe TRADE PLAN as:
-1. PRIMARY SETUP: The single highest-conviction trade. Entry zone, target, stop, timeframe. 2-3 lines max.
-2. INVALIDATION: What kills the setup and what to do (cut, reverse, go flat). 1-2 lines.
-3. SCENARIOS (if useful): Alternate paths with specific trigger levels. Upside/downside/vol scenarios.
+REGIME ALIGNMENT: List all 5 gamma flip points relative to spot. Are they clustered (strong consensus on regime) or scattered (transition zone)? Where does spot sit relative to each flip? Identify the most consequential flip — the one where crossing it changes the most windows.
 
-Keep the PRIMARY SETUP scannable — a trader should get the trade in 5 seconds of reading. Scenarios are optional context for those who want depth.
+DELTA FLIP LADDER: All delta flip points ordered by distance from spot. Which is nearest? Which windows have NO flip point (structural selling at all prices)? Total dollar magnitude of dealer selling pressure across all windows.
 
-ALWAYS lead each timeframe analysis with a single bold top-line: **BOTTOM LINE:** followed by the single most actionable takeaway in one sentence. This should answer "what do I do today?" — include direction (long/short/flat), the key price levels to watch, and the setup trigger. Examples:
-- "**BOTTOM LINE:** Fade rallies into $71,728 call wall, buy dips at $68,141 put wall — tight $3,500 range with positive gamma and dealer selling confirms both walls."
-- "**BOTTOM LINE:** Stay flat — gamma just flipped negative, dealer delta flipping at $104K means neither wall is reliable until positioning stabilizes."
-- "**BOTTOM LINE:** Long above $70,200 gamma flip targeting $72,750 delta flip — dealers are net short ~$33M notional creating a bid, but charm selling into $72.8M headwind caps upside speed."
+CONVERGENCE ZONES: Where do multiple windows agree on levels? A strike that's a put wall in 0-3d AND 8-14d AND shows Deribit agreement is higher conviction than a single-window level. A call wall that's also a delta flip point in another window is a key inflection.
 
-After the bottom line, state the EDGE in one sentence: why this setup has positive expected value. Reference the specific structural factor — venue convergence, regime history, dealer delta asymmetry, level trajectory — that makes this more than a coin flip. Example: "Edge: both venues agree on $68K put wall (HIGH CONVICTION) and positive gamma regime historically means-reverts within range."
+DISTRIBUTION SHAPE: Synthesize the per-window gex_distribution into an overall picture. Is the negative GEX below spot distributed (gradient) or concentrated (cliff)? Is the positive GEX above spot thick (multiple stabilizing strikes) or thin (one wall then nothing)?
 
-After the BOTTOM LINE and EDGE, include a structured causal mechanic:
+POST-EXPIRY SHIFT: What happens when the nearest expiry clears? Which levels disappear, which persist, and what does the range look like once near-term gamma expires? Identify specifically which longer-dated window's levels take over.
 
-**MECHANIC:** WHO [identify the constrained actor and their positioning] → WHOM [who is affected by their forced action] → WHAT [the specific forced action and its price consequence]
+VENUE PICTURE: Where do IBIT and Deribit agree vs diverge? Which venue dominates which timeframe? Are there levels where one venue has massive gamma that the other doesn't see?
 
-Examples:
-- "**MECHANIC:** WHO: Dealers short gamma at $104K call wall → WHOM: Directional longs above $104K → WHAT: Forced to sell rallies into $104K to maintain delta neutrality, capping upside and compressing range"
-- "**MECHANIC:** WHO: Deribit MMs long gamma below $98K put wall → WHOM: Short sellers targeting breakdown → WHAT: Forced to buy dips mechanically, creating a bid that absorbs selling pressure"
-- "**MECHANIC:** WHO: No dominant constraint — net GEX near zero, flip point at spot → WHOM: All participants → WHAT: No forced hedging flow; levels are informational, not structural. Reduce position sizing."
+STRUCTURAL BACKDROP: Macro regime score, ETF flow trend, funding rate, aggregate OI flush status. Is the structural backdrop confirming or contradicting the tactical positioning?
 
-The MECHANIC line forces you to identify whether there IS a structural constraint or not. If net GEX is near zero or positioning confidence is low, the correct MECHANIC is "no dominant constraint" — don't fabricate one. This is more valuable than a false signal.
+Do NOT include: trade plans, setups, entry/exit levels, stop losses, invalidation levels, scenario trees, directional recommendations, or language like "lever long/short," "fade rallies," "buy dips," "scalp," or "with confidence."
 
-Then provide 3-5 supporting bullet points. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+Lead each timeframe with:
+
+**POSITIONING:** One sentence describing the mechanical state. Not a trade signal — a structural description. Examples:
+- "Dealers net long $646M in negative gamma, amplifying moves both directions within $66,827-$67,707. Charm buying $27M overnight from 0 DTE decay."
+- "No delta flip at any price — $249M of structural selling regardless of direction. Distribution shows -$6.4M concentrated at $66,827 with -$2.5M gradient extending to $61,552."
+- "Regime just flipped — gamma flip at $67,408 is $491 above spot. Positive gamma starts at $67,500 (Deribit) and $67,707 (IBIT)."
+
+Follow with 3-5 concise bullet points covering: what changed, distribution shape, dealer positioning, flows, key risk. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
 ANALYSIS QUALITY RULES — follow these strictly:
-
-PRIOR CALLS: Be factual, not self-congratulatory. State prediction, outcome, right/wrong. No "proved prescient" or "correctly anticipated."
 
 FABRICATED NUMBERS: Never assign numerical confidence percentages to regime calls or level strength unless derived from actual data fields (like positioning_confidence). If net GEX is near zero, say "marginal positive gamma — net GEX near zero, regime could flip with small OI changes." Don't invent "50% confidence" or similar.
 
@@ -4786,7 +4786,9 @@ VANNA/VOL-CRUSH: Don't aggregate vanna or vol-crush notional across DTE windows 
 
 LARGE NUMBERS: When dealer delta or flow numbers exceed $500M, contextualize them. $2.14B dealer long across 31-45d is distributed across ~15 days of expiries — the per-day flow impact is ~$140M, not $2.14B. Compare to BTC daily volume (~$30-40B) when useful. Frame magnitudes relative to the relevant timeframe.
 
-BOTTOM LINE PRECISION: The bottom line must reference exact structural levels (gamma flip, delta flip, call/put wall), not spot price. "Hold longs above $70,372 gamma flip" not "Hold longs above $69,294" (that's just where spot happens to be). The reader needs to know which level to defend, not where price currently is.
+POSITIONING PRECISION: The analysis must reference exact structural levels (gamma flip, delta flip, call/put wall), not spot price. Identify levels by their structural role, not by where price currently is.
+
+NEGATIVE GEX LANGUAGE: Never describe negative gamma zones as "support," "floor," "absorption," "cushion," "buffer," or any language implying price stabilization. Negative GEX amplifies moves — it's acceleration, not support. If you find yourself writing "the put wall provides support," rewrite it: "the put wall marks the deepest negative GEX concentration — maximum amplification if breached." The ONLY mechanical support comes from positive GEX (dealers buying dips) or dealer delta being net short (forced buying). Check dealer_delta_briefing at the put wall — if dealers are net LONG there, they're selling into the decline, making the put wall an acceleration trigger, not a floor.
 
 DTE windows are NON-OVERLAPPING. Each timeframe shows distinct option positioning:
 - 0-3d: Immediate expirations. Highest gamma, strongest near-term hedging pressure. These are today's actionable levels.
@@ -4799,12 +4801,7 @@ When comparing across windows: if 0-3d and 4-7d call walls are at the same strik
 
 IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "31-45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
 
-    # Build user message with optional previous analysis
-    prev_analysis_date, prev_analysis = get_prev_analysis(ticker)
     user_content = f"Analyze the following {cfg['name']} GEX data across all timeframes:\n\n{prompt_data}"
-    if prev_analysis:
-        prev_json = json.dumps(prev_analysis, indent=1)
-        user_content += f"\n\n--- PREVIOUS ANALYSIS ({prev_analysis_date}) ---\n{prev_json}"
 
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
