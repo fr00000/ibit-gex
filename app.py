@@ -3330,12 +3330,17 @@ _last_yahoo_check = {}  # (ticker, dte) -> datetime
 _yahoo_check_lock = threading.Lock()
 
 
-def get_latest_cache(ticker, dte):
-    """Return the most recent cached data and its date, or (None, None)."""
+def get_latest_cache(ticker, dte, target_date=None):
+    """Return cached data and its date, or (None, None).
+    If target_date given, return that specific date's data."""
     conn = get_db()
     c = conn.cursor()
-    c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
-              (ticker, dte))
+    if target_date:
+        c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date=? LIMIT 1',
+                  (ticker, dte, target_date))
+    else:
+        c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+                  (ticker, dte))
     row = c.fetchone()
     conn.close()
     if row:
@@ -3656,10 +3661,29 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/snapshot/dates')
+def api_snapshot_dates():
+    """Return available snapshot dates for a ticker (only dates with at least 4 DTE windows)."""
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    if ticker not in TICKER_CONFIG:
+        return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+    conn = get_db()
+    c = conn.cursor()
+    rows = c.execute('''
+        SELECT date, COUNT(DISTINCT dte) as window_count
+        FROM data_cache WHERE ticker=?
+        GROUP BY date HAVING window_count >= 4
+        ORDER BY date DESC
+    ''', (ticker,)).fetchall()
+    conn.close()
+    return Response(json.dumps({'dates': [r[0] for r in rows]}), mimetype='application/json')
+
+
 @app.route('/api/outlook')
 def api_outlook():
     """Return key levels from all DTE windows for the outlook funnel chart."""
     ticker = request.args.get('ticker', 'IBIT').upper()
+    snapshot_date = request.args.get('date')
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
 
@@ -3667,7 +3691,7 @@ def api_outlook():
     spot_btc = None
 
     for dte_key, min_d, max_d in DTE_WINDOWS:
-        _, cached = get_latest_cache(ticker, dte_key)
+        _, cached = get_latest_cache(ticker, dte_key, target_date=snapshot_date)
         if not cached:
             continue
 
@@ -3750,6 +3774,7 @@ def api_outlook():
 def api_range_cone():
     """Return per-window expected move, GEX zones, and flip levels for range cone chart."""
     ticker = request.args.get('ticker', 'IBIT').upper()
+    snapshot_date = request.args.get('date')
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
 
@@ -3757,7 +3782,7 @@ def api_range_cone():
     spot_btc = None
 
     for dte_key, min_d, max_d in DTE_WINDOWS:
-        _, cached = get_latest_cache(ticker, dte_key)
+        _, cached = get_latest_cache(ticker, dte_key, target_date=snapshot_date)
         if not cached:
             continue
 
@@ -4033,8 +4058,18 @@ def api_data():
             return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
         dte = request.args.get('dte', 3, type=int)
         min_dte = request.args.get('min_dte', 0, type=int)
+        snapshot_date = request.args.get('date')
         dte = max(1, min(dte, 90))
         min_dte = max(0, min(min_dte, dte - 1))
+
+        if snapshot_date:
+            # Historical mode: serve from cache directly
+            _, cached = get_latest_cache(ticker, dte, target_date=snapshot_date)
+            if cached:
+                cached['snapshot_date'] = snapshot_date
+                return Response(json.dumps(cached, cls=NumpyEncoder), mimetype='application/json')
+            return Response(json.dumps({'error': f'No data for {snapshot_date}'}), mimetype='application/json'), 404
+
         try:
             data = fetch_with_cache(ticker, dte, min_dte)
         except (ValueError, KeyError):
@@ -5010,8 +5045,20 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
 def api_analysis():
     """GET cached analysis. Returns today's if available, otherwise most recent."""
     ticker = request.args.get('ticker', 'IBIT').upper()
+    snapshot_date = request.args.get('date')
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
+
+    if snapshot_date:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT analysis_json FROM analysis_cache WHERE ticker=? AND date=?', (ticker, snapshot_date))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return Response(row[0], mimetype='application/json')
+        return Response(json.dumps({'status': 'no analysis for this date'}), mimetype='application/json')
+
     cached = get_cached_analysis(ticker)
     if cached:
         return Response(json.dumps(cached), mimetype='application/json')
