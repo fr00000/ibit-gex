@@ -699,7 +699,7 @@ function renderGEX(data){
     options:{
       responsive:true,maintainAspectRatio:false,
       plugins:{
-        legend:{display:true,position:'top',align:'end',labels:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6,generateLabels:function(chart){if(currentSource==='all'&&chart.data.datasets.length===2){return chart.data.datasets.map((ds,i)=>({text:ds.label,fillStyle:i===0?'rgba(0,220,130,0.8)':'rgba(0,220,130,0.4)',strokeStyle:'transparent',lineWidth:0,datasetIndex:i,hidden:!chart.isDatasetVisible(i)}));}return Chart.defaults.plugins.legend.labels.generateLabels(chart);}}},
+        legend:{display:true,position:'top',align:'end',labels:{color:'#8896a6',font:{size:8,family:'IBM Plex Mono'},boxWidth:8,boxHeight:8,padding:6,generateLabels:function(chart){if(currentSource==='all'&&chart.data.datasets.length===2){return chart.data.datasets.map((ds,i)=>({text:ds.label,fillStyle:i===0?'rgba(0,220,130,0.8)':'rgba(0,220,130,0.4)',strokeStyle:'transparent',lineWidth:0,datasetIndex:i,hidden:!chart.isDatasetVisible(i),fontColor:'#8896a6'}));}return Chart.defaults.plugins.legend.labels.generateLabels(chart);}}},
         tooltip:{callbacks:{
           title:i=>i[0].label,
           afterBody:function(items){
