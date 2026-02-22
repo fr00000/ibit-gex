@@ -312,9 +312,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <option value="deribit">DERIBIT</option>
     </select>
     <span id="hdr-deribit" style="display:none;color:var(--t3);font-size:9px"></span>
+    <div class="hdr-sep"></div>
+    <select id="snapshot-select" onchange="onSnapshotChange()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
+      <option value="">LIVE</option>
+    </select>
     <button class="hdr-btn" onclick="loadData()">REFRESH</button>
   </div>
 </div>
+
+<div id="snapshot-banner" style="display:none;background:rgba(255,176,32,0.15);color:#ffb020;text-align:center;font-size:9px;font-weight:600;letter-spacing:1px;padding:2px 0;font-family:var(--mono)"></div>
 
 <div class="macro-bar" id="macro-bar" style="display:none">
   <span style="color:var(--t3)">MACRO</span>
@@ -436,6 +442,9 @@ let currentTicker='IBIT';
 let _loadSeq=0;
 let expiryFilter='all';
 let currentSource='all';
+let snapshotDate='';
+
+function dateParam(){return snapshotDate?`&date=${snapshotDate}`:''}
 const TICKER_WS={IBIT:'btcusdt',ETHA:'ethusdt'};
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
 const fB=n=>`$${Math.round(n).toLocaleString()}`;
@@ -528,6 +537,32 @@ function switchTicker(tk){
   document.querySelectorAll('.hdr-tab').forEach(b=>b.classList.toggle('active',b.dataset.ticker===tk));
   aiData=null;
   aiUnsaved=false;
+  loadData();
+  loadAnalysis();
+  loadSnapshotDates();
+}
+
+async function loadSnapshotDates(){
+  try{
+    const r=await fetch(`/api/snapshot/dates?ticker=${currentTicker}`);
+    const d=await r.json();
+    const sel=document.getElementById('snapshot-select');
+    const current=sel.value;
+    sel.innerHTML='<option value="">LIVE</option>';
+    (d.dates||[]).forEach(date=>{
+      const opt=document.createElement('option');
+      opt.value=date;
+      const dt=new Date(date+'T12:00:00');
+      opt.textContent=dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+      sel.appendChild(opt);
+    });
+    if(current&&(d.dates||[]).includes(current))sel.value=current;
+  }catch(e){console.warn('Snapshot dates:',e)}
+}
+
+function onSnapshotChange(){
+  snapshotDate=document.getElementById('snapshot-select').value;
+  if(!snapshotDate&&tvSeries)tvSeries.setMarkers([]);
   loadData();
   loadAnalysis();
 }
@@ -1110,7 +1145,7 @@ async function loadData(){
   try{
     const dteVal=document.getElementById('dte-select').value;
     const [minDte,maxDte]=dteVal.split('-').map(Number);
-    const resp=await fetch(`/api/data?ticker=${currentTicker}&dte=${maxDte}&min_dte=${minDte}`);
+    const resp=await fetch(`/api/data?ticker=${currentTicker}&dte=${maxDte}&min_dte=${minDte}${dateParam()}`);
     if(seq!==_loadSeq)return;
     const data=await resp.json();
     if(seq!==_loadSeq)return;
@@ -1182,12 +1217,29 @@ async function loadData(){
     if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
     else document.getElementById('hdr-exp').textContent='';
 
+    // Snapshot banner
+    const snapBanner=document.getElementById('snapshot-banner');
+    if(snapshotDate){
+      snapBanner.style.display='block';
+      const dt=new Date(snapshotDate+'T12:00:00');
+      snapBanner.textContent=`VIEWING SNAPSHOT: ${dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'})}`;
+    }else{snapBanner.style.display='none'}
+
     // Chart overlay
     try{
       if(tvSeries){
         const candles=await loadBTC();
         if(seq!==_loadSeq)return;
         if(candles.length) updateChartOverlay(data);
+      }
+      // Snapshot date marker
+      if(tvSeries){
+        if(snapshotDate){
+          const ts=Math.floor(new Date(snapshotDate+'T16:00:00').getTime()/1000);
+          tvSeries.setMarkers([{time:ts,position:'aboveBar',color:'#ffb020',shape:'arrowDown',text:'SNAPSHOT'}]);
+        }else{
+          tvSeries.setMarkers([]);
+        }
       }
     }catch(e){console.warn('Chart overlay:',e)}
 
@@ -1247,10 +1299,10 @@ function formatAiText(text){
 async function loadAnalysis(){
   // Fetch cached analysis; if pending, poll every 10s
   try{
-    const resp=await fetch(`/api/analysis?ticker=${currentTicker}`);
+    const resp=await fetch(`/api/analysis?ticker=${currentTicker}${dateParam()}`);
     const data=await resp.json();
-    if(data.status==='pending'){
-      setTimeout(loadAnalysis,10000);
+    if(data.status==='pending'||data.status==='no analysis for this date'){
+      if(!snapshotDate)setTimeout(loadAnalysis,10000);
       return;
     }
     aiData=data;
@@ -1328,7 +1380,7 @@ async function saveAnalysis(){
 // Outlook funnel
 async function loadOutlook(){
   try{
-    const r=await fetch(`/api/outlook?ticker=${currentTicker}`);
+    const r=await fetch(`/api/outlook?ticker=${currentTicker}${dateParam()}`);
     const d=await r.json();
     if(d.error||!d.windows||!d.windows.length){document.getElementById('outlook-chart').style.visibility='hidden';return}
     document.getElementById('outlook-chart').style.visibility='visible';
@@ -1614,7 +1666,7 @@ async function loadStructure(){
 
 async function loadRangeCone(){
   try{
-    const r=await fetch(`/api/range-cone?ticker=${currentTicker}`);
+    const r=await fetch(`/api/range-cone?ticker=${currentTicker}${dateParam()}`);
     const d=await r.json();
     if(d.error||!d.windows||!d.windows.length)return;
     renderRangeCone(d);
@@ -1939,6 +1991,7 @@ function renderStructure(data){
 try{initTV()}catch(e){console.warn('TV init:',e)}
 loadData();
 loadAnalysis();
+loadSnapshotDates();
 async function loadMacro(){
   try{
     const r=await fetch(`/api/macro-regime?ticker=${currentTicker}`);
@@ -1979,7 +2032,7 @@ async function loadMacro(){
 }
 
 // Auto-refresh GEX data every 30 min to match backend check interval
-setInterval(()=>{loadData();loadAnalysis()},30*60*1000);
+setInterval(()=>{if(!snapshotDate){loadData();loadAnalysis()}},30*60*1000);
 </script>
 </body>
 </html>
