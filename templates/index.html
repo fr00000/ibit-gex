@@ -1227,8 +1227,8 @@ async function loadData(){
     const snapBanner=document.getElementById('snapshot-banner');
     if(snapshotDate){
       snapBanner.style.display='block';
-      const dt=new Date(snapshotDate+'T12:00:00');
-      snapBanner.textContent=`VIEWING SNAPSHOT: ${dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'})}`;
+      const label=data.timestamp||snapshotDate;
+      snapBanner.textContent=`VIEWING SNAPSHOT: ${label}`;
     }else{snapBanner.style.display='none'}
 
     // Chart overlay
@@ -1241,8 +1241,9 @@ async function loadData(){
       // Snapshot date marker
       if(tvSeries){
         if(snapshotDate){
-          const ts=Math.floor(new Date(snapshotDate+'T16:00:00').getTime()/1000);
-          tvSeries.setMarkers([{time:ts,position:'aboveBar',color:'#ffb020',shape:'arrowDown',text:'SNAPSHOT'}]);
+          const snapTs=data.timestamp?Math.floor(new Date(data.timestamp.replace(' ','T')).getTime()/1000)
+            :Math.floor(new Date(snapshotDate+'T16:00:00').getTime()/1000);
+          tvSeries.setMarkers([{time:snapTs,position:'aboveBar',color:'#ffb020',shape:'arrowDown',text:'SNAPSHOT'}]);
         }else{
           tvSeries.setMarkers([]);
         }
@@ -1263,6 +1264,15 @@ async function loadData(){
     loadStructure();
     loadRangeCone();
     loadMacro();
+
+    // In snapshot mode, override macro freshness with snapshot's venue timestamps
+    if(snapshotDate&&data.data_freshness){
+      const frEl=document.getElementById('macro-freshness');
+      const p=[];
+      if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
+      if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
+      if(p.length)frEl.textContent=p.join('  \u00b7  ');
+    }
 
   }catch(e){
     console.error(e);
@@ -2030,7 +2040,7 @@ async function loadMacro(){
 
     const frEl=document.getElementById('macro-freshness');
     const fr=m.data_freshness;
-    if(fr){
+    if(fr&&!snapshotDate){
       const p=[];
       if(fr.ibit)p.push('IBIT '+fr.ibit.as_of);
       if(fr.deribit)p.push('DERIBIT '+fr.deribit.as_of);
