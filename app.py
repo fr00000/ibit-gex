@@ -2287,6 +2287,69 @@ def _compute_levels_from_df(df, spot, etf_flows=None):
     return levels
 
 
+def _process_deribit_options(deribit_options, btc_spot, rfr):
+    """Process raw Deribit options into strike data dict and DataFrame.
+    Returns (deribit_strike_data, deribit_df, deribit_oi_btc)."""
+    deribit_strike_data = {}
+    deribit_oi_btc = 0
+
+    for opt in deribit_options:
+        strike_btc = opt['strike']
+        oi = opt['oi']
+        iv = opt['iv'] / 100.0
+        btc_s = opt['underlying_price']
+        T = max(opt['dte'] / 365.0, 0.5 / 365)
+        opt_type = opt['option_type']
+        sign = 1 if opt_type == 'call' else -1
+
+        gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
+        delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
+        vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
+        charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
+
+        gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
+        dealer_delta = -delta * oi * 1 * btc_s
+        dealer_vanna = -vanna * oi * 1 * btc_s * 0.01
+        dealer_charm = -charm * oi * 1 / 365.0 * btc_s
+
+        deribit_oi_btc += oi
+
+        if strike_btc not in deribit_strike_data:
+            deribit_strike_data[strike_btc] = {
+                'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
+                'call_delta': 0, 'put_delta': 0,
+                'call_vanna': 0, 'put_vanna': 0,
+                'call_charm': 0, 'put_charm': 0,
+            }
+        d_entry = deribit_strike_data[strike_btc]
+        d_entry[f'{opt_type}_oi'] += oi
+        d_entry[f'{opt_type}_gex'] += gex
+        d_entry[f'{opt_type}_delta'] += dealer_delta
+        d_entry[f'{opt_type}_vanna'] += dealer_vanna
+        d_entry[f'{opt_type}_charm'] += dealer_charm
+
+    deribit_rows = []
+    for strike_btc, d in sorted(deribit_strike_data.items()):
+        deribit_rows.append({
+            'strike': strike_btc, 'btc_price': strike_btc,
+            'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
+            'total_oi': d['call_oi'] + d['put_oi'],
+            'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
+            'net_gex': d['call_gex'] + d['put_gex'],
+            'net_dealer_delta': d['call_delta'] + d['put_delta'],
+            'net_vanna': d['call_vanna'] + d['put_vanna'],
+            'net_charm': d['call_charm'] + d['put_charm'],
+            'call_vanna': d['call_vanna'], 'put_vanna': d['put_vanna'],
+            'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
+            'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+            'active_gex': d['call_gex'] + d['put_gex'],
+            'expiry_gex': {},
+        })
+    deribit_df = pd.DataFrame(deribit_rows) if deribit_rows else pd.DataFrame()
+
+    return deribit_strike_data, deribit_df, deribit_oi_btc
+
+
 def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     cfg = TICKER_CONFIG.get(ticker_symbol)
     is_crypto = cfg is not None
@@ -2455,69 +2518,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     deribit_strike_data = {}
     deribit_oi_btc = 0
     deribit_options = []
+    deribit_df = pd.DataFrame()
     if is_crypto and ticker_symbol == 'IBIT':
         try:
             deribit_options = fetch_deribit_options(min_dte, max_dte)
             if deribit_options:
                 deribit_available = True
-                for opt in deribit_options:
-                    strike_btc = opt['strike']
-                    oi = opt['oi']
-                    iv = opt['iv'] / 100.0  # Deribit gives IV as percentage
-                    btc_s = opt['underlying_price']
-                    T = max(opt['dte'] / 365.0, 0.5 / 365)
-                    opt_type = opt['option_type']
-                    sign = 1 if opt_type == 'call' else -1
-
-                    gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
-                    delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
-                    vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
-                    charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
-
-                    # Contract multiplier = 1 BTC (not 100 shares)
-                    gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
-                    dealer_delta = -delta * oi * 1 * btc_s  # dollar notional
-                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
-                    dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
-
-                    deribit_oi_btc += oi
-
-                    if strike_btc not in deribit_strike_data:
-                        deribit_strike_data[strike_btc] = {
-                            'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
-                            'call_delta': 0, 'put_delta': 0,
-                            'call_vanna': 0, 'put_vanna': 0,
-                            'call_charm': 0, 'put_charm': 0,
-                        }
-                    d_entry = deribit_strike_data[strike_btc]
-                    d_entry[f'{opt_type}_oi'] += oi
-                    d_entry[f'{opt_type}_gex'] += gex
-                    d_entry[f'{opt_type}_delta'] += dealer_delta
-                    d_entry[f'{opt_type}_vanna'] += dealer_vanna
-                    d_entry[f'{opt_type}_charm'] += dealer_charm
+                deribit_strike_data, deribit_df, deribit_oi_btc = _process_deribit_options(
+                    deribit_options, btc_spot, rfr
+                )
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
-
-    # Build Deribit DataFrame
-    deribit_rows = []
-    for strike_btc, d_entry in sorted(deribit_strike_data.items()):
-        deribit_rows.append({
-            'strike': strike_btc,
-            'btc_price': strike_btc,
-            'call_oi': d_entry['call_oi'], 'put_oi': d_entry['put_oi'],
-            'total_oi': d_entry['call_oi'] + d_entry['put_oi'],
-            'call_gex': d_entry['call_gex'], 'put_gex': d_entry['put_gex'],
-            'net_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'net_dealer_delta': d_entry['call_delta'] + d_entry['put_delta'],
-            'net_vanna': d_entry['call_vanna'] + d_entry['put_vanna'],
-            'net_charm': d_entry['call_charm'] + d_entry['put_charm'],
-            'call_vanna': d_entry['call_vanna'], 'put_vanna': d_entry['put_vanna'],
-            'call_charm': d_entry['call_charm'], 'put_charm': d_entry['put_charm'],
-            'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
-            'active_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'expiry_gex': {},
-        })
-    deribit_df = pd.DataFrame(deribit_rows) if deribit_rows else pd.DataFrame()
 
     # Build combined DataFrame (BTC-price-keyed)
     ibit_btc_df = df.copy()
@@ -3416,6 +3427,232 @@ def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
 
 REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 
+
+def _deribit_only_overlay(ticker):
+    """Re-fetch Deribit and overlay onto existing cached blobs.
+    Used when full refresh fails (weekends: Yahoo empty but Deribit alive).
+    Tries Yahoo for stale IBIT chains to enable full dealer delta recomputation."""
+    rfr = get_risk_free_rate()
+    cfg = TICKER_CONFIG.get(ticker)
+    is_crypto = cfg.get('is_crypto', False) if cfg else False
+
+    # Try to get IBIT chains from Yahoo (usually still serves Friday's data on weekends)
+    yahoo_chains = {}
+    yahoo_spot = None
+    try:
+        yticker = yf.Ticker(ticker)
+        yahoo_spot = yticker.info.get('regularMarketPrice')
+        if yahoo_spot is None:
+            hist = yticker.history(period="1d")
+            if not hist.empty:
+                yahoo_spot = float(hist['Close'].iloc[-1])
+        for exp_str in yticker.options:
+            try:
+                yahoo_chains[exp_str] = yticker.option_chain(exp_str)
+            except Exception:
+                continue
+        if yahoo_chains:
+            log.info(f"[deribit-overlay] Got {len(yahoo_chains)} IBIT chain(s) from Yahoo")
+    except Exception as e:
+        log.info(f"[deribit-overlay] Yahoo unavailable ({e}), proceeding without IBIT chains")
+
+    for label, min_d, max_d in REFRESH_DTES:
+        try:
+            cache_date, cached = get_latest_cache(ticker, max_d)
+            if not cached:
+                continue
+
+            btc_spot = cached.get('btc_spot')
+            spot = cached.get('spot')
+            if not btc_spot or not spot:
+                continue
+
+            ref_per_share = cached.get('btc_per_share', btc_spot / spot if spot else 1)
+
+            # Fetch fresh Deribit for this DTE window
+            deribit_options = fetch_deribit_options(min_d, max_d)
+            if not deribit_options:
+                continue
+
+            deribit_strike_data, deribit_df, deribit_oi_btc = _process_deribit_options(
+                deribit_options, btc_spot, rfr
+            )
+            if deribit_df.empty:
+                continue
+
+            # --- Rebuild IBIT DataFrame ---
+            # If Yahoo chains available, build proper IBIT df (same as fetch_and_analyze)
+            ibit_df = pd.DataFrame()
+            now = datetime.now(timezone.utc)
+            cutoff_max = (now + timedelta(days=max_d)).replace(hour=23, minute=59)
+            cutoff_min = (now + timedelta(days=min_d)).replace(hour=0, minute=0)
+            if yahoo_chains:
+                ibit_rows = []
+                for exp_str, chain in yahoo_chains.items():
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    if not (cutoff_min <= exp_date <= cutoff_max):
+                        continue
+                    T = max((exp_date - now).total_seconds() / 86400.0 / 365.0, 0.5 / 365)
+                    use_spot = yahoo_spot or spot
+                    for opt_type, df_chain, sign in [('call', chain.calls, 1), ('put', chain.puts, -1)]:
+                        for _, row in df_chain.iterrows():
+                            strike = row['strike']
+                            if strike < use_spot * (1 - STRIKE_RANGE_PCT) or strike > use_spot * (1 + STRIKE_RANGE_PCT):
+                                continue
+                            oi = row.get('openInterest', 0)
+                            if pd.isna(oi) or oi == 0:
+                                continue
+                            iv = row.get('impliedVolatility', 0)
+                            if pd.isna(iv) or iv <= 0:
+                                continue
+                            oi = int(oi)
+                            gamma = bs_gamma(use_spot, strike, T, rfr, float(iv))
+                            vanna_val = bs_vanna(use_spot, strike, T, rfr, float(iv))
+                            charm_val = bs_charm(use_spot, strike, T, rfr, float(iv), opt_type)
+                            gex = sign * gamma * oi * 100 * use_spot ** 2 * 0.01
+                            btc_p = round(strike / ref_per_share) if is_crypto else round(strike)
+                            ibit_rows.append({
+                                'strike': btc_p,
+                                'net_gex': gex,
+                                'net_vanna': -vanna_val * oi * 100 * use_spot * 0.01,
+                                'net_charm': -charm_val * oi * 100 / 365.0 * use_spot,
+                                'call_oi': oi if opt_type == 'call' else 0,
+                                'put_oi': oi if opt_type == 'put' else 0,
+                                'total_oi': oi,
+                                'net_dealer_delta': 0,
+                            })
+                if ibit_rows:
+                    ibit_df = pd.DataFrame(ibit_rows)
+                    ibit_df = ibit_df.groupby('strike', as_index=False).sum()
+                else:
+                    log.info(f"[deribit-overlay] Yahoo chains empty for DTE {min_d}-{max_d}, using cached IBIT data")
+
+            # If no Yahoo data, reconstruct approximate IBIT df from cached gex_chart
+            if ibit_df.empty:
+                gex_chart = cached.get('gex_chart', [])
+                approx_rows = []
+                for entry in gex_chart:
+                    i_gex = entry.get('ibit_gex', 0)
+                    if i_gex != 0:
+                        approx_rows.append({
+                            'strike': entry['btc'],
+                            'net_gex': i_gex,
+                            'net_vanna': 0,
+                            'net_charm': 0,
+                            'call_oi': 0, 'put_oi': 0, 'total_oi': 0,
+                            'net_dealer_delta': 0,
+                        })
+                ibit_df = pd.DataFrame(approx_rows) if approx_rows else pd.DataFrame()
+
+            # --- Compute combined data ---
+            if not ibit_df.empty and not deribit_df.empty:
+                combined_df = pd.concat([ibit_df, deribit_df], ignore_index=True)
+            elif not deribit_df.empty:
+                combined_df = deribit_df
+            else:
+                continue
+
+            # Levels
+            deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot)
+            combined_levels_btc = _compute_levels_from_df(combined_df, btc_spot)
+
+            # --- Update gex_chart ---
+            new_deribit_by_btc = {}
+            btc_lo, btc_hi = btc_spot * 0.82, btc_spot * 1.22
+            for _, row in deribit_df[(deribit_df['strike'] >= btc_lo) & (deribit_df['strike'] <= btc_hi)].iterrows():
+                new_deribit_by_btc[round(float(row['strike']))] = row
+
+            updated_chart = []
+            seen_btc = set()
+            for entry in cached.get('gex_chart', []):
+                btc_p = round(entry.get('btc', 0))
+                seen_btc.add(btc_p)
+                new_d = new_deribit_by_btc.get(btc_p)
+                new_d_gex = float(new_d['net_gex']) if new_d is not None else 0
+                i_gex = entry.get('ibit_gex', 0)
+                entry['deribit_gex'] = new_d_gex
+                entry['net_gex'] = i_gex + new_d_gex
+                updated_chart.append(entry)
+
+            # Add new Deribit-only strikes
+            for btc_p, row in new_deribit_by_btc.items():
+                if btc_p not in seen_btc:
+                    updated_chart.append({
+                        'strike': 0, 'btc': float(btc_p),
+                        'net_gex': float(row['net_gex']),
+                        'ibit_gex': 0, 'deribit_gex': float(row['net_gex']),
+                        'active_gex': float(row['net_gex']),
+                        'net_vanna': float(row['net_vanna']),
+                        'net_charm': float(row['net_charm']),
+                        'call_oi': int(row['call_oi']), 'put_oi': int(row['put_oi']),
+                        'total_oi': int(row['total_oi']),
+                        'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                        'expiry_breakdown': {},
+                    })
+            updated_chart.sort(key=lambda x: x.get('btc', 0))
+
+            # --- Recompute flow forecast ---
+            levels_for_forecast = combined_levels_btc or cached.get('levels', {})
+            flow_forecast = compute_flow_forecast(combined_df, btc_spot, levels_for_forecast, is_crypto)
+
+            # --- Recompute dealer delta scenarios (only if Yahoo chains available) ---
+            dealer_delta_profile = None
+            dealer_delta_briefing = None
+            delta_flip_points = []
+            if yahoo_chains:
+                try:
+                    window_chains = {
+                        exp: chain for exp, chain in yahoo_chains.items()
+                        if cutoff_min <= datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff_max
+                    }
+                    # Verify chains actually have option data (not just empty DataFrames)
+                    has_chain_data = any(
+                        not chain.calls.empty or not chain.puts.empty
+                        for chain in window_chains.values()
+                    )
+                    if window_chains and has_chain_data:
+                        use_spot = yahoo_spot or spot
+                        scenario_result = compute_dealer_delta_scenarios(
+                            window_chains, use_spot,
+                            cached.get('levels', {}),
+                            cached.get('expected_move'),
+                            rfr, ref_per_share, is_crypto,
+                            deribit_options=deribit_options
+                        )
+                        dealer_delta_profile = scenario_result['profile']
+                        delta_flip_points = scenario_result['flip_points']
+                        dealer_delta_briefing = generate_dealer_delta_briefing(
+                            scenario_result, use_spot, cached.get('levels', {}),
+                            ref_per_share, is_crypto
+                        )
+                except Exception as e:
+                    log.warning(f"[deribit-overlay] Dealer delta recompute failed: {e}")
+
+            # --- Apply updates to blob ---
+            cached['deribit_available'] = True
+            cached['deribit_oi_btc'] = float(deribit_oi_btc)
+            cached['deribit_net_gex'] = float(deribit_df['net_gex'].sum())
+            cached['deribit_levels_btc'] = {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                             for k, v in deribit_levels_btc.items()} if deribit_levels_btc else None
+            cached['combined_levels_btc'] = {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                              for k, v in combined_levels_btc.items()} if combined_levels_btc else None
+            cached['gex_chart'] = updated_chart
+            cached['flow_forecast'] = flow_forecast
+            if dealer_delta_profile is not None:
+                cached['dealer_delta_profile'] = dealer_delta_profile
+                cached['dealer_delta_briefing'] = dealer_delta_briefing
+                cached['delta_flip_points'] = delta_flip_points
+            cached['data_freshness']['deribit'] = _compute_deribit_freshness()
+            cached['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+            set_cached_data(ticker, max_d, cached)
+            log.info(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay applied"
+                     f" (dealer delta: {'yes' if dealer_delta_profile else 'no chains'})")
+
+        except Exception as e:
+            log.error(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay error: {e}")
+
+
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
     pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
@@ -3514,31 +3751,39 @@ def _bg_refresh():
 
             # Deribit intraday refresh: re-fetch hourly to keep Deribit data fresh
             # IBIT OI is EOD-only so it won't change, but Deribit OI/IV updates 24/7
-            if all_fresh and tk == 'IBIT':
+            if tk == 'IBIT':
                 try:
-                    # Check live Deribit age from in-memory cache (not stored JSON which is stale)
                     freshness = _compute_deribit_freshness()
                     age_min = freshness.get('age_minutes')
                     deribit_stale = age_min is None or age_min >= 65
 
                     if deribit_stale:
-                        log.info(f"[bg-refresh] {tk} Deribit data stale, refreshing all windows...")
                         with _deribit_lock:
                             _deribit_cache['time'] = 0
 
-                        with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
-                            futures = {
-                                pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
-                                for label, min_d, max_d in REFRESH_DTES
-                            }
-                            for fut in as_completed(futures):
-                                try:
-                                    fut.result()
-                                except Exception as e:
-                                    w = futures[fut]
-                                    log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
+                        if all_fresh:
+                            # Weekday: IBIT data is current, safe to do full refresh
+                            log.info(f"[bg-refresh] {tk} Deribit stale, full refresh (IBIT fresh)...")
+                            with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
+                                futures = {
+                                    pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
+                                    for label, min_d, max_d in REFRESH_DTES
+                                }
+                                for fut in as_completed(futures):
+                                    try:
+                                        fut.result()
+                                    except Exception as e:
+                                        w = futures[fut]
+                                        log.warning(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} failed: {e}")
+                            log.info(f"[bg-refresh] {tk} Deribit full refresh complete")
+                        else:
+                            # Weekend/Yahoo degraded: IBIT stale, overlay only
+                            # Don't call fetch_and_analyze — it would write blobs with
+                            # degraded IBIT data, corrupting dealer delta values
+                            log.info(f"[bg-refresh] {tk} Deribit stale, overlay only (IBIT stale)...")
+                            _deribit_only_overlay(tk)
+                            log.info(f"[bg-refresh] {tk} Deribit overlay complete")
 
-                        log.info(f"[bg-refresh] {tk} Deribit refresh complete")
                 except Exception as e:
                     log.error(f"[bg-refresh] {tk} Deribit freshness check error: {e}")
 
