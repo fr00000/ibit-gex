@@ -1227,8 +1227,8 @@ async function loadData(){
     const snapBanner=document.getElementById('snapshot-banner');
     if(snapshotDate){
       snapBanner.style.display='block';
-      const dt=new Date(snapshotDate+'T12:00:00');
-      snapBanner.textContent=`VIEWING SNAPSHOT: ${dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'})}`;
+      const label=data.timestamp||snapshotDate;
+      snapBanner.textContent=`VIEWING SNAPSHOT: ${label}`;
     }else{snapBanner.style.display='none'}
 
     // Chart overlay
@@ -1241,8 +1241,9 @@ async function loadData(){
       // Snapshot date marker
       if(tvSeries){
         if(snapshotDate){
-          const ts=Math.floor(new Date(snapshotDate+'T16:00:00').getTime()/1000);
-          tvSeries.setMarkers([{time:ts,position:'aboveBar',color:'#ffb020',shape:'arrowDown',text:'SNAPSHOT'}]);
+          const snapTs=data.timestamp?Math.floor(new Date(data.timestamp.replace(' ','T')).getTime()/1000)
+            :Math.floor(new Date(snapshotDate+'T16:00:00').getTime()/1000);
+          tvSeries.setMarkers([{time:snapTs,position:'aboveBar',color:'#ffb020',shape:'arrowDown',text:'SNAPSHOT'}]);
         }else{
           tvSeries.setMarkers([]);
         }
