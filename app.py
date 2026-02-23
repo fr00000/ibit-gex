@@ -1912,7 +1912,7 @@ def fetch_coinglass_data():
             try:
                 url_liq = (
                     f'{COINGLASS_BASE_URL}/futures/liquidation/'
-                    f'aggregated-history?symbol=BTC&interval=1d&limit=90'
+                    f'aggregated-history?symbol=BTC&interval=1d&limit=90&exchange_list=Binance,OKX,Bybit,Bitget,BingX,dYdX,CoinEx,Kraken,Bitmex'
                 )
                 req = urllib.request.Request(url_liq, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1922,8 +1922,10 @@ def fetch_coinglass_data():
                     count = 0
                     for pt in body['data']:
                         ts = pt.get('time', 0)
-                        liq_val = pt.get('close')
-                        if liq_val is None:
+                        long_liq = float(pt.get('aggregated_long_liquidation_usd', 0) or 0)
+                        short_liq = float(pt.get('aggregated_short_liquidation_usd', 0) or 0)
+                        liq_val = long_liq + short_liq
+                        if liq_val <= 0:
                             continue
                         day = datetime.fromtimestamp(ts / 1000).strftime('%Y-%m-%d')
                         c.execute(
@@ -1950,17 +1952,17 @@ def fetch_coinglass_data():
                     for coin in body['data']:
                         if coin.get('symbol') != 'BTC':
                             continue
-                        long_24h = coin.get('longLiquidationUsd24h', 0) or 0
-                        short_24h = coin.get('shortLiquidationUsd24h', 0) or 0
+                        long_24h = coin.get('long_liquidation_usd_24h', 0) or 0
+                        short_24h = coin.get('short_liquidation_usd_24h', 0) or 0
                         total_24h = long_24h + short_24h
                         extra = {
                             'long_24h': long_24h, 'short_24h': short_24h,
-                            'long_12h': coin.get('longLiquidationUsd12h', 0) or 0,
-                            'short_12h': coin.get('shortLiquidationUsd12h', 0) or 0,
-                            'long_4h': coin.get('longLiquidationUsd4h', 0) or 0,
-                            'short_4h': coin.get('shortLiquidationUsd4h', 0) or 0,
-                            'long_1h': coin.get('longLiquidationUsd1h', 0) or 0,
-                            'short_1h': coin.get('shortLiquidationUsd1h', 0) or 0,
+                            'long_12h': coin.get('long_liquidation_usd_12h', 0) or 0,
+                            'short_12h': coin.get('short_liquidation_usd_12h', 0) or 0,
+                            'long_4h': coin.get('long_liquidation_usd_4h', 0) or 0,
+                            'short_4h': coin.get('short_liquidation_usd_4h', 0) or 0,
+                            'long_1h': coin.get('long_liquidation_usd_1h', 0) or 0,
+                            'short_1h': coin.get('short_liquidation_usd_1h', 0) or 0,
                         }
                         c.execute(
                             'INSERT OR REPLACE INTO coinglass_data '
