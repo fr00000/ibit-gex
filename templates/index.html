@@ -444,6 +444,12 @@ let expiryFilter='all';
 let currentSource='all';
 let snapshotDate='';
 
+// Admin key: set via ?admin=KEY url param, stored in localStorage
+const urlAdmin=new URLSearchParams(window.location.search).get('admin');
+if(urlAdmin){localStorage.setItem('gex_admin_key',urlAdmin);window.history.replaceState({},'',window.location.pathname)}
+const adminKey=localStorage.getItem('gex_admin_key')||'';
+function adminHeaders(){return adminKey?{'X-Admin-Key':adminKey}:{}}
+
 function dateParam(){return snapshotDate?`&date=${snapshotDate}`:''}
 const TICKER_WS={IBIT:'btcusdt',ETHA:'ethusdt'};
 const fmt=n=>n>=1000?`$${n.toLocaleString('en-US',{maximumFractionDigits:0})}`:`$${n.toFixed(2)}`;
@@ -1271,8 +1277,10 @@ function renderAiPanel(){
   const aiDte=document.getElementById('dte-select').value+'d';
   let h=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis${aiUnsaved?'<span class="ai-unsaved">UNSAVED</span>':''}</div>`;
   h+=`<div style="display:flex;gap:4px">`;
-  if(aiUnsaved)h+=`<button class="ai-btn ai-btn-save" id="ai-save-btn" onclick="saveAnalysis()" title="Save analysis for today">SAVE</button>`;
-  h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
+  if(adminKey){
+    if(aiUnsaved)h+=`<button class="ai-btn ai-btn-save" id="ai-save-btn" onclick="saveAnalysis()" title="Save analysis for today">SAVE</button>`;
+    h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
+  }
   h+=`<button class="ai-btn" id="ai-copy-data-btn" onclick="copyAnalysisData()" title="Copy raw data to clipboard">DATA</button>`;
   h+=`</div></div>`;
   if(aiData&&aiData._timestamp){
@@ -1316,7 +1324,7 @@ async function runAnalysis(){
   btn.disabled=true;
   btn.innerHTML='<div class="spin" style="width:10px;height:10px;display:inline-block;vertical-align:middle;border-width:1.5px"></div>';
   try{
-    const resp=await fetch(`/api/analyze?ticker=${currentTicker}`,{method:'POST'});
+    const resp=await fetch(`/api/analyze?ticker=${currentTicker}`,{method:'POST',headers:adminHeaders()});
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     aiData=data;
@@ -1366,7 +1374,7 @@ async function saveAnalysis(){
   const btn=document.getElementById('ai-save-btn');
   if(btn){btn.disabled=true;btn.textContent='...';}
   try{
-    const resp=await fetch(`/api/analysis/save?ticker=${currentTicker}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(aiData)});
+    const resp=await fetch(`/api/analysis/save?ticker=${currentTicker}`,{method:'POST',headers:{...adminHeaders(),'Content-Type':'application/json'},body:JSON.stringify(aiData)});
     const data=await resp.json();
     if(data.error)throw new Error(data.error);
     aiUnsaved=false;
