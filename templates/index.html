@@ -1265,6 +1265,15 @@ async function loadData(){
     loadRangeCone();
     loadMacro();
 
+    // In snapshot mode, override macro freshness with snapshot's venue timestamps
+    if(snapshotDate&&data.data_freshness){
+      const frEl=document.getElementById('macro-freshness');
+      const p=[];
+      if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
+      if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
+      if(p.length)frEl.textContent=p.join('  \u00b7  ');
+    }
+
   }catch(e){
     console.error(e);
     document.getElementById('sidebar').innerHTML=`<div class="sec" style="color:var(--red)">Error: ${esc(e.message)}<br><br><button class="hdr-btn" onclick="loadData()">RETRY</button></div>`;
@@ -2031,7 +2040,7 @@ async function loadMacro(){
 
     const frEl=document.getElementById('macro-freshness');
     const fr=m.data_freshness;
-    if(fr){
+    if(fr&&!snapshotDate){
       const p=[];
       if(fr.ibit)p.push('IBIT '+fr.ibit.as_of);
       if(fr.deribit)p.push('DERIBIT '+fr.deribit.as_of);
