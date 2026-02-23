@@ -103,6 +103,7 @@ TICKER_CONFIG = {
 }
 
 COINGLASS_API_KEY = os.environ.get('COINGLASS_API_KEY')
+ADMIN_KEY = os.environ.get('ADMIN_KEY', '')
 
 _rfr_cache = {'rate': None, 'date': None}
 
@@ -5086,6 +5087,8 @@ def api_analysis_data():
 @app.route('/api/analyze', methods=['POST'])
 def api_analyze():
     """Re-run analysis without saving. Use /api/analysis/save to persist."""
+    if ADMIN_KEY and request.headers.get('X-Admin-Key') != ADMIN_KEY:
+        return Response(json.dumps({'error': 'Unauthorized'}), mimetype='application/json'), 403
     ticker = request.args.get('ticker', 'IBIT').upper()
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
@@ -5100,6 +5103,8 @@ def api_analyze():
 @app.route('/api/analysis/save', methods=['POST'])
 def api_analysis_save():
     """Save the provided analysis as today's cached analysis."""
+    if ADMIN_KEY and request.headers.get('X-Admin-Key') != ADMIN_KEY:
+        return Response(json.dumps({'error': 'Unauthorized'}), mimetype='application/json'), 403
     ticker = request.args.get('ticker', 'IBIT').upper()
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
@@ -5254,11 +5259,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', '-p', type=int, default=5000)
     parser.add_argument('--host', default='127.0.0.1')
+    parser.add_argument('--production', action='store_true', help='Run in production mode (no debug, no reloader)')
     args = parser.parse_args()
     init_db()
-    log.info(f"GEX Terminal → http://{args.host}:{args.port}")
-    # Start background refresh (skip reloader parent to avoid double threads)
-    debug_mode = True  # must match the debug= arg below
+    debug_mode = not args.production
+    log.info(f"GEX Terminal ({'production' if args.production else 'dev'}) → http://{args.host}:{args.port}")
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not debug_mode:
         start_bg_refresh()
     app.run(host=args.host, port=args.port, debug=debug_mode)
