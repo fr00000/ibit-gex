@@ -3416,6 +3416,134 @@ def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
 
 REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 
+
+def _refresh_deribit_only(ticker):
+    """Patch cached blobs with fresh Deribit data. Does NOT touch IBIT data,
+    dealer delta, flow forecast, or any other computed field.
+    Used when Yahoo/IBIT is unavailable (weekends)."""
+    rfr = get_risk_free_rate()
+
+    for label, min_d, max_d in REFRESH_DTES:
+        try:
+            cache_date, cached = get_latest_cache(ticker, max_d)
+            if not cached:
+                continue
+
+            btc_spot = cached.get('btc_spot')
+            if not btc_spot:
+                continue
+
+            # Fetch fresh Deribit for this DTE window
+            deribit_options = fetch_deribit_options(min_d, max_d)
+            if not deribit_options:
+                continue
+
+            # Process Deribit options (same math as fetch_and_analyze)
+            deribit_strike_data = {}
+            deribit_oi_btc = 0
+            for opt in deribit_options:
+                strike_btc = opt['strike']
+                oi = opt['oi']
+                iv = opt['iv'] / 100.0
+                btc_s = opt['underlying_price']
+                T = max(opt['dte'] / 365.0, 0.5 / 365)
+                opt_type = opt['option_type']
+                sign = 1 if opt_type == 'call' else -1
+
+                gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
+                gex = sign * gamma * oi * btc_s ** 2 * 0.01
+                deribit_oi_btc += oi
+
+                if strike_btc not in deribit_strike_data:
+                    deribit_strike_data[strike_btc] = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
+                deribit_strike_data[strike_btc][f'{opt_type}_gex'] += gex
+                deribit_strike_data[strike_btc][f'{opt_type}_oi'] += oi
+
+            # Build lookup: BTC strike -> net_gex
+            deribit_by_btc = {}
+            deribit_net_gex_total = 0
+            btc_lo, btc_hi = btc_spot * 0.82, btc_spot * 1.22
+            for strike_btc, d in deribit_strike_data.items():
+                net = d['call_gex'] + d['put_gex']
+                deribit_net_gex_total += net
+                if btc_lo <= strike_btc <= btc_hi:
+                    deribit_by_btc[round(strike_btc)] = net
+
+            # Patch gex_chart: update deribit_gex per bar, recalc net_gex
+            gex_chart = cached.get('gex_chart', [])
+            seen = set()
+            for entry in gex_chart:
+                btc_p = round(entry.get('btc', 0))
+                seen.add(btc_p)
+                new_d_gex = deribit_by_btc.get(btc_p, 0)
+                entry['deribit_gex'] = new_d_gex
+                entry['net_gex'] = entry.get('ibit_gex', 0) + new_d_gex
+
+            # Add Deribit-only strikes not already in chart
+            for btc_p, net_gex in deribit_by_btc.items():
+                if btc_p not in seen:
+                    gex_chart.append({
+                        'strike': 0, 'btc': float(btc_p),
+                        'net_gex': net_gex, 'ibit_gex': 0, 'deribit_gex': net_gex,
+                        'active_gex': net_gex,
+                        'net_vanna': 0, 'net_charm': 0,
+                        'call_oi': 0, 'put_oi': 0, 'total_oi': 0,
+                        'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                        'expiry_breakdown': {},
+                    })
+            gex_chart.sort(key=lambda x: x.get('btc', 0))
+
+            # Build simple Deribit-only df for level computation
+            deribit_rows = []
+            for strike_btc, d in sorted(deribit_strike_data.items()):
+                deribit_rows.append({
+                    'strike': strike_btc,
+                    'net_gex': d['call_gex'] + d['put_gex'],
+                    'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
+                    'total_oi': d['call_oi'] + d['put_oi'],
+                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+                    'active_gex': d['call_gex'] + d['put_gex'],
+                })
+            deribit_df = pd.DataFrame(deribit_rows)
+            deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if not deribit_df.empty else None
+
+            # Rebuild combined levels from patched gex_chart
+            combined_rows = []
+            for entry in gex_chart:
+                if entry.get('net_gex', 0) != 0:
+                    combined_rows.append({
+                        'strike': entry['btc'],
+                        'net_gex': entry['net_gex'],
+                        'call_oi': entry.get('call_oi', 0),
+                        'put_oi': entry.get('put_oi', 0),
+                        'total_oi': entry.get('total_oi', 0),
+                        'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+                        'active_gex': entry.get('active_gex', entry['net_gex']),
+                    })
+            combined_df = pd.DataFrame(combined_rows)
+            combined_levels_btc = _compute_levels_from_df(combined_df, btc_spot) if not combined_df.empty else None
+
+            # Patch blob — ONLY Deribit fields
+            cached['gex_chart'] = gex_chart
+            cached['deribit_available'] = True
+            cached['deribit_oi_btc'] = float(deribit_oi_btc)
+            cached['deribit_net_gex'] = float(deribit_net_gex_total)
+            if deribit_levels_btc:
+                cached['deribit_levels_btc'] = {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                                 for k, v in deribit_levels_btc.items()}
+            if combined_levels_btc:
+                cached['combined_levels_btc'] = {k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                                                  for k, v in combined_levels_btc.items()}
+            cached['data_freshness']['deribit'] = _compute_deribit_freshness()
+            cached['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+            set_cached_data(ticker, max_d, cached)
+            log.info(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay done")
+
+        except Exception as e:
+            log.error(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay error: {e}")
+
+
 def _bg_refresh():
     """Background thread: backfill candles on startup for all tickers,
     pre-fetch all DTEs, then periodically update candles (every 5 min) and re-check GEX data."""
@@ -3514,31 +3642,37 @@ def _bg_refresh():
 
             # Deribit intraday refresh: re-fetch hourly to keep Deribit data fresh
             # IBIT OI is EOD-only so it won't change, but Deribit OI/IV updates 24/7
-            if all_fresh and tk == 'IBIT':
+            if tk == 'IBIT':
                 try:
-                    # Check live Deribit age from in-memory cache (not stored JSON which is stale)
                     freshness = _compute_deribit_freshness()
                     age_min = freshness.get('age_minutes')
                     deribit_stale = age_min is None or age_min >= 65
 
                     if deribit_stale:
-                        log.info(f"[bg-refresh] {tk} Deribit data stale, refreshing all windows...")
                         with _deribit_lock:
                             _deribit_cache['time'] = 0
 
-                        with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
-                            futures = {
-                                pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
-                                for label, min_d, max_d in REFRESH_DTES
-                            }
-                            for fut in as_completed(futures):
-                                try:
-                                    fut.result()
-                                except Exception as e:
-                                    w = futures[fut]
-                                    log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
+                        if all_fresh:
+                            # Weekday: IBIT is current, safe to do full refresh
+                            log.info(f"[bg-refresh] {tk} Deribit stale, full refresh...")
+                            with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
+                                futures = {
+                                    pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
+                                    for label, min_d, max_d in REFRESH_DTES
+                                }
+                                for fut in as_completed(futures):
+                                    try:
+                                        fut.result()
+                                    except Exception as e:
+                                        w = futures[fut]
+                                        log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
+                            log.info(f"[bg-refresh] {tk} Deribit full refresh complete")
+                        else:
+                            # Weekend: IBIT stale, only update Deribit fields in cached blobs
+                            log.info(f"[bg-refresh] {tk} Deribit stale, weekend overlay...")
+                            _refresh_deribit_only(tk)
+                            log.info(f"[bg-refresh] {tk} Deribit weekend overlay complete")
 
-                        log.info(f"[bg-refresh] {tk} Deribit refresh complete")
                 except Exception as e:
                     log.error(f"[bg-refresh] {tk} Deribit freshness check error: {e}")
 
