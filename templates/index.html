@@ -391,15 +391,22 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   </div>
   <div class="cell cell-structure">
     <div class="cell-label">
-      <span class="cell-tab active" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
+      <span class="cell-tab active" data-view="oi-skew" onclick="setStructView('oi-skew')" style="margin-right:8px">OI Skew</span>
+      <span class="cell-tab" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
       <span class="cell-tab" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Walls</span>
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
     </div>
-    <canvas id="range-cone-chart"></canvas>
+    <canvas id="oi-skew-chart"></canvas>
+    <canvas id="range-cone-chart" style="display:none"></canvas>
     <canvas id="structure-chart" style="display:none"></canvas>
     <canvas id="heatmap-chart" style="display:none"></canvas>
-    <div id="range-cone-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+    <div id="oi-skew-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#00dc82cc"></span>Call OI</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#ff4060cc"></span>Put OI</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,255,255,0.5)"></span>Spot</span>
+    </div>
+    <div id="range-cone-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(168,139,250,0.3)"></span>EM</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:rgba(0,220,130,0.5)"></span>+GEX</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:rgba(255,64,96,0.5)"></span>&minus;GEX</span>
@@ -1263,6 +1270,7 @@ async function loadData(){
     loadOutlook();
     loadStructure();
     loadRangeCone();
+    if(structView==='oi-skew') renderOiSkew();
     loadMacro();
 
     // In snapshot mode, override macro freshness with snapshot's venue timestamps
@@ -1557,23 +1565,87 @@ const STRUCT_WINDOWS=[
   {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
 ];
 
-let structView='range';
+let structView='oi-skew';
 let heatmapData=null;
 function setStructView(view){
   structView=view;
   document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
+  const isOiSkew=view==='oi-skew';
   const isRange=view==='range';
   const isWalls=view==='walls';
-  const isHeat=!isRange&&!isWalls;
+  const isHeat=!isOiSkew&&!isRange&&!isWalls;
+  document.getElementById('oi-skew-chart').style.display=isOiSkew?'':'none';
   document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('structure-chart').style.display=isWalls?'':'none';
   document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
+  document.getElementById('oi-skew-legend').style.display=isOiSkew?'flex':'none';
   document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
   document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
   document.getElementById('heat-legend-gex').style.display=view==='heatmap-gex'?'flex':'none';
+  if(isOiSkew) renderOiSkew();
+  if(isRange) loadRangeCone();
   if(isHeat) loadHeatmap();
+}
+let oiSkewChart=null;
+function renderOiSkew(){
+  if(typeof Chart==='undefined')return;
+  const data=window._lastData;
+  if(!data||!data.gex_chart)return;
+  const canvas=document.getElementById('oi-skew-chart');
+  const ctx=canvas.getContext('2d');
+  if(oiSkewChart)oiSkewChart.destroy();
+  const labels=data.gex_chart.map(d=>fB(d.btc));
+  const callOi=data.gex_chart.map(d=>d.call_oi||0);
+  const putOi=data.gex_chart.map(d=>-(d.put_oi||0));
+  const spotBtc=data.btc_spot||0;
+  const spotIdx=data.gex_chart.reduce((best,d,i)=>Math.abs(d.btc-spotBtc)<Math.abs(data.gex_chart[best].btc-spotBtc)?i:best,0);
+  const callColors=data.gex_chart.map(d=>{
+    const total=(d.call_oi||0)+(d.put_oi||0);
+    if(total===0)return'#00dc8233';
+    const ratio=(d.call_oi||0)/total;
+    const alpha=ratio>0.8?'cc':ratio>0.6?'88':'55';
+    return'#00dc82'+alpha;
+  });
+  const putColors=data.gex_chart.map(d=>{
+    const total=(d.call_oi||0)+(d.put_oi||0);
+    if(total===0)return'#ff406033';
+    const ratio=(d.put_oi||0)/total;
+    const alpha=ratio>0.8?'cc':ratio>0.6?'88':'55';
+    return'#ff4060'+alpha;
+  });
+  oiSkewChart=new Chart(ctx,{
+    type:'bar',
+    data:{labels,datasets:[
+      {label:'Call OI',data:callOi,backgroundColor:callColors,borderRadius:1,barPercentage:0.85},
+      {label:'Put OI',data:putOi,backgroundColor:putColors,borderRadius:1,barPercentage:0.85}
+    ]},
+    options:{
+      responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false}},
+      scales:{
+        x:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},maxTicksLimit:12,maxRotation:0},grid:{color:'#111620'},border:{color:'#1c2230'}},
+        y:{stacked:true,ticks:{color:'#4a5568',font:{size:8,family:'IBM Plex Mono'},callback:v=>`${Math.abs(v/1000).toFixed(0)}K`},grid:{color:'#111620'},border:{color:'#1c2230'}}
+      }
+    },
+    plugins:[{
+      id:'spotLine',
+      afterDatasetsDraw(chart){
+        const meta=chart.getDatasetMeta(0);
+        if(!meta.data[spotIdx])return;
+        const x=meta.data[spotIdx].x;
+        const{top,bottom}=chart.chartArea;
+        const c=chart.ctx;
+        c.save();
+        c.setLineDash([3,3]);
+        c.strokeStyle='rgba(255,255,255,0.5)';
+        c.lineWidth=1;
+        c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();
+        c.restore();
+      }
+    }]
+  });
 }
 async function loadHeatmap(){
   try{
