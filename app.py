@@ -95,10 +95,12 @@ TICKER_CONFIG = {
     'IBIT': {
         'name': 'IBIT', 'asset_label': 'BTC', 'ref_ticker': 'BTC-USD',
         'binance_symbol': 'BTCUSDT', 'per_share_default': 0.000568,
+        'deribit_currency': 'BTC',
     },
     'ETHA': {
         'name': 'ETHA', 'asset_label': 'ETH', 'ref_ticker': 'ETH-USD',
         'binance_symbol': 'ETHUSDT', 'per_share_default': 0.0091,
+        'deribit_currency': 'ETH',
     },
 }
 
@@ -1572,7 +1574,7 @@ def _get_data_freshness(c, ticker):
     """Compute live IBIT/Deribit data freshness."""
     return {
         'ibit': _compute_ibit_freshness(),
-        'deribit': _compute_deribit_freshness(),
+        'deribit': _compute_deribit_freshness(TICKER_CONFIG.get(ticker, {}).get('deribit_currency', 'BTC')),
     }
 
 
@@ -1661,10 +1663,11 @@ def _compute_ibit_freshness():
     }
 
 
-def _compute_deribit_freshness():
-    """Compute minutes since last Deribit data fetch."""
+def _compute_deribit_freshness(currency='BTC'):
+    """Compute minutes since last Deribit data fetch for given currency."""
     with _deribit_lock:
-        cache_time = _deribit_cache.get('time', 0)
+        cache = _deribit_caches.get(currency, _deribit_caches['BTC'])
+        cache_time = cache.get('time', 0)
     if cache_time == 0:
         return {'age_minutes': None, 'as_of': None}
     age_min = (time.time() - cache_time) / 60
@@ -1682,10 +1685,13 @@ _farside_lock = threading.Lock()
 FARSIDE_URL = 'https://farside.co.uk/bitcoin-etf-flow-all-data/'
 FARSIDE_CACHE_SECONDS = 3600
 
-# Deribit BTC options cache: at most 1 fetch per hour
-_deribit_cache = {'data': None, 'time': 0}
+# Deribit options cache: per-currency, at most 1 fetch per hour
+_deribit_caches = {
+    'BTC': {'data': None, 'time': 0},
+    'ETH': {'data': None, 'time': 0},
+}
 _deribit_lock = threading.Lock()
-DERIBIT_URL = 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option'
+DERIBIT_BASE_URL = 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?kind=option&currency='
 DERIBIT_CACHE_SECONDS = 3600
 
 
@@ -1985,28 +1991,30 @@ def fetch_coinglass_data():
             conn.close()
 
 
-def fetch_deribit_options(min_dte=0, max_dte=7):
-    """Fetch BTC options from Deribit public API. Returns list of dicts with
-    strike, expiry, dte, option_type, oi (in BTC), iv, underlying_price.
-    Cached for 1 hour. Returns empty list on any failure."""
+def fetch_deribit_options(min_dte=0, max_dte=7, currency='BTC'):
+    """Fetch options from Deribit public API for given currency (BTC or ETH).
+    Returns list of dicts with strike, expiry, dte, option_type, oi, iv,
+    underlying_price. Cached for 1 hour per currency. Returns empty list on failure."""
     with _deribit_lock:
         now = time.time()
-        if _deribit_cache['data'] is not None and (now - _deribit_cache['time']) < DERIBIT_CACHE_SECONDS:
-            raw = _deribit_cache['data']
+        cache = _deribit_caches.get(currency, _deribit_caches['BTC'])
+        if cache['data'] is not None and (now - cache['time']) < DERIBIT_CACHE_SECONDS:
+            raw = cache['data']
         else:
             try:
-                req = urllib.request.Request(DERIBIT_URL, headers={
+                url = f'{DERIBIT_BASE_URL}{currency}'
+                req = urllib.request.Request(url, headers={
                     'User-Agent': 'ibit-gex/1.0'
                 })
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     raw = json.loads(resp.read().decode())
-                _deribit_cache['data'] = raw
-                _deribit_cache['time'] = now
+                cache['data'] = raw
+                cache['time'] = now
                 result_count = len(raw.get('result', []))
-                log.info(f"[deribit] Fetched {result_count} instruments from Deribit")
+                log.info(f"[deribit] Fetched {result_count} {currency} instruments from Deribit")
             except Exception as e:
-                log.warning(f"[deribit] Fetch failed: {e}")
-                raw = _deribit_cache.get('data')
+                log.warning(f"[deribit] {currency} fetch failed: {e}")
+                raw = cache.get('data')
                 if not raw:
                     return []
 
@@ -2457,9 +2465,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     deribit_strike_data = {}
     deribit_oi_btc = 0
     deribit_options = []
-    if is_crypto and ticker_symbol == 'IBIT':
+    deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
+    if is_crypto and deribit_currency:
         try:
-            deribit_options = fetch_deribit_options(min_dte, max_dte)
+            deribit_options = fetch_deribit_options(min_dte, max_dte, currency=deribit_currency)
             if deribit_options:
                 deribit_available = True
                 for opt in deribit_options:
@@ -2765,7 +2774,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                                for k, v in deribit_levels_btc.items()} if deribit_levels_btc else None,
         'data_freshness': {
             'ibit': _compute_ibit_freshness(),
-            'deribit': _compute_deribit_freshness() if deribit_available else {'age_minutes': None, 'as_of': None},
+            'deribit': _compute_deribit_freshness(deribit_currency) if deribit_available else {'age_minutes': None, 'as_of': None},
         },
     }
 
@@ -3424,6 +3433,7 @@ def _refresh_deribit_only(ticker):
     dealer delta, flow forecast, or any other computed field.
     Used when Yahoo/IBIT is unavailable (weekends)."""
     rfr = get_risk_free_rate()
+    deribit_currency = TICKER_CONFIG.get(ticker, {}).get('deribit_currency', 'BTC')
 
     for label, min_d, max_d in REFRESH_DTES:
         try:
@@ -3436,7 +3446,7 @@ def _refresh_deribit_only(ticker):
                 continue
 
             # Fetch fresh Deribit for this DTE window
-            deribit_options = fetch_deribit_options(min_d, max_d)
+            deribit_options = fetch_deribit_options(min_d, max_d, currency=deribit_currency)
             if not deribit_options:
                 continue
 
@@ -3644,15 +3654,16 @@ def _bg_refresh():
 
             # Deribit intraday refresh: re-fetch hourly to keep Deribit data fresh
             # IBIT OI is EOD-only so it won't change, but Deribit OI/IV updates 24/7
-            if tk == 'IBIT':
+            deribit_currency = TICKER_CONFIG.get(tk, {}).get('deribit_currency')
+            if deribit_currency:
                 try:
-                    freshness = _compute_deribit_freshness()
+                    freshness = _compute_deribit_freshness(deribit_currency)
                     age_min = freshness.get('age_minutes')
                     deribit_stale = age_min is None or age_min >= 65
 
                     if deribit_stale:
                         with _deribit_lock:
-                            _deribit_cache['time'] = 0
+                            _deribit_caches[deribit_currency]['time'] = 0
 
                         if all_fresh:
                             # Weekday: IBIT is current, safe to do full refresh
