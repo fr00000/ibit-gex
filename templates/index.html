@@ -1585,6 +1585,7 @@ function setStructView(view){
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
   document.getElementById('heat-legend-gex').style.display=view==='heatmap-gex'?'flex':'none';
   if(isOiSkew) renderOiSkew();
+  if(isRange) loadRangeCone();
   if(isHeat) loadHeatmap();
 }
 let oiSkewChart=null;
