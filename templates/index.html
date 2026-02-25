@@ -1181,6 +1181,27 @@ async function loadExpiryOptions(){
     if(!d.expiries||!d.expiries.length)return;
     expiryList=d.expiries;
 
+    // Annotate DTE window options with expiry count + OI
+    const dteWindows=[{v:'0-3',min:0,max:3},{v:'4-7',min:4,max:7},{v:'8-14',min:8,max:14},{v:'15-30',min:15,max:30},{v:'31-45',min:31,max:45}];
+    for(const w of dteWindows){
+      const matching=expiryList.filter(e=>e.dte>=w.min&&e.dte<=w.max);
+      const opt=document.querySelector(`#dte-select option[value="${w.v}"]`);
+      if(opt){
+        if(matching.length){
+          const totalOi=matching.reduce((s,e)=>s+(e.total_oi||0),0);
+          opt.textContent=`${w.v} DTE (${matching.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+        }else{
+          opt.textContent=`${w.v} DTE`;
+        }
+      }
+    }
+    // ALL DTE
+    const allOpt=document.querySelector('#dte-select option[value="0-100"]');
+    if(allOpt){
+      const totalOi=expiryList.reduce((s,e)=>s+(e.total_oi||0),0);
+      allOpt.textContent=`ALL DTE (${expiryList.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+    }
+
     // Single expiry options
     const expGroup=document.getElementById('dte-expiry-group');
     expGroup.innerHTML='';
