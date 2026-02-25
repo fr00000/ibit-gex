@@ -2492,6 +2492,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Deribit options integration
     deribit_available = False
     deribit_strike_data = {}
+    deribit_expiry_strike_data = {}  # exp_str -> {strike_btc -> {call_oi, ...}}
     deribit_oi_btc = 0
     deribit_options = []
     deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
@@ -2535,6 +2536,25 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     d_entry[f'{opt_type}_delta'] += dealer_delta
                     d_entry[f'{opt_type}_vanna'] += dealer_vanna
                     d_entry[f'{opt_type}_charm'] += dealer_charm
+
+                    deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+                    if deribit_exp_str not in deribit_expiry_strike_data:
+                        deribit_expiry_strike_data[deribit_exp_str] = {}
+                    desd = deribit_expiry_strike_data[deribit_exp_str]
+                    if strike_btc not in desd:
+                        desd[strike_btc] = {
+                            'call_oi': 0, 'put_oi': 0,
+                            'call_gex': 0, 'put_gex': 0,
+                            'call_delta': 0, 'put_delta': 0,
+                            'call_vanna': 0, 'put_vanna': 0,
+                            'call_charm': 0, 'put_charm': 0,
+                            'dte': int(opt['dte']),
+                        }
+                    desd[strike_btc][f'{opt_type}_oi'] += oi
+                    desd[strike_btc][f'{opt_type}_gex'] += gex
+                    desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
+                    desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
+                    desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
 
@@ -2770,30 +2790,67 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         expiry_meta.append({'exp': exp_str, 'dte': dte_days})
     expiry_meta.sort(key=lambda x: x['dte'])
 
-    # Store per-expiry chain snapshots
+    # Store per-expiry chain snapshots (merged IBIT + Deribit)
     try:
         conn_exp = get_db()
         c_exp = conn_exp.cursor()
         today_str = datetime.now().strftime('%Y-%m-%d')
-        for exp_str, strikes_dict in expiry_strike_data.items():
+
+        all_exp_dates = sorted(set(
+            list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
+        ))
+
+        for exp_str in all_exp_dates:
             exp_date_obj = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             dte_val = max(int((exp_date_obj - now).total_seconds() / 86400.0), 0)
+            spot_btc_val = spot / ref_per_share if is_crypto else spot
+
+            # Build IBIT lookup by BTC price (same pattern as gex_chart_data)
+            ibit_by_btc = {}
+            for strike_val, d in expiry_strike_data.get(exp_str, {}).items():
+                btc_p = round(strike_val / ref_per_share) if is_crypto else round(strike_val)
+                ibit_by_btc[btc_p] = (strike_val, d)
+
+            # Deribit lookup already in BTC
+            deribit_by_btc = {}
+            for strike_btc, d in deribit_expiry_strike_data.get(exp_str, {}).items():
+                deribit_by_btc[round(strike_btc)] = d
+
+            all_btc = sorted(set(list(ibit_by_btc.keys()) + list(deribit_by_btc.keys())))
 
             strike_rows = []
-            for strike_val, d in sorted(strikes_dict.items()):
-                btc_price = strike_val / ref_per_share if is_crypto else strike_val
+            for btc_p in all_btc:
+                ib_entry = ibit_by_btc.get(btc_p)
+                db_entry = deribit_by_btc.get(btc_p)
+                ib = ib_entry[1] if ib_entry else None
+                ibit_strike = ib_entry[0] if ib_entry else 0
+
+                i_call_gex = ib['call_gex'] if ib else 0
+                i_put_gex = ib['put_gex'] if ib else 0
+                d_call_gex = db_entry['call_gex'] if db_entry else 0
+                d_put_gex = db_entry['put_gex'] if db_entry else 0
+
                 strike_rows.append({
-                    'strike': strike_val,
-                    'btc': round(btc_price, 2),
-                    'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
-                    'call_gex': round(d['call_gex'], 2),
-                    'put_gex': round(d['put_gex'], 2),
-                    'net_gex': round(d['call_gex'] + d['put_gex'], 2),
-                    'net_dealer_delta': round(d['call_delta'] + d['put_delta'], 2),
-                    'net_vanna': round(d['call_vanna'] + d['put_vanna'], 2),
-                    'net_charm': round(d['call_charm'] + d['put_charm'], 2),
-                    'call_volume': d['call_volume'],
-                    'put_volume': d['put_volume'],
+                    'strike': ibit_strike,
+                    'btc': float(btc_p),
+                    'call_oi': (ib['call_oi'] if ib else 0) + (db_entry['call_oi'] if db_entry else 0),
+                    'put_oi': (ib['put_oi'] if ib else 0) + (db_entry['put_oi'] if db_entry else 0),
+                    'call_gex': round(i_call_gex + d_call_gex, 2),
+                    'put_gex': round(i_put_gex + d_put_gex, 2),
+                    'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
+                    'ibit_gex': round(i_call_gex + i_put_gex, 2),
+                    'deribit_gex': round(d_call_gex + d_put_gex, 2),
+                    'net_dealer_delta': round(
+                        (ib['call_delta'] + ib['put_delta'] if ib else 0) +
+                        (db_entry['call_delta'] + db_entry['put_delta'] if db_entry else 0), 2),
+                    'net_vanna': round(
+                        (ib['call_vanna'] + ib['put_vanna'] if ib else 0) +
+                        (db_entry['call_vanna'] + db_entry['put_vanna'] if db_entry else 0), 2),
+                    'net_charm': round(
+                        (ib['call_charm'] + ib['put_charm'] if ib else 0) +
+                        (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
+                    'call_volume': ib['call_volume'] if ib else 0,
+                    'put_volume': ib['put_volume'] if ib else 0,
                 })
 
             # Compute per-expiry levels
@@ -2809,24 +2866,22 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 'active_gex': sr['net_gex'],
             } for sr in strike_rows]
             level_df = pd.DataFrame(level_rows)
-            spot_btc_val = spot / ref_per_share if is_crypto else spot
             levels_exp = _compute_levels_from_df(level_df, spot_btc_val) if not level_df.empty else {}
 
             net_gex = sum(sr['net_gex'] for sr in strike_rows)
             total_call = sum(sr['call_oi'] for sr in strike_rows)
             total_put = sum(sr['put_oi'] for sr in strike_rows)
+            has_deribit = any(sr['deribit_gex'] != 0 for sr in strike_rows)
 
             expiry_blob = {
-                'expiry_date': exp_str,
-                'dte': dte_val,
-                'spot': spot,
-                'spot_btc': round(spot_btc_val, 2),
+                'expiry_date': exp_str, 'dte': dte_val,
+                'spot': spot, 'spot_btc': round(spot_btc_val, 2),
                 'btc_per_share': ref_per_share,
+                'deribit_available': has_deribit,
                 'strikes': strike_rows,
                 'summary': {
                     'net_gex_total': round(net_gex, 2),
-                    'total_call_oi': total_call,
-                    'total_put_oi': total_put,
+                    'total_call_oi': total_call, 'total_put_oi': total_put,
                     'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
                     'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
                     'call_wall_btc': levels_exp.get('call_wall'),
@@ -4366,6 +4421,7 @@ def api_expiry_data():
                 'total_oi': d['summary']['total_call_oi'] + d['summary']['total_put_oi'],
                 'net_gex_total': d['summary']['net_gex_total'],
                 'regime': d['summary']['regime'],
+                'deribit_available': d.get('deribit_available', False),
             })
         return Response(json.dumps({'date': snapshot_date, 'expiries': result}),
                         mimetype='application/json')
@@ -4415,7 +4471,8 @@ def api_expiry_data():
             a['net_gex'] += s['net_gex']
             a['call_gex'] += s.get('call_gex', 0)
             a['put_gex'] += s.get('put_gex', 0)
-            a['ibit_gex'] += s['net_gex']
+            a['ibit_gex'] += s.get('ibit_gex', s['net_gex'])
+            a['deribit_gex'] += s.get('deribit_gex', 0)
             a['net_dealer_delta'] += s['net_dealer_delta']
             a['net_vanna'] += s['net_vanna']
             a['net_charm'] += s['net_charm']
@@ -4458,6 +4515,7 @@ def api_expiry_data():
         'total_put_oi': total_put,
         'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
         'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in gex_chart),
     }
 
     return Response(json.dumps(result, default=str), mimetype='application/json')

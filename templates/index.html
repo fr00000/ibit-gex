@@ -1291,7 +1291,7 @@ async function loadData(){
       data.spot=data.spot||0;
       data.levels=data.levels_btc||{};
       data.combined_levels_btc=data.levels_btc||{};
-      data.deribit_available=false;
+      data.deribit_available=data.deribit_available||false;
       data.timestamp=data.date||'';
       data.dealer_delta_profile=[];
       data.expirations=data.included_expiries||[];
@@ -1414,11 +1414,6 @@ async function loadData(){
       // --- EXPIRY MODE ---
       // Clear dealer delta chart (profile not computed per-expiry)
       if(deltaChart){deltaChart.destroy();deltaChart=null}
-
-      // Hide Deribit source selector (expiry cache is IBIT-only)
-      if(document.getElementById('src-select'))document.getElementById('src-select').style.display='none';
-      if(document.getElementById('src-label'))document.getElementById('src-label').style.display='none';
-      document.getElementById('hdr-deribit').style.display='none';
 
       // Hide GEX per-expiry filter (redundant in expiry mode)
       const expFilter=document.getElementById('expiry-filter');
