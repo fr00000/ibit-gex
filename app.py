@@ -2799,10 +2799,13 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             # Compute per-expiry levels
             level_rows = [{
                 'strike': sr['btc'], 'net_gex': sr['net_gex'],
+                'call_gex': sr['call_gex'], 'put_gex': sr['put_gex'],
                 'call_oi': sr['call_oi'], 'put_oi': sr['put_oi'],
                 'total_oi': sr['call_oi'] + sr['put_oi'],
                 'net_dealer_delta': sr['net_dealer_delta'],
                 'net_vanna': sr['net_vanna'], 'net_charm': sr['net_charm'],
+                'call_volume': sr['call_volume'], 'put_volume': sr['put_volume'],
+                'call_vol_gex': 0, 'put_vol_gex': 0,
                 'active_gex': sr['net_gex'],
             } for sr in strike_rows]
             level_df = pd.DataFrame(level_rows)
@@ -4401,6 +4404,7 @@ def api_expiry_data():
                 strike_agg[btc] = {
                     'btc': s['btc'], 'strike': s['strike'],
                     'call_oi': 0, 'put_oi': 0,
+                    'call_gex': 0, 'put_gex': 0,
                     'net_gex': 0, 'ibit_gex': 0, 'deribit_gex': 0,
                     'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
                     'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
@@ -4409,6 +4413,8 @@ def api_expiry_data():
             a['call_oi'] += s['call_oi']
             a['put_oi'] += s['put_oi']
             a['net_gex'] += s['net_gex']
+            a['call_gex'] += s.get('call_gex', 0)
+            a['put_gex'] += s.get('put_gex', 0)
             a['ibit_gex'] += s['net_gex']
             a['net_dealer_delta'] += s['net_dealer_delta']
             a['net_vanna'] += s['net_vanna']
@@ -4423,10 +4429,13 @@ def api_expiry_data():
     spot_btc = first_blob.get('spot_btc', 0)
     level_rows = [{
         'strike': s['btc'], 'net_gex': s['net_gex'],
+        'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
         'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
         'total_oi': s['call_oi'] + s['put_oi'],
         'net_dealer_delta': s['net_dealer_delta'],
         'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
+        'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
+        'call_vol_gex': 0, 'put_vol_gex': 0,
         'active_gex': s['net_gex'],
     } for s in gex_chart]
     level_df = pd.DataFrame(level_rows)
