@@ -296,12 +296,16 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="hdr-sep"></div>
     <label style="color:var(--t3);font-size:10px;">DTE</label>
     <select id="dte-select" onchange="loadData()" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer">
-      <option value="0-3" selected>0-3 DTE</option>
-      <option value="4-7">4-7 DTE</option>
-      <option value="8-14">8-14 DTE</option>
-      <option value="15-30">15-30 DTE</option>
-      <option value="31-45">31-45 DTE</option>
-      <option value="0-100">ALL DTE</option>
+      <optgroup label="DTE Windows">
+        <option value="0-3" selected>0-3 DTE</option>
+        <option value="4-7">4-7 DTE</option>
+        <option value="8-14">8-14 DTE</option>
+        <option value="15-30">15-30 DTE</option>
+        <option value="31-45">31-45 DTE</option>
+        <option value="0-100">ALL DTE</option>
+      </optgroup>
+      <optgroup label="Expiry Ranges" id="dte-range-group"></optgroup>
+      <optgroup label="Single Expiry" id="dte-expiry-group"></optgroup>
     </select>
     <span id="hdr-exp" style="color:var(--t3);font-size:9px"></span>
     <div class="hdr-sep"></div>
@@ -551,6 +555,7 @@ function switchTicker(tk){
   aiData=null;
   aiUnsaved=false;
   loadData();
+  loadExpiryOptions();
   loadAnalysis();
   loadSnapshotDates();
 }
@@ -898,6 +903,9 @@ function renderSidebar(data){
   } else {
     srcLabel=hasDeribit?' (IBIT)':'';
   }
+  if(window._isExpiryMode){
+    srcLabel=' (Per-Expiry)';
+  }
 
   // Price formatting: BTC-direct levels are already in BTC, IBIT levels need conversion
   const b=useBtcDirect?s=>fB(s):s=>fB(s/bps);
@@ -1152,18 +1160,169 @@ function renderSidebar(data){
   document.getElementById('sidebar').innerHTML=h;
 }
 
+let expiryList=[];
+
+function findNextMonthly(fromDate){
+  for(let m=0;m<3;m++){
+    const d=new Date(fromDate.getFullYear(),fromDate.getMonth()+m,1);
+    const firstDow=d.getDay();
+    const firstFriDay=firstDow<=5?(5-firstDow+1):(5+7-firstDow+1);
+    const thirdFriDay=firstFriDay+14;
+    const thirdFri=new Date(d.getFullYear(),d.getMonth(),thirdFriDay);
+    if(thirdFri>=fromDate)return thirdFri.toISOString().slice(0,10);
+  }
+  return fromDate.toISOString().slice(0,10);
+}
+
+async function loadExpiryOptions(){
+  try{
+    const r=await fetch(`/api/expiry-data?ticker=${currentTicker}`);
+    const d=await r.json();
+    if(!d.expiries||!d.expiries.length)return;
+    expiryList=d.expiries;
+
+    // Annotate DTE window options with expiry count + OI
+    const dteWindows=[{v:'0-3',min:0,max:3},{v:'4-7',min:4,max:7},{v:'8-14',min:8,max:14},{v:'15-30',min:15,max:30},{v:'31-45',min:31,max:45}];
+    for(const w of dteWindows){
+      const matching=expiryList.filter(e=>e.dte>=w.min&&e.dte<=w.max);
+      const opt=document.querySelector(`#dte-select option[value="${w.v}"]`);
+      if(opt){
+        if(matching.length){
+          const totalOi=matching.reduce((s,e)=>s+(e.total_oi||0),0);
+          opt.textContent=`${w.v} DTE (${matching.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+        }else{
+          opt.textContent=`${w.v} DTE`;
+        }
+      }
+    }
+    // ALL DTE
+    const allOpt=document.querySelector('#dte-select option[value="0-100"]');
+    if(allOpt){
+      const totalOi=expiryList.reduce((s,e)=>s+(e.total_oi||0),0);
+      allOpt.textContent=`ALL DTE (${expiryList.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+    }
+
+    // Single expiry options
+    const expGroup=document.getElementById('dte-expiry-group');
+    expGroup.innerHTML='';
+    for(const exp of d.expiries){
+      const dt=new Date(exp.expiry_date+'T12:00:00');
+      const mon=dt.toLocaleString('en',{month:'short'});
+      const day=dt.getDate();
+      const oi=((exp.total_oi||0)/1000).toFixed(0);
+      const opt=document.createElement('option');
+      opt.value=`exp:${exp.expiry_date}`;
+      opt.textContent=`${mon} ${day} (${exp.dte}d) ${oi}K OI`;
+      expGroup.appendChild(opt);
+    }
+
+    // Range options (only if expiries exist in range)
+    const rangeGroup=document.getElementById('dte-range-group');
+    rangeGroup.innerHTML='';
+
+    const today=new Date();
+    today.setHours(0,0,0,0);
+    const dow=today.getDay();
+
+    // This week: today through this Friday
+    const thisFri=new Date(today);
+    thisFri.setDate(today.getDate()+(5-dow));
+    const thisWeekExps=expiryList.filter(e=>{
+      const ed=new Date(e.expiry_date+'T12:00:00');
+      return ed>=today&&ed<=thisFri;
+    });
+
+    // Next week: next Monday through next Friday
+    const nextMon=new Date(today);
+    nextMon.setDate(today.getDate()+(8-dow));
+    const nextFri=new Date(nextMon);
+    nextFri.setDate(nextMon.getDate()+4);
+    const nextWeekExps=expiryList.filter(e=>{
+      const ed=new Date(e.expiry_date+'T12:00:00');
+      return ed>=nextMon&&ed<=nextFri;
+    });
+
+    // Next monthly: 3rd Friday of current or next months
+    const monthlyDate=findNextMonthly(today);
+    const monthlyExp=expiryList.find(e=>e.expiry_date===monthlyDate);
+
+    if(thisWeekExps.length){
+      const totalOi=thisWeekExps.reduce((s,e)=>s+(e.total_oi||0),0);
+      const opt=document.createElement('option');
+      const fromStr=today.toISOString().slice(0,10);
+      const toStr=thisFri.toISOString().slice(0,10);
+      opt.value=`range:${fromStr}:${toStr}`;
+      opt.textContent=`This Week (${thisWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    if(nextWeekExps.length){
+      const totalOi=nextWeekExps.reduce((s,e)=>s+(e.total_oi||0),0);
+      const opt=document.createElement('option');
+      opt.value=`range:${nextMon.toISOString().slice(0,10)}:${nextFri.toISOString().slice(0,10)}`;
+      opt.textContent=`Next Week (${nextWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    if(monthlyExp){
+      const opt=document.createElement('option');
+      opt.value=`exp:${monthlyDate}`;
+      const md=new Date(monthlyDate+'T12:00:00');
+      opt.textContent=`Monthly ${md.toLocaleString('en',{month:'short'})} ${md.getDate()} (${monthlyExp.dte}d) ${((monthlyExp.total_oi||0)/1000).toFixed(0)}K OI`;
+      rangeGroup.appendChild(opt);
+    }
+
+    // Hide range group entirely if no ranges available
+    rangeGroup.style.display=rangeGroup.children.length?'':'none';
+
+  }catch(e){console.warn('Expiry options:',e)}
+}
+
 async function loadData(){
   const seq=++_loadSeq;
   document.getElementById('loading').classList.remove('hidden');
   try{
     const dteVal=document.getElementById('dte-select').value;
-    const [minDte,maxDte]=dteVal.split('-').map(Number);
-    const resp=await fetch(`/api/data?ticker=${currentTicker}&dte=${maxDte}&min_dte=${minDte}${dateParam()}`);
+    let resp;
+    let isExpiryMode=false;
+
+    if(dteVal.startsWith('exp:')){
+      const expDate=dteVal.slice(4);
+      resp=await fetch(`/api/expiry-data?ticker=${currentTicker}&expiry=${expDate}${dateParam()}`);
+      isExpiryMode=true;
+    }else if(dteVal.startsWith('range:')){
+      const parts=dteVal.split(':');
+      const from=parts[1];
+      const to=parts[2];
+      resp=await fetch(`/api/expiry-data?ticker=${currentTicker}&from_date=${from}&to_date=${to}${dateParam()}`);
+      isExpiryMode=true;
+    }else{
+      const [minDte,maxDte]=dteVal.split('-').map(Number);
+      resp=await fetch(`/api/data?ticker=${currentTicker}&dte=${maxDte}&min_dte=${minDte}${dateParam()}`);
+    }
+
     if(seq!==_loadSeq)return;
     const data=await resp.json();
     if(seq!==_loadSeq)return;
     if(data.error)throw new Error(data.error);
+
+    // Normalize expiry-data response to match /api/data shape
+    if(isExpiryMode){
+      data.btc_spot=data.spot_btc||0;
+      data.spot=data.spot||0;
+      data.levels=data.levels_btc||{};
+      data.combined_levels_btc=data.levels_btc||{};
+      data.deribit_available=data.deribit_available||false;
+      data.timestamp=data.date||'';
+      data.dealer_delta_profile=[];
+      data.expirations=data.included_expiries||[];
+      data.etf_flows=null;
+      data.data_freshness=null;
+      if(!data.levels.regime)data.levels.regime=data.regime||'positive_gamma';
+    }
+
     window._lastData=data;
+    window._isExpiryMode=isExpiryMode;
 
     // Header
     if(data.fallback_from){document.getElementById('dte-select').value='0-3';console.warn(`DTE ${data.fallback_from}d unavailable, fell back to 0-3d`)}
@@ -1227,8 +1386,12 @@ async function loadData(){
       currentSource='all';
     }
     const exps=data.expirations||[];
-    if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
-    else document.getElementById('hdr-exp').textContent='';
+    if(isExpiryMode){
+      document.getElementById('hdr-exp').textContent=exps.length?`Expiry: ${exps.join(', ')}`:'';
+    }else{
+      if(exps.length)document.getElementById('hdr-exp').textContent=`Exp: ${exps[exps.length-1]} 4:00PM ET`;
+      else document.getElementById('hdr-exp').textContent='';
+    }
 
     // Snapshot banner
     const snapBanner=document.getElementById('snapshot-banner');
@@ -1257,6 +1420,7 @@ async function loadData(){
       }
     }catch(e){console.warn('Chart overlay:',e)}
 
+    // Charts that work in both modes
     try{renderGEX(data)}catch(e){console.warn('GEX:',e)}
     if(gexView==='oi'){try{renderOI(data)}catch(e){console.warn('OI:',e)}}
     try{
@@ -1264,22 +1428,58 @@ async function loadData(){
       const flows=await fr.json();
       if(seq===_loadSeq&&Array.isArray(flows))renderFlowChart(flows);
     }catch(e){console.warn('Flows:',e)}
-    try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
     try{renderSidebar(data)}catch(e){console.warn('Sidebar:',e)}
-    try{renderAiPanel()}catch(e){console.warn('AI:',e)}
-    loadOutlook();
-    loadStructure();
-    loadRangeCone();
     if(structView==='oi-skew') renderOiSkew();
-    loadMacro();
 
-    // In snapshot mode, override macro freshness with snapshot's venue timestamps
-    if(snapshotDate&&data.data_freshness){
-      const frEl=document.getElementById('macro-freshness');
-      const p=[];
-      if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
-      if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
-      if(p.length)frEl.textContent=p.join('  \u00b7  ');
+    if(isExpiryMode){
+      // --- EXPIRY MODE ---
+      // Clear dealer delta chart (profile not computed per-expiry)
+      if(deltaChart){deltaChart.destroy();deltaChart=null}
+
+      // Hide GEX per-expiry filter (redundant in expiry mode)
+      const expFilter=document.getElementById('expiry-filter');
+      if(expFilter)expFilter.style.display='none';
+
+      // Gray out structure tabs that need multi-day history
+      document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>{
+        const v=t.dataset.view;
+        if(['range','walls','heatmap-oi','heatmap-gex'].includes(v)){
+          t.style.opacity='0.3';
+          t.style.pointerEvents='none';
+        }
+      });
+      if(['range','walls','heatmap-oi','heatmap-gex'].includes(structView)){
+        setStructView('oi-skew');
+      }
+
+      // Skip AI analysis panel (API cost per run)
+      const aiPanel=document.getElementById('ai-panel');
+      if(aiPanel)aiPanel.innerHTML='<div class="sec" style="color:var(--t3);font-size:10px;padding:12px">AI analysis not available in expiry view</div>';
+
+    }else{
+      // --- DTE WINDOW MODE (existing behavior) ---
+      document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>{
+        t.style.opacity='';
+        t.style.pointerEvents='';
+      });
+      const expFilter=document.getElementById('expiry-filter');
+      if(expFilter)expFilter.style.display='';
+
+      try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
+      try{renderAiPanel()}catch(e){console.warn('AI:',e)}
+      loadOutlook();
+      loadStructure();
+      loadRangeCone();
+      loadMacro();
+
+      // In snapshot mode, override macro freshness with snapshot's venue timestamps
+      if(snapshotDate&&data.data_freshness){
+        const frEl=document.getElementById('macro-freshness');
+        const p=[];
+        if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
+        if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
+        if(p.length)frEl.textContent=p.join('  \u00b7  ');
+      }
     }
 
   }catch(e){
@@ -2080,6 +2280,7 @@ function renderStructure(data){
 // Init
 try{initTV()}catch(e){console.warn('TV init:',e)}
 loadData();
+loadExpiryOptions();
 loadAnalysis();
 loadSnapshotDates();
 async function loadMacro(){

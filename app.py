@@ -303,6 +303,13 @@ def init_db():
         extra_json TEXT,
         UNIQUE(date, symbol, metric)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS expiry_cache (
+        date TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        expiry_date TEXT NOT NULL,
+        data_json TEXT NOT NULL,
+        UNIQUE(date, ticker, expiry_date)
+    )''')
     # Migrate: add T+2 scoring columns to predictions
     pred_cols = {r[1] for r in c.execute('PRAGMA table_info(predictions)').fetchall()}
     for col, typ in [
@@ -2347,6 +2354,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Collect options data
     strike_data = {}
     cached_chains = {}  # exp_str -> chain, reused for expected move
+    expiry_strike_data = {}  # exp_str -> {strike -> {call_oi, put_oi, call_gex, ...}}
     for exp_str in selected_exps:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         dte_float = max((exp_date - now).total_seconds() / 86400.0, 0.0)
@@ -2413,6 +2421,27 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     }
                 strike_data[strike]['expiry_gex'][exp_str][f'{opt_type}_gex'] += gex
 
+                # Per-expiry accumulator
+                if exp_str not in expiry_strike_data:
+                    expiry_strike_data[exp_str] = {}
+                esd = expiry_strike_data[exp_str]
+                if strike not in esd:
+                    esd[strike] = {
+                        'call_oi': 0, 'put_oi': 0,
+                        'call_gex': 0, 'put_gex': 0,
+                        'call_delta': 0, 'put_delta': 0,
+                        'call_vanna': 0, 'put_vanna': 0,
+                        'call_charm': 0, 'put_charm': 0,
+                        'call_volume': 0, 'put_volume': 0,
+                        'dte': dte_days,
+                    }
+                esd[strike][f'{opt_type}_oi'] += oi
+                esd[strike][f'{opt_type}_gex'] += gex
+                esd[strike][f'{opt_type}_delta'] += dealer_delta
+                esd[strike][f'{opt_type}_vanna'] += dealer_vanna
+                esd[strike][f'{opt_type}_charm'] += dealer_charm
+                esd[strike][f'{opt_type}_volume'] += vol
+
     # Build dataframe
     rows = []
     for strike, d in sorted(strike_data.items()):
@@ -2463,6 +2492,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Deribit options integration
     deribit_available = False
     deribit_strike_data = {}
+    deribit_expiry_strike_data = {}  # exp_str -> {strike_btc -> {call_oi, ...}}
     deribit_oi_btc = 0
     deribit_options = []
     deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
@@ -2506,6 +2536,25 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     d_entry[f'{opt_type}_delta'] += dealer_delta
                     d_entry[f'{opt_type}_vanna'] += dealer_vanna
                     d_entry[f'{opt_type}_charm'] += dealer_charm
+
+                    deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+                    if deribit_exp_str not in deribit_expiry_strike_data:
+                        deribit_expiry_strike_data[deribit_exp_str] = {}
+                    desd = deribit_expiry_strike_data[deribit_exp_str]
+                    if strike_btc not in desd:
+                        desd[strike_btc] = {
+                            'call_oi': 0, 'put_oi': 0,
+                            'call_gex': 0, 'put_gex': 0,
+                            'call_delta': 0, 'put_delta': 0,
+                            'call_vanna': 0, 'put_vanna': 0,
+                            'call_charm': 0, 'put_charm': 0,
+                            'dte': int(opt['dte']),
+                        }
+                    desd[strike_btc][f'{opt_type}_oi'] += oi
+                    desd[strike_btc][f'{opt_type}_gex'] += gex
+                    desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
+                    desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
+                    desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
 
@@ -2740,6 +2789,115 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         dte_days = max((exp_date - now).days, 0)
         expiry_meta.append({'exp': exp_str, 'dte': dte_days})
     expiry_meta.sort(key=lambda x: x['dte'])
+
+    # Store per-expiry chain snapshots (merged IBIT + Deribit)
+    try:
+        conn_exp = get_db()
+        c_exp = conn_exp.cursor()
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        all_exp_dates = sorted(set(
+            list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
+        ))
+
+        for exp_str in all_exp_dates:
+            exp_date_obj = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dte_val = max(int((exp_date_obj - now).total_seconds() / 86400.0), 0)
+            spot_btc_val = spot / ref_per_share if is_crypto else spot
+
+            # Build IBIT lookup by BTC price (same pattern as gex_chart_data)
+            ibit_by_btc = {}
+            for strike_val, d in expiry_strike_data.get(exp_str, {}).items():
+                btc_p = round(strike_val / ref_per_share) if is_crypto else round(strike_val)
+                ibit_by_btc[btc_p] = (strike_val, d)
+
+            # Deribit lookup already in BTC
+            deribit_by_btc = {}
+            for strike_btc, d in deribit_expiry_strike_data.get(exp_str, {}).items():
+                deribit_by_btc[round(strike_btc)] = d
+
+            all_btc = sorted(set(list(ibit_by_btc.keys()) + list(deribit_by_btc.keys())))
+
+            strike_rows = []
+            for btc_p in all_btc:
+                ib_entry = ibit_by_btc.get(btc_p)
+                db_entry = deribit_by_btc.get(btc_p)
+                ib = ib_entry[1] if ib_entry else None
+                ibit_strike = ib_entry[0] if ib_entry else 0
+
+                i_call_gex = ib['call_gex'] if ib else 0
+                i_put_gex = ib['put_gex'] if ib else 0
+                d_call_gex = db_entry['call_gex'] if db_entry else 0
+                d_put_gex = db_entry['put_gex'] if db_entry else 0
+
+                strike_rows.append({
+                    'strike': ibit_strike,
+                    'btc': float(btc_p),
+                    'call_oi': (ib['call_oi'] if ib else 0) + (db_entry['call_oi'] if db_entry else 0),
+                    'put_oi': (ib['put_oi'] if ib else 0) + (db_entry['put_oi'] if db_entry else 0),
+                    'call_gex': round(i_call_gex + d_call_gex, 2),
+                    'put_gex': round(i_put_gex + d_put_gex, 2),
+                    'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
+                    'ibit_gex': round(i_call_gex + i_put_gex, 2),
+                    'deribit_gex': round(d_call_gex + d_put_gex, 2),
+                    'net_dealer_delta': round(
+                        (ib['call_delta'] + ib['put_delta'] if ib else 0) +
+                        (db_entry['call_delta'] + db_entry['put_delta'] if db_entry else 0), 2),
+                    'net_vanna': round(
+                        (ib['call_vanna'] + ib['put_vanna'] if ib else 0) +
+                        (db_entry['call_vanna'] + db_entry['put_vanna'] if db_entry else 0), 2),
+                    'net_charm': round(
+                        (ib['call_charm'] + ib['put_charm'] if ib else 0) +
+                        (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
+                    'call_volume': ib['call_volume'] if ib else 0,
+                    'put_volume': ib['put_volume'] if ib else 0,
+                })
+
+            # Compute per-expiry levels
+            level_rows = [{
+                'strike': sr['btc'], 'net_gex': sr['net_gex'],
+                'call_gex': sr['call_gex'], 'put_gex': sr['put_gex'],
+                'call_oi': sr['call_oi'], 'put_oi': sr['put_oi'],
+                'total_oi': sr['call_oi'] + sr['put_oi'],
+                'net_dealer_delta': sr['net_dealer_delta'],
+                'net_vanna': sr['net_vanna'], 'net_charm': sr['net_charm'],
+                'call_volume': sr['call_volume'], 'put_volume': sr['put_volume'],
+                'call_vol_gex': 0, 'put_vol_gex': 0,
+                'active_gex': sr['net_gex'],
+            } for sr in strike_rows]
+            level_df = pd.DataFrame(level_rows)
+            levels_exp = _compute_levels_from_df(level_df, spot_btc_val) if not level_df.empty else {}
+
+            net_gex = sum(sr['net_gex'] for sr in strike_rows)
+            total_call = sum(sr['call_oi'] for sr in strike_rows)
+            total_put = sum(sr['put_oi'] for sr in strike_rows)
+            has_deribit = any(sr['deribit_gex'] != 0 for sr in strike_rows)
+
+            expiry_blob = {
+                'expiry_date': exp_str, 'dte': dte_val,
+                'spot': spot, 'spot_btc': round(spot_btc_val, 2),
+                'btc_per_share': ref_per_share,
+                'deribit_available': has_deribit,
+                'strikes': strike_rows,
+                'summary': {
+                    'net_gex_total': round(net_gex, 2),
+                    'total_call_oi': total_call, 'total_put_oi': total_put,
+                    'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
+                    'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+                    'call_wall_btc': levels_exp.get('call_wall'),
+                    'put_wall_btc': levels_exp.get('put_wall'),
+                    'gamma_flip_btc': levels_exp.get('gamma_flip'),
+                }
+            }
+
+            c_exp.execute(
+                'INSERT OR REPLACE INTO expiry_cache (date, ticker, expiry_date, data_json) VALUES (?, ?, ?, ?)',
+                (today_str, ticker_symbol, exp_str, json.dumps(expiry_blob))
+            )
+        conn_exp.commit()
+        conn_exp.close()
+    except Exception as e:
+        log.warning(f"[expiry-cache] Failed to store per-expiry data: {e}")
 
     return {
         'ticker': ticker_symbol,
@@ -3589,6 +3747,16 @@ def _bg_refresh():
     # Track whether post-close refresh has been done today for each ticker
     post_close_done = {}  # {ticker: date_string}
     while True:
+        # Cleanup old expiry_cache rows
+        try:
+            conn = get_db()
+            conn.execute("DELETE FROM expiry_cache WHERE date < date('now', '-90 days')")
+            conn.execute("DELETE FROM expiry_cache WHERE expiry_date < date('now', '-7 days')")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
         # Update candles every 5 minutes for all tickers
         now = time.time()
         if now - last_candle_update >= 300:
@@ -4196,6 +4364,161 @@ def api_flows():
     rows.reverse()
     data = [{'date': r[0], 'flow': r[1], 'shares': r[2], 'aum': r[3], 'nav': r[4], 'total_flow': r[5]} for r in rows]
     return Response(json.dumps(data), mimetype='application/json')
+
+
+@app.route('/api/expiry-data')
+def api_expiry_data():
+    """Query per-expiry options data.
+
+    Params:
+      ticker: IBIT or ETHA (default IBIT)
+      expiry: single expiry date YYYY-MM-DD
+      from_date: range start (inclusive)
+      to_date: range end (inclusive)
+      date: snapshot date (default: latest available)
+
+    No expiry/from_date/to_date = list available expiries.
+    Single expiry = full strike data for that expiry.
+    from_date + to_date = aggregates all expiries in range.
+
+    Response gex_chart shape matches existing charts.
+    """
+    ticker = request.args.get('ticker', 'IBIT').upper()
+    expiry = request.args.get('expiry')
+    from_date = request.args.get('from_date')
+    to_date = request.args.get('to_date')
+    snapshot_date = request.args.get('date')
+
+    conn = get_db()
+    c = conn.cursor()
+
+    if not snapshot_date:
+        row = c.execute(
+            'SELECT MAX(date) FROM expiry_cache WHERE ticker=?', (ticker,)
+        ).fetchone()
+        snapshot_date = row[0] if row and row[0] else None
+        if not snapshot_date:
+            conn.close()
+            return Response(json.dumps({'error': 'No expiry data available'}),
+                            mimetype='application/json'), 404
+
+    # --- List mode: return available expiries ---
+    if not expiry and not from_date:
+        expiries = c.execute(
+            'SELECT expiry_date, data_json FROM expiry_cache '
+            'WHERE date=? AND ticker=? ORDER BY expiry_date',
+            (snapshot_date, ticker)
+        ).fetchall()
+        conn.close()
+        result = []
+        for exp_date, dj in expiries:
+            d = json.loads(dj)
+            result.append({
+                'expiry_date': exp_date,
+                'dte': d.get('dte'),
+                'total_call_oi': d['summary']['total_call_oi'],
+                'total_put_oi': d['summary']['total_put_oi'],
+                'total_oi': d['summary']['total_call_oi'] + d['summary']['total_put_oi'],
+                'net_gex_total': d['summary']['net_gex_total'],
+                'regime': d['summary']['regime'],
+                'deribit_available': d.get('deribit_available', False),
+            })
+        return Response(json.dumps({'date': snapshot_date, 'expiries': result}),
+                        mimetype='application/json')
+
+    # --- Single expiry or range mode ---
+    if expiry:
+        rows = c.execute(
+            'SELECT data_json FROM expiry_cache '
+            'WHERE date=? AND ticker=? AND expiry_date=?',
+            (snapshot_date, ticker, expiry)
+        ).fetchall()
+    else:
+        rows = c.execute(
+            'SELECT data_json FROM expiry_cache '
+            'WHERE date=? AND ticker=? AND expiry_date>=? AND expiry_date<=?',
+            (snapshot_date, ticker, from_date, to_date)
+        ).fetchall()
+
+    conn.close()
+
+    if not rows:
+        return Response(json.dumps({'error': 'No data found'}),
+                        mimetype='application/json'), 404
+
+    # Aggregate strikes across matching expiries, keyed by rounded BTC price
+    strike_agg = {}
+    included_expiries = []
+    first_blob = json.loads(rows[0][0])
+
+    for row in rows:
+        d = json.loads(row[0])
+        included_expiries.append(d['expiry_date'])
+        for s in d['strikes']:
+            btc = round(s['btc'])
+            if btc not in strike_agg:
+                strike_agg[btc] = {
+                    'btc': s['btc'], 'strike': s['strike'],
+                    'call_oi': 0, 'put_oi': 0,
+                    'call_gex': 0, 'put_gex': 0,
+                    'net_gex': 0, 'ibit_gex': 0, 'deribit_gex': 0,
+                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+                    'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                }
+            a = strike_agg[btc]
+            a['call_oi'] += s['call_oi']
+            a['put_oi'] += s['put_oi']
+            a['net_gex'] += s['net_gex']
+            a['call_gex'] += s.get('call_gex', 0)
+            a['put_gex'] += s.get('put_gex', 0)
+            a['ibit_gex'] += s.get('ibit_gex', s['net_gex'])
+            a['deribit_gex'] += s.get('deribit_gex', 0)
+            a['net_dealer_delta'] += s['net_dealer_delta']
+            a['net_vanna'] += s['net_vanna']
+            a['net_charm'] += s['net_charm']
+            a['call_volume'] += s['call_volume']
+            a['put_volume'] += s['put_volume']
+            a['total_volume'] += s['call_volume'] + s['put_volume']
+
+    gex_chart = sorted(strike_agg.values(), key=lambda x: x['btc'])
+
+    # Compute aggregated levels
+    spot_btc = first_blob.get('spot_btc', 0)
+    level_rows = [{
+        'strike': s['btc'], 'net_gex': s['net_gex'],
+        'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
+        'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
+        'total_oi': s['call_oi'] + s['put_oi'],
+        'net_dealer_delta': s['net_dealer_delta'],
+        'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
+        'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
+        'call_vol_gex': 0, 'put_vol_gex': 0,
+        'active_gex': s['net_gex'],
+    } for s in gex_chart]
+    level_df = pd.DataFrame(level_rows)
+    levels_btc = _compute_levels_from_df(level_df, spot_btc) if not level_df.empty else {}
+
+    net_gex = sum(s['net_gex'] for s in gex_chart)
+    total_call = sum(s['call_oi'] for s in gex_chart)
+    total_put = sum(s['put_oi'] for s in gex_chart)
+
+    result = {
+        'date': snapshot_date,
+        'spot_btc': spot_btc,
+        'spot': first_blob.get('spot'),
+        'btc_per_share': first_blob.get('btc_per_share'),
+        'included_expiries': sorted(included_expiries),
+        'gex_chart': gex_chart,
+        'levels_btc': levels_btc,
+        'net_gex_total': net_gex,
+        'total_call_oi': total_call,
+        'total_put_oi': total_put,
+        'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
+        'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in gex_chart),
+    }
+
+    return Response(json.dumps(result, default=str), mimetype='application/json')
 
 
 @app.route('/api/data')
