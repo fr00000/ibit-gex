@@ -1351,10 +1351,35 @@ def compute_macro_regime(conn, ticker, days=30):
     if not wall_detail:
         wall_detail = f'Insufficient data ({len(cache_rows)} days of 31-45d cache)'
 
-    # ── Signal 3: Range Compression + Regime Context (-12 to +12) ────────
+    # ── Signal 3: Range Compression + Spot Position (-12 to +12) ─────────
+    # Compressed range = coiled spring. Direction depends on WHERE spot sits
+    # within the range and whether gamma regime amplifies or dampens.
     compression_score = 0
     compression_detail = ''
 
+    # Get spot BTC and current walls from freshest available data
+    spot_btc = 0
+    current_cw = 0
+    current_pw = 0
+    for try_dte in [3, 7, 14, 30, 45]:
+        fresh = c.execute(
+            'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+            (ticker, try_dte)
+        ).fetchone()
+        if fresh:
+            fd = json.loads(fresh[0])
+            sb = fd.get('btc_spot', 0)
+            comb = fd.get('combined_levels_btc') or {}
+            lvl = fd.get('levels', {})
+            cw = comb.get('call_wall') or (lvl.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+            pw = comb.get('put_wall') or (lvl.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+            if sb and cw and pw:
+                spot_btc = sb
+                current_cw = cw
+                current_pw = pw
+                break
+
+    # Build range history from structural data (cache_rows = dte=45, already loaded)
     if len(cache_rows) >= 10:
         ranges = []
         for row in cache_rows:
@@ -1370,22 +1395,57 @@ def compute_macro_regime(conn, ticker, days=30):
                 continue
 
         if ranges:
-            current_range = ranges[0]  # Most recent (desc order from query)
+            current_range = ranges[0]
             sorted_ranges = sorted(ranges)
-            # Find percentile position
             below = sum(1 for r in sorted_ranges if r < current_range)
             percentile = (below / len(sorted_ranges)) * 100
 
-            if percentile <= 20:
+            if percentile <= 20 and spot_btc and current_cw and current_pw and current_cw > current_pw:
+                # Compressed — score by spot position + regime
+                spot_pct = (spot_btc - current_pw) / (current_cw - current_pw)
+                spot_pct = max(0, min(1, spot_pct))  # clamp
                 current_regime = rows[0][1] if rows else None
+
                 if current_regime == 'positive_gamma':
-                    compression_score = -12
-                    compression_detail = f'{percentile:.0f}th pctl range + positive gamma -> breaks DOWN'
+                    # Positive gamma: walls hold. Near call wall = rejection, near put wall = bounce
+                    if spot_pct > 0.75:
+                        compression_score = -12
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (call wall) + pos \u03b3 \u2192 rejection'
+                    elif spot_pct > 0.60:
+                        compression_score = -6
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (lean resistance) + pos \u03b3'
+                    elif spot_pct < 0.25:
+                        compression_score = 12
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (put wall) + pos \u03b3 \u2192 bounce'
+                    elif spot_pct < 0.40:
+                        compression_score = 6
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (lean support) + pos \u03b3'
+                    else:
+                        compression_score = 0
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (mid-range) + pos \u03b3 \u2192 range-bound'
+
                 elif current_regime == 'negative_gamma':
-                    compression_score = 12
-                    compression_detail = f'{percentile:.0f}th pctl range + negative gamma -> breaks UP'
+                    # Negative gamma: walls break. Near call wall = breakout up, near put wall = breakdown
+                    if spot_pct > 0.75:
+                        compression_score = 12
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (call wall) + neg \u03b3 \u2192 breakout'
+                    elif spot_pct > 0.60:
+                        compression_score = 6
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (lean resistance) + neg \u03b3'
+                    elif spot_pct < 0.25:
+                        compression_score = -12
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (put wall) + neg \u03b3 \u2192 breakdown'
+                    elif spot_pct < 0.40:
+                        compression_score = -6
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (lean support) + neg \u03b3'
+                    else:
+                        compression_score = 0
+                        compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%} (mid-range) + neg \u03b3 \u2192 volatile'
                 else:
-                    compression_detail = f'{percentile:.0f}th pctl range, oscillating regime'
+                    compression_detail = f'{percentile:.0f}th pctl range, spot at {spot_pct:.0%}, oscillating regime'
+
+            elif percentile <= 20:
+                compression_detail = f'{percentile:.0f}th pctl range (compressed, no wall data for position)'
             else:
                 compression_detail = f'{percentile:.0f}th pctl range (not compressed)'
 
