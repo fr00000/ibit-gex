@@ -1532,7 +1532,7 @@ def compute_macro_regime(conn, ticker, days=30):
 
     venue_data = None
     venue_dte_label = ''
-    for try_dte in [45, 30, 14, 7, 3]:
+    for try_dte in [3, 7, 14, 30, 45]:
         row = c.execute(
             'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
             (ticker, try_dte)
