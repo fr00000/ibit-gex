@@ -2248,12 +2248,18 @@ function renderStructure(data, outlook){
   const fwdCWArr = new Array(dates.length).fill(null);
   const fwdRegimes = [];
 
+  // Bridge: connect last historical 31-45d wall to forward projection
   if(fwdPoints.length > 0){
+    const lastHistPW = histPW[histPW.length-1];
+    const lastHistCW = histCW[histCW.length-1];
+    fwdPWArr[fwdPWArr.length-1] = lastHistPW;
+    fwdCWArr[fwdCWArr.length-1] = lastHistCW;
+
     for(const fp of fwdPoints){
       allLabels.push(fp.label);
       allPW.push(null);
       allCW.push(null);
-      allSpot.push(histSpot[histSpot.length-1]);
+      allSpot.push(null);
       allGF.push(null);
       allPW03.push(null);
       allCW03.push(null);
@@ -2292,15 +2298,42 @@ function renderStructure(data, outlook){
     order:2,
   });
 
-  // --- Forward projected walls (dots only, no connecting lines) ---
+  // --- Forward projected walls (dashed) ---
   if(fwdPoints.length > 0){
     datasets.push({
       label:'Projected PW',
       data:fwdPWArr,
-      borderColor:'rgba(0,220,130,0.8)',
+      borderColor:'rgba(0,220,130,0.6)',
+      backgroundColor:'rgba(0,220,130,0.03)',
+      borderWidth:2,
+      borderDash:[6,4],
+      pointRadius:0,
+      fill:false,
+      spanGaps:true,
+      tension:0.3,
+      order:2,
+    });
+    datasets.push({
+      label:'Projected CW',
+      data:fwdCWArr,
+      borderColor:'rgba(255,64,96,0.6)',
+      backgroundColor:'rgba(255,64,96,0.03)',
+      borderWidth:2,
+      borderDash:[6,4],
+      pointRadius:0,
+      fill:'-1',
+      spanGaps:true,
+      tension:0.3,
+      order:2,
+    });
+
+    // Forward window markers (dots at each DTE window point)
+    datasets.push({
+      label:'Fwd PW',
+      data:fwdPWArr.map((v,i) => i > dividerIdx ? v : null),
+      borderColor:'transparent',
       backgroundColor:'rgba(0,220,130,0.8)',
-      pointRadius:5,
-      pointHoverRadius:7,
+      pointRadius:4,
       pointStyle:'circle',
       showLine:false,
       fill:false,
@@ -2308,12 +2341,11 @@ function renderStructure(data, outlook){
       order:0,
     });
     datasets.push({
-      label:'Projected CW',
-      data:fwdCWArr,
-      borderColor:'rgba(255,64,96,0.8)',
+      label:'Fwd CW',
+      data:fwdCWArr.map((v,i) => i > dividerIdx ? v : null),
+      borderColor:'transparent',
       backgroundColor:'rgba(255,64,96,0.8)',
-      pointRadius:5,
-      pointHoverRadius:7,
+      pointRadius:4,
       pointStyle:'circle',
       showLine:false,
       fill:false,
