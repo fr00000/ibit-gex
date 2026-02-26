@@ -1181,6 +1181,18 @@ async function loadExpiryOptions(){
     if(!d.expiries||!d.expiries.length)return;
     expiryList=d.expiries;
 
+    // Filter out expired entries and recompute DTE from actual date
+    // (stored dte is stale — computed at storage time, not query time)
+    const now=new Date();
+    now.setHours(0,0,0,0);
+    expiryList=expiryList.filter(e=>{
+      return e.expiry_date>=now.toISOString().slice(0,10);
+    }).map(e=>{
+      const ed=new Date(e.expiry_date+'T12:00:00');
+      const freshDte=Math.max(0,Math.round((ed-now)/86400000));
+      return {...e,dte:freshDte};
+    });
+
     // Annotate DTE window options with expiry count + OI
     const dteWindows=[{v:'0-3',min:0,max:3},{v:'4-7',min:4,max:7},{v:'8-14',min:8,max:14},{v:'15-30',min:15,max:30},{v:'31-45',min:31,max:45}];
     for(const w of dteWindows){
