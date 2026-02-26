@@ -2426,10 +2426,7 @@ function renderStructure(data, outlook){
       interaction:{mode:'index',intersect:false},
       scales:{
         x:{
-          grid:{
-            color: (ctx) => ctx.index === dividerIdx ? 'rgba(255,255,255,0.3)' : 'rgba(28,34,48,0.5)',
-            lineWidth: (ctx) => ctx.index === dividerIdx ? 2 : 1,
-          },
+          grid:{color:'rgba(28,34,48,0.5)'},
           ticks:{color:'#4a5568',font:{size:8},maxRotation:0,autoSkip:true,maxTicksLimit:10}
         },
         y:{grace:'5%',grid:{color:'rgba(28,34,48,0.5)'},ticks:{color:'#4a5568',font:{size:9},callback:v=>'$'+(v/1000).toFixed(0)+'K'}}
@@ -2487,11 +2484,6 @@ function renderStructure(data, outlook){
         const x = meta.data[dividerIdx].x;
         const c = chart.ctx;
         c.save();
-        c.font = '600 8px "IBM Plex Mono", monospace';
-        c.fillStyle = 'rgba(255,255,255,0.5)';
-        c.textAlign = 'center';
-        c.fillText('NOW', x, chart.chartArea.top + 10);
-
         const {top, bottom, right} = chart.chartArea;
         c.fillStyle = 'rgba(255,255,255,0.015)';
         c.fillRect(x, top, right - x, bottom - top);
