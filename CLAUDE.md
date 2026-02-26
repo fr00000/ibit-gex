@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Options gamma exposure (GEX) dashboard for BTC/ETH ETFs (IBIT, ETHA). Flask backend + vanilla JS frontend in a single `app.py` (~5100 lines) and `templates/index.html` (~1800 lines). Combines IBIT options data (via Yahoo Finance), Deribit crypto options, Coinglass derivatives data, and ETF flows (Farside Investors) into a real-time positioning analysis tool.
+Options gamma exposure (GEX) dashboard for BTC/ETH ETFs (IBIT, ETHA). Flask backend + vanilla JS frontend in a single `app.py` (~6300 lines) and `templates/index.html` (~2500 lines). Combines IBIT options data (via Yahoo Finance), Deribit crypto options, Coinglass derivatives data, and ETF flows (Farside Investors) into a real-time positioning analysis tool.
 
 The AI analysis feature sends structured per-window data to Claude Opus 4.6 for cross-timeframe positioning synthesis.
 
@@ -11,7 +11,7 @@ The AI analysis feature sends structured per-window data to Claude Opus 4.6 for 
 ```
 app.py                  # Everything: Flask app, data fetching, analysis, all logic
 templates/index.html    # Dashboard UI: Chart.js + custom canvas charts, all frontend JS
-templates/macro.html    # Standalone macro regime page
+templates/macro.html    # Standalone macro regime page with signal charts (~1100 lines)
 .env                    # ANTHROPIC_API_KEY, COINGLASS_API_KEY (not committed)
 gex_data.db             # SQLite database (auto-created)
 ```
@@ -20,24 +20,26 @@ gex_data.db             # SQLite database (auto-created)
 
 | Lines | Section | Key Functions |
 |-------|---------|--------------|
-| 1-125 | Config, logging | `DTE_WINDOWS`, `TICKER_CONFIG`, env vars |
-| 127-165 | Black-Scholes | `bs_gamma`, `bs_delta`, `bs_vanna`, `bs_charm` |
-| 170-315 | Database | `init_db()` — 8 tables: snapshots, strike_history, data_cache, analysis_cache, btc_candles, etf_flows, predictions, coinglass_data |
-| 316-675 | History & trends | `get_prev_strikes`, `summarize_history_trends` (30d regime, level migration, range evolution) |
-| 675-770 | Structure trends | `summarize_structure_trends` (per-window wall migration over 7d) |
-| 770-1570 | Macro regime | `compute_macro_regime` — scoring system (-100 to +100) combining funding, OI, ETF flows, venue convergence, liquidation |
-| 1570-1985 | External data | ETF flows (Farside HTML parsing), Coinglass API (funding, OI, liquidations), data freshness |
-| 1985-2160 | Deribit + candles | `fetch_deribit_options`, BTC candle backfill/update |
-| 2160-2770 | Core data pipeline | `_compute_levels_from_df` (GEX computation), `fetch_and_analyze` (main data fetch: Yahoo + Deribit → combined levels) |
-| 2770-3100 | Flow & dealer delta | `compute_flow_forecast` (charm/vanna), `compute_dealer_delta_scenarios`, `generate_dealer_delta_briefing` |
-| 3100-3325 | Significant levels | `compute_significant_levels` (behavioral labels), `compute_breakout` |
-| 3325-3410 | Cache layer | `get_latest_cache`, `set_cached_data`, `fetch_with_cache` |
-| 3410-3650 | Background refresh | `_bg_refresh()` — 5min loop: post-close trigger (4:20 PM ET), weekend runs, >2% move re-analysis |
-| 3650-3990 | API routes | `/api/data`, `/api/outlook`, `/api/range-cone`, `/api/structure`, `/api/candles`, `/api/flows` |
-| 3990-4380 | Analysis cache | `get_cached_analysis`, `save_predictions`, `score_expired_predictions`, `detect_structural_patterns` |
-| 4380-4600 | Analysis data builder | `build_analysis_data()` — assembles the JSON blob sent to AI. GEX distribution extraction at ~4504 |
-| 4600-4940 | AI system prompt + runner | `run_analysis()` — system prompt (~300 lines), Claude API call. **No prior analysis injection** (removed intentionally) |
-| 4940-5150 | Analysis API + accuracy | `/api/analysis`, `/api/analyze`, `/api/accuracy`, `/api/macro-regime` |
+| 1-130 | Config, logging, BS math | `DTE_WINDOWS`, `TICKER_CONFIG`, `bs_gamma/delta/vanna/charm` |
+| 170-330 | Database | `init_db()` — 9 tables: snapshots, strike_history, data_cache, analysis_cache, btc_candles, etf_flows, predictions, coinglass_data, expiry_cache |
+| 330-780 | History & structure trends | `get_prev_strikes`, `summarize_history_trends`, `summarize_structure_trends` |
+| 780-1200 | Phase 2+3 signal functions | `_compute_funding_signal`, `_compute_oi_signal`, `_compute_liquidation_signal`, `_compute_pcr_direction`, `_compute_wall_breach`, `_compute_iv_term_signal`, `_compute_score_history` |
+| 1200-2030 | Macro regime | `compute_macro_regime` — 11-signal scoring system (-100 to +100) |
+| 2030-2450 | External data | ETF flows (Farside HTML parsing), Coinglass API (funding, OI, liquidations), Deribit freshness |
+| 2450-2625 | Deribit + candles | `fetch_deribit_options`, BTC candle backfill/update |
+| 2625-2755 | Level computation | `_compute_levels_from_df` (GEX computation from dataframe) |
+| 2755-3465 | Core data pipeline | `fetch_and_analyze` — main data fetch: Yahoo + Deribit → combined levels, IV term structure aggregation, per-expiry caching |
+| 3465-3820 | Flow & dealer delta | `compute_flow_forecast` (charm/vanna), `compute_dealer_delta_scenarios`, `generate_dealer_delta_briefing` |
+| 3820-4030 | Significant levels & breakout | `compute_significant_levels`, `compute_breakout` |
+| 4030-4115 | Cache layer | `get_latest_cache`, `set_cached_data`, `fetch_with_cache` |
+| 4115-4540 | Background refresh | `_refresh_deribit_only`, `_bg_deribit_overlay` (per-DTE Deribit merge + IV storage), `_bg_refresh` (5min loop) |
+| 4540-4935 | API routes (data) | `/api/data`, `/api/outlook`, `/api/range-cone`, `/api/structure`, `/api/structure/heatmap`, `/api/candles`, `/api/flows` |
+| 4935-5090 | Per-expiry data system | `/api/expiry-data` — list expiries, single expiry, date range. Reads from `expiry_cache` table |
+| 5090-5400 | Main data API | `/api/data` — the primary endpoint, calls `fetch_with_cache` |
+| 5400-5750 | Analysis data builder | `build_analysis_data()` — assembles JSON blob for AI including IV term structure per DTE, macro regime, structure trends |
+| 5750-6080 | AI system prompt + runner | `run_analysis()` — system prompt (~330 lines), Claude Opus 4.6 API call |
+| 6080-6290 | Analysis API + accuracy | `/api/analysis`, `/api/analyze`, `/api/accuracy`, `/api/macro-regime` |
+| 6290-6355 | Macro page + main | `/macro` route, `app.run()` |
 
 ## Key Architecture Concepts
 
@@ -55,6 +57,29 @@ Each window shows distinct option positioning. When comparing across windows, sa
 5. `build_analysis_data()` assembles all windows + history + macro into one JSON blob
 6. `run_analysis()` sends blob to Claude Opus for synthesis
 
+### Macro Regime (11-signal scoring, -100 to +100)
+
+**Phase 1 — GEX-derived (±12 each):**
+- Regime persistence & transition (consecutive days in regime, transition bonus at 7+ days)
+- Structural wall migration (31-45d walls, needs 7+ days history)
+- Range compression + spot position (uses same DTE for range history and spot %)
+- ETF flow momentum (reversal detection)
+- Venue wall convergence (IBIT vs Deribit, DTE-scaled threshold: 2% at dte=3, 4% at dte=45)
+
+**Phase 2 — Coinglass (±13 each, requires `COINGLASS_API_KEY`):**
+- Funding rate
+- Aggregate OI
+- Liquidation intensity
+
+**Phase 3 — Options-derived (±8 to ±13):**
+- PCR direction (±8, contrarian: surging PCR = bullish)
+- Wall breach detection (±13, spot through GEX wall + regime)
+
+**Phase 4 — Volatility (±8):**
+- IV term structure shape (backwardation = fear = contrarian bullish)
+
+Total clamped to ±100.
+
 ### Background Refresh (`_bg_refresh`)
 - **Post-close (primary)**: 4:20 PM ET Mon-Fri, force-refresh all windows → run AI analysis → save predictions
 - **Weekend**: Once per day if no analysis cached (Deribit-primary)
@@ -70,14 +95,15 @@ Each window shows distinct option positioning. When comparing across windows, sa
 
 ### Frontend Charts (in index.html)
 - **Price chart**: TradingView lightweight-charts (top-left)
-- **GEX Profile**: Chart.js bar chart, IBIT vs Deribit stacked (bottom-left, tab 1)
-- **OI Profile**: Chart.js bar chart (bottom-left, tab 2)
 - **Positioning Outlook**: Chart.js line chart — walls, flips, expected move across DTE windows (top-right)
-- **Range Cone**: Custom canvas — continuous GEX heatmap strips per window + expected move funnel (bottom-right, default tab)
-- **Walls / Structure**: Chart.js line chart — 30d wall evolution (bottom-right, tab 2)
-- **OI/GEX Heatmap**: Custom canvas (bottom-right, tabs 3-4)
+- **GEX Profile / Open Interest / OI Skew**: Chart.js charts in GEX cell (middle-left, tabbed)
 - **Dealer Delta Profile**: Chart.js bar chart (middle-right)
-- **Flow Forecast**: Chart.js bar chart (sidebar)
+- **Wall Migration with Forward Projection**: Chart.js line chart — 30d historical 31-45d walls + forward-projected walls from DTE windows with NOW divider (bottom-left, DEFAULT tab)
+- **Range Cone**: Custom canvas — continuous GEX heatmap strips per window + expected move funnel (bottom-left, tab 2)
+- **OI/GEX Heatmap**: Custom canvas (bottom-left, tabs 3-4)
+- **ETF Flows**: Chart.js bar chart (bottom-right)
+- **Macro Regime Bar**: Score badge + signal pills in header
+- **Per-Expiry Selector**: Dropdown with DTE windows, date ranges, individual expiries
 
 ### Database Tables
 | Table | Purpose |
@@ -90,13 +116,23 @@ Each window shows distinct option positioning. When comparing across windows, sa
 | `etf_flows` | Daily ETF fund flows from Farside |
 | `predictions` | Saved level predictions for accuracy scoring |
 | `coinglass_data` | Funding rates, aggregate OI, liquidations |
+| `expiry_cache` | Per-expiry strike data (GEX, OI, greeks per strike per expiry date) |
+
+### IV Term Structure
+ATM IV is computed per expiry during both IBIT processing (from `impliedVolatility`) and Deribit overlay (from `mark_iv`). Stored as `iv_term_structure` array in the `data_cache` blob. Each entry has `{expiry, dte, atm_iv, call_iv, put_iv, source}`. ATM = OI-weighted average of options within 2% of spot. IBIT IV is decimal (0.65), Deribit is percentage (65.0) — converted during computation.
+
+### Per-Expiry Data System
+Separate from the DTE window cache. `expiry_cache` stores per-strike data for each individual expiry date, including merged IBIT + Deribit data. Frontend expiry selector dynamically populates from `/api/expiry-data` with expiry count, OI, and DTE. Client-side filters expired entries and recomputes DTE.
+
+### Wall Migration Forward Projection
+The wall migration chart merges historical data from `/api/structure` with forward data from `/api/outlook`. Each DTE window's current walls are plotted at their forward date (4-7d→+5d, 8-14d→+11d, 15-30d→+22d, 31-45d→+38d). These are the market's implied forward wall positions — directly observable, no model needed.
 
 ## Common Tasks
 
 ### Adding a new field to AI analysis data
-1. Add computation in `build_analysis_data()` (~line 4381)
+1. Add computation in `build_analysis_data()` (~line 5400)
 2. Add to per-window summary dict
-3. Add interpretation instructions to system prompt in `run_analysis()` (~line 4600)
+3. Add interpretation instructions to system prompt in `run_analysis()` (~line 5750)
 4. Token budget: currently ~16K max_tokens, data blob should stay under ~8K tokens
 
 ### Adding a new chart
@@ -105,8 +141,19 @@ Each window shows distinct option positioning. When comparing across windows, sa
 3. Call load function from `loadData()` success path (~line 1194)
 4. Use custom canvas for non-standard visualizations; Chart.js for standard line/bar charts
 
+### Adding a new macro signal
+1. Write the signal function (e.g. `_compute_new_signal(c, ticker, btc_per_share)`) returning `(score, detail, history)`
+2. Call it in `compute_macro_regime()` after the appropriate phase
+3. Add to `total_score` sum
+4. Add to `signals` dict in return with `{'score':..., 'max':..., 'detail':...}`
+5. Add to `history` dict if it produces historical data
+6. Update `_compute_score_history()` to include in daily recompute
+7. Update the AI system prompt's macro section to explain the signal
+8. Frontend macro page renders dynamically — no hardcoded signal names needed
+9. Main dashboard macro pills render dynamically via the `abbr` map — add abbreviation there
+
 ### Modifying the system prompt
-The AI system prompt is a single long f-string starting at ~line 4600 in `run_analysis()`. It contains:
+The AI system prompt is a single long f-string starting at ~line 5750 in `run_analysis()`. It contains:
 - Data field explanations
 - Output format instructions (POSITIONING summary, not trade signals)
 - Quality rules (negative GEX language, fabricated numbers, OI vs expiry)
@@ -126,7 +173,7 @@ Add to `DTE_WINDOWS` list. Everything else (caching, analysis, charts) automatic
 - Chart patterns: see existing heatmap and range-cone for custom canvas; see outlook and GEX profile for Chart.js
 
 ## Important Gotchas
-- `app.py` is one large file (~5100 lines). When editing, use precise line numbers and verify context.
+- `app.py` is one large file (~6300 lines). When editing, use precise line numbers and verify context.
 - `gex_chart` in the cache vs `gex_distribution` in analysis data are related but different: `gex_chart` is the raw per-strike data, `gex_distribution` is the top-20 extracted for the AI prompt.
 - IBIT data is daily (stale overnight/weekends). Deribit is near real-time. The `data_freshness` field tracks this.
 - `btc_per_share` converts between IBIT share prices and BTC prices. All analysis uses BTC prices.

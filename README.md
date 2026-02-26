@@ -44,6 +44,7 @@ Open http://localhost:5000 in your browser.
 | Variable | Required | Description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | For AI analysis | Claude API key for automated trading analysis |
+| `COINGLASS_API_KEY` | Optional | Enables funding rate, aggregate OI, liquidation signals in macro regime |
 
 Create a `.env` file in the project root (loaded automatically via python-dotenv).
 
@@ -69,19 +70,22 @@ DTE windows are selectable from the web UI dropdown. Windows are non-overlapping
 ## Dashboard
 
 ### Header
-Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE window selector (non-overlapping ranges), source selector (ALL/IBIT/DERIBIT — shown when Deribit data is available), Deribit OI badge, candle timeframe selector (15m/1h/4h/1d), expiration date, refresh button.
+Ticker tabs (IBIT/ETHA), crypto price, ETF price, gamma regime badge, positioning confidence indicator, ETF flow badge (daily inflow/outflow with streak), timestamp, DTE window selector (non-overlapping ranges), source selector (ALL/IBIT/DERIBIT — shown when Deribit data is available), Deribit OI badge, candle timeframe selector (15m/1h/4h/1d), per-expiry selector (DTE windows, date ranges, individual expiries), refresh button.
+
+### Macro Regime Bar
+Score badge (-100 to +100), bias label (BOTTOMING/NEUTRAL/TOPPING), high conviction swing badges, and individual signal pills with tooltips showing score detail. Combines 11 signals across GEX positioning, derivatives data, and options-derived metrics.
 
 ### Candlestick Chart
 Crypto candles (BTC/ETH via Binance, persisted in SQLite with 90-day backfill) with horizontal overlays at call wall, put wall, gamma flip, max pain, expected move bounds, support/resistance levels, and dealer delta flip points (purple dotted). Overlay lines update when the source selector changes. Timeframe is selectable from the header. Real-time updates via Binance WebSocket.
 
-### GEX Profile
-Stacked bar chart showing GEX at each strike. Green = positive gamma, red = negative gamma. In ALL source mode, bars are stacked by venue (IBIT solid, Deribit translucent). In IBIT mode, bars stack by expiry with distinct colors. In DERIBIT mode, Deribit-only bars are shown. An expiry filter dropdown (ALL EXP, NEAREST, NEXT 2, NEXT 3) controls which expirations are displayed. Tooltip shows net GEX, per-venue breakdown, and volume.
-
-### Open Interest Profile
-Call vs put open interest at each strike, showing where hedging activity is concentrated.
+### GEX Profile / Open Interest / OI Skew
+Three-tab cell showing strike-space charts. **GEX Profile**: Stacked bar chart showing GEX at each strike. Green = positive gamma, red = negative gamma. In ALL source mode, bars are stacked by venue (IBIT solid, Deribit translucent). In IBIT mode, bars stack by expiry with distinct colors. An expiry filter dropdown (ALL EXP, NEAREST, NEXT 2, NEXT 3) controls which expirations are displayed. **Open Interest**: Call vs put open interest at each strike. **OI Skew**: Call OI (green, up) vs put OI (red, down) butterfly chart with spot line, showing directional skew at each strike.
 
 ### ETF Flows
 Dual-bar chart of daily ETF fund flows over the last 30 days sourced from Farside Investors. Wide faded bars show total BTC ETF flow (all spot Bitcoin ETFs combined), narrow solid bars show IBIT-specific flow. Green = inflow, red = outflow. When IBIT outflows coincide with positive total flow, it signals fund rotation rather than genuine institutional exit.
+
+### Wall Migration with Forward Projection
+Default bottom-left chart. Shows 30 days of historical 31-45d structural wall positions (solid lines) with forward-projected walls from current DTE window positioning (dashed lines). A vertical "NOW" divider separates historical from projected. Each DTE window's walls are plotted at their forward date — the market's implied future wall positions, directly observable from the options chain. Includes 0-3d tactical walls (thin dashed) and gamma flip for context.
 
 ### Dealer Delta Profile
 Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices across the key level grid. Green bars = dealers must BUY (supportive), red bars = dealers must SELL (resistive). Shows where dealer hedging creates natural support/resistance independent of the GEX profile.
@@ -101,6 +105,10 @@ Bar chart of pre-computed dealer delta (hedging pressure) at hypothetical prices
 - **Dealer Hedging Pressure** — Scenario analysis showing current dealer delta position, delta flip points (where hedging direction reverses), dealer delta at key levels, and a morning briefing summary
 - **Dealer Position** — Net GEX, Active GEX, dealer delta, net vanna, net charm, put/call ratio
 - **History** — Daily snapshots of regime and levels
+
+### Macro Regime Page
+
+Available at `/macro`. Shows the swing-trade regime score (-100 to +100) with per-signal breakdown and historical charts. The score combines 11 signals across GEX positioning, derivatives data (via Coinglass), and options-derived metrics. Requires `COINGLASS_API_KEY` for 3 of the 11 signals (funding, OI, liquidation). Charts include regime history, wall migration, funding rates, OI flush, liquidation, ETF flows, PCR direction, IV term structure, and score components stacked area.
 
 ## How It Works
 
@@ -258,7 +266,7 @@ Save an AI analysis result to the database for today. Accepts the analysis JSON 
 - Crypto/share ratio auto-calculated from spot; actual NAV drifts slightly due to fees
 - Vanna/charm magnitudes are estimates — actual dealer positioning depends on their book, which isn't public
 - ETF flow data from Farside Investors is only available for IBIT (and total BTC ETFs); ETHA flow data is not yet supported
-- Deribit integration is BTC-only (IBIT); ETHA/ETH Deribit options are not fetched
+- Deribit integration covers BTC (IBIT) and ETH (ETHA)
 - Deribit data is cached for 1 hour; IBIT OI is daily — refresh cadences differ
 - Expected move is derived from IBIT ATM straddle only, not Deribit
 - Significant levels, breakout signals, and flow forecast are computed from IBIT data only; dealer delta scenarios include both venues
