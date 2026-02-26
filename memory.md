@@ -15,21 +15,21 @@ This file captures the "why" behind design choices, debugging outcomes, and sign
 **Decision:** Threshold scales by DTE: 2% at dte=3, 2.5% at dte=7, 3% at dte=14, 3.5% at dte=30, 4% at dte=45.
 **Why:** At short DTEs, strike grids are dense and 4% is too generous — gives false convergences. At long DTEs, strikes are sparse and wider tolerance is appropriate.
 
-### Range Compression Timeframe Fix (Feb 25, 2026)
-**Decision:** Range history percentile and spot position now use the SAME DTE window (shortest available with 7+ days).
-**Why:** Previously, range history used dte=45 structural walls while spot_pct used dte=3 tactical walls. The 45-DTE call wall could be $80K while the 0-3 DTE wall is $70K — so "compressed range" and "spot position within range" referred to different ranges. Now both use the same walls for consistency.
+### Range Compression Timeframe (Feb 25, 2026)
+**Decision:** Range history percentile and spot position use the SAME DTE window (shortest available with 7+ days).
+**Why:** Using different DTEs for range history vs spot position creates inconsistency — the 45-DTE call wall could be $80K while the 0-3 DTE wall is $70K, making "compressed range" and "spot position within range" refer to different ranges. Same-DTE comparison ensures consistency.
 
 ### Range Compression Spot Position Logic (Feb 25, 2026)
 **Decision:** Score direction depends on WHERE spot sits within the compressed range + gamma regime.
-**Why:** Previous logic was a blanket directional assumption: positive gamma = breaks DOWN, negative gamma = breaks UP. This ignored spot position entirely. Example: spot at 94% of range (near call wall) in positive gamma should be rejection (-12), but spot at 6% (near put wall) in positive gamma should be bounce (+12). Same regime, opposite direction — position matters.
+**Why:** Spot position within the range determines breakout direction. Example: spot at 94% of range (near call wall) in positive gamma = rejection (-12), but spot at 6% (near put wall) in positive gamma = bounce (+12). Same regime, opposite direction — position matters more than regime alone.
 
 ### Wall Migration Threshold (Feb 25, 2026)
-**Decision:** Lowered from 14 days to 7 days required, with dynamic half-window comparison.
-**Why:** DB only had ~10 days of data when implemented. 14-day requirement made the signal permanently stuck at 0. With 7-day minimum and `half = len(wall_history) // 2` for comparison windows, it activates earlier and adapts to available data.
+**Decision:** Requires 7 days minimum history, with dynamic half-window comparison (`half = len(wall_history) // 2`).
+**Why:** 7 days is the minimum needed to detect meaningful wall drift. Dynamic half-window adapts to available data length rather than requiring a fixed history depth.
 
 ### Regime Transition Threshold (Feb 25, 2026)
-**Decision:** Lowered from 20 consecutive days in old regime to 7.
-**Why:** With only 11 days of snapshot data, the 20-day requirement was literally unreachable. 7 days is still meaningful (a full trading week in one regime then flipping).
+**Decision:** Requires 7 consecutive days in one regime before a transition bonus fires.
+**Why:** 7 days is a full trading week — enough to confirm a regime was established before crediting the transition. Shorter thresholds would fire on noise; longer ones require too much history to ever activate.
 
 ## Signal Additions
 
@@ -37,7 +37,7 @@ This file captures the "why" behind design choices, debugging outcomes, and sign
 **Why added:** Put/call ratio is a classic contrarian sentiment indicator. The data was already stored in `levels.pcr` per DTE per day but wasn't being used in the macro score. Surging PCR = fear building = contrarian bullish. Scored ±8 (lower weight than structural signals).
 
 ### Wall Breach Detection (Feb 25, 2026)
-**Why added:** The most important missing signal. When spot trades through a GEX wall, dealer hedging shifts from stabilizing to amplifying. This is the most mechanically significant event in the GEX framework. Scored ±13 (high weight). Direction depends on gamma regime: negative gamma + above call wall = breakout acceleration, positive gamma + above call wall = likely pinning.
+**Why added:** When spot trades through a GEX wall, dealer hedging shifts from stabilizing to amplifying — the most mechanically significant event in the GEX framework. Scored ±13 (high weight). Direction depends on gamma regime: negative gamma + above call wall = breakout acceleration, positive gamma + above call wall = likely pinning.
 
 ### IV Term Structure (Feb 25, 2026)
 **Why added:** Backwardation (short-dated IV > long-dated IV) is a reliable marker of stress that often precedes bottoms. The raw IV existed per option during computation but was discarded after Greeks calculation. Now aggregated as OI-weighted ATM IV per expiry and stored in `data_cache`. Scored ±8. Signal needs ~5 days to accumulate history before it starts scoring.
@@ -57,7 +57,7 @@ This file captures the "why" behind design choices, debugging outcomes, and sign
 ## Frontend Design
 
 ### Wall Migration Chart with Forward Projection (Feb 25, 2026)
-**Why:** The original "Walls" chart plotted all 5 DTE windows' walls, which was visually busy and hard to read. Replaced with focused 31-45d structural walls + forward projection.
+**Why:** Plotting all 5 DTE windows' walls is visually busy and hard to read. Focusing on 31-45d structural walls + forward projection gives a clearer narrative of wall migration over time.
 **Insight:** Each DTE window's current walls ARE the market's implied forward wall positions. Today's 4-7d walls are where the 0-3d walls will migrate after near-term expiries clear. Plotting them at their forward date (midpoint of DTE range) creates a natural projection without any model.
 **Data:** Historical from `/api/structure`, forward from `/api/outlook`. Both fetched in parallel.
 
@@ -72,8 +72,8 @@ This file captures the "why" behind design choices, debugging outcomes, and sign
 **Fix:** Client-side filter: `expiryList.filter(e => e.expiry_date >= today)` then recompute DTE from actual date diff.
 
 ### Database Location Gotcha
-**The SQLite database is `~/.ibit_gex_history.db`** — a hidden file in the HOME directory, NOT in the project directory. Defined by `DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")` at the top of app.py. When querying manually: `sqlite3 ~/.ibit_gex_history.db "SELECT ..."`. Previous documentation incorrectly said `gex_data.db` — this caused confusion when trying to query the database.
+**The SQLite database is `~/.ibit_gex_history.db`** — a hidden file in the HOME directory, NOT in the project directory. Defined by `DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")` at the top of app.py. When querying manually: `sqlite3 ~/.ibit_gex_history.db "SELECT ..."`.
 
-### Weekend Deribit Data (prior)
+### Weekend Deribit Data
 **Problem:** IBIT data is stale over weekends (no Yahoo updates), but Deribit keeps trading. Dashboard showed stale combined data.
 **Fix:** `_refresh_deribit_only()` runs Deribit overlay on cached IBIT data during weekends. Deribit levels update while IBIT levels stay frozen. `data_freshness` shows age for each venue so the UI can flag staleness.
