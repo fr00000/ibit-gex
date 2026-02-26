@@ -2282,7 +2282,7 @@ function renderStructure(data, outlook){
   const fwdCWArr = new Array(dates.length).fill(null);
   const fwdRegimes = [];
 
-  // Bridge: connect last historical 31-45d wall to forward projection
+  // Bridge: connect last historical wall to forward projection
   if(fwdPoints.length > 0){
     const lastHistPW = histPW[histPW.length-1];
     const lastHistCW = histCW[histCW.length-1];
@@ -2305,135 +2305,123 @@ function renderStructure(data, outlook){
 
   const dividerIdx = dates.length - 1;
   const datasets = [];
-
-  // --- Primary window walls (solid) ---
   const pwLabel = isAll ? 'all' : pw+'d';
   const swLabel = sw ? sw+'d' : '';
-  datasets.push({
-    label:'Put Wall ('+pwLabel+')',
-    data:allPW,
-    borderColor:'rgba(0,220,130,0.9)',
-    backgroundColor:'rgba(0,220,130,0.04)',
-    borderWidth:2,
-    pointRadius:0,
-    fill:false,
-    spanGaps:true,
-    tension:0.3,
-    order:2,
-  });
-  datasets.push({
-    label:'Call Wall ('+pwLabel+')',
-    data:allCW,
-    borderColor:'rgba(255,64,96,0.9)',
-    backgroundColor:'rgba(255,64,96,0.04)',
-    borderWidth:2,
-    pointRadius:0,
-    fill:'-1',
-    spanGaps:true,
-    tension:0.3,
-    order:2,
-  });
+  const fwdPad = new Array(fwdPoints.length).fill(null);
+
+  if(isAll){
+    // === ALL DTE: nested filled bands per window ===
+    const drawOrder = ['31-45','15-30','8-14','4-7','0-3'];
+    const windowData = allKeys.map(key => ({
+      key,
+      pw: dates.map(d => data[d]?.windows?.[key]?.put_wall || null),
+      cw: dates.map(d => data[d]?.windows?.[key]?.call_wall || null),
+    }));
+    // Live override per window
+    if(outlook && outlook.windows){
+      for(const wd of windowData){
+        const ow = outlook.windows.find(w => w.label === wd.key+'d');
+        if(ow){
+          if(ow.call_wall) wd.cw[wd.cw.length-1] = ow.call_wall;
+          if(ow.put_wall) wd.pw[wd.pw.length-1] = ow.put_wall;
+        }
+      }
+    }
+    for(const key of drawOrder){
+      const wd = windowData.find(w => w.key === key);
+      const swDef = STRUCT_WINDOWS.find(s => s.key === key);
+      if(!wd || !swDef) continue;
+      const pwArr = [...wd.pw, ...fwdPad];
+      const cwArr = [...wd.cw, ...fwdPad];
+      const ord = 10 - drawOrder.indexOf(key);
+      datasets.push({
+        label:'PW '+swDef.label, data:pwArr,
+        borderColor:swDef.border, borderWidth:swDef.bw,
+        pointRadius:0, fill:false, spanGaps:true, tension:0.3, order:ord,
+      });
+      datasets.push({
+        label:'CW '+swDef.label, data:cwArr,
+        borderColor:swDef.border, backgroundColor:swDef.bg, borderWidth:swDef.bw,
+        pointRadius:0, fill:'-1', spanGaps:true, tension:0.3, order:ord,
+      });
+    }
+  } else {
+    // === Single window: solid primary + dashed secondary ===
+    datasets.push({
+      label:'Put Wall ('+pwLabel+')',
+      data:allPW,
+      borderColor:'rgba(0,220,130,0.9)',
+      backgroundColor:'rgba(0,220,130,0.04)',
+      borderWidth:2, pointRadius:0, fill:false,
+      spanGaps:true, tension:0.3, order:2,
+    });
+    datasets.push({
+      label:'Call Wall ('+pwLabel+')',
+      data:allCW,
+      borderColor:'rgba(255,64,96,0.9)',
+      backgroundColor:'rgba(255,64,96,0.04)',
+      borderWidth:2, pointRadius:0, fill:'-1',
+      spanGaps:true, tension:0.3, order:2,
+    });
+  }
 
   // --- Forward projected walls (dashed) ---
   if(fwdPoints.length > 0){
     datasets.push({
-      label:'Projected PW',
-      data:fwdPWArr,
-      borderColor:'rgba(0,220,130,0.6)',
-      backgroundColor:'rgba(0,220,130,0.03)',
-      borderWidth:2,
-      borderDash:[6,4],
-      pointRadius:0,
-      fill:false,
-      spanGaps:true,
-      tension:0.3,
-      order:2,
+      label:'Projected PW', data:fwdPWArr,
+      borderColor:'rgba(0,220,130,0.6)', backgroundColor:'rgba(0,220,130,0.03)',
+      borderWidth:2, borderDash:[6,4], pointRadius:0, fill:false,
+      spanGaps:true, tension:0.3, order:2,
     });
     datasets.push({
-      label:'Projected CW',
-      data:fwdCWArr,
-      borderColor:'rgba(255,64,96,0.6)',
-      backgroundColor:'rgba(255,64,96,0.03)',
-      borderWidth:2,
-      borderDash:[6,4],
-      pointRadius:0,
-      fill:'-1',
-      spanGaps:true,
-      tension:0.3,
-      order:2,
+      label:'Projected CW', data:fwdCWArr,
+      borderColor:'rgba(255,64,96,0.6)', backgroundColor:'rgba(255,64,96,0.03)',
+      borderWidth:2, borderDash:[6,4], pointRadius:0, fill:'-1',
+      spanGaps:true, tension:0.3, order:2,
     });
-
-    // Forward window markers (dots at each DTE window point)
     datasets.push({
       label:'Fwd PW',
       data:fwdPWArr.map((v,i) => i > dividerIdx ? v : null),
-      borderColor:'transparent',
-      backgroundColor:'rgba(0,220,130,0.8)',
-      pointRadius:4,
-      pointStyle:'circle',
-      showLine:false,
-      fill:false,
-      spanGaps:false,
-      order:0,
+      borderColor:'transparent', backgroundColor:'rgba(0,220,130,0.8)',
+      pointRadius:4, pointStyle:'circle', showLine:false, fill:false, spanGaps:false, order:0,
     });
     datasets.push({
       label:'Fwd CW',
       data:fwdCWArr.map((v,i) => i > dividerIdx ? v : null),
-      borderColor:'transparent',
-      backgroundColor:'rgba(255,64,96,0.8)',
-      pointRadius:4,
-      pointStyle:'circle',
-      showLine:false,
-      fill:false,
-      spanGaps:false,
-      order:0,
+      borderColor:'transparent', backgroundColor:'rgba(255,64,96,0.8)',
+      pointRadius:4, pointStyle:'circle', showLine:false, fill:false, spanGaps:false, order:0,
     });
   }
 
-  // --- Secondary window walls (thin dashed, historical only) ---
+  if(!isAll){
+    // --- Secondary window walls (thin dashed, historical only) ---
+    datasets.push({
+      label:'PW ('+swLabel+')', data:allPWSec,
+      borderColor:'rgba(0,220,130,0.25)', borderWidth:1, borderDash:[4,4],
+      pointRadius:0, fill:false, spanGaps:true, tension:0.3, order:3,
+    });
+    datasets.push({
+      label:'CW ('+swLabel+')', data:allCWSec,
+      borderColor:'rgba(255,64,96,0.25)', borderWidth:1, borderDash:[4,4],
+      pointRadius:0, fill:false, spanGaps:true, tension:0.3, order:3,
+    });
+    // --- Gamma flip ---
+    datasets.push({
+      label:'γ Flip ('+pwLabel+')', data:allGF,
+      borderColor:'rgba(255,176,32,0.4)', borderWidth:1.5, borderDash:[3,3],
+      pointRadius:0, fill:false, spanGaps:true, tension:0.3, order:3,
+    });
+  }
+
+  // --- Spot (white, prominent, always on top) ---
   datasets.push({
-    label:'PW ('+swLabel+')',
-    data:allPWSec,
-    borderColor:'rgba(0,220,130,0.25)',
-    borderWidth:1,
-    borderDash:[4,4],
-    pointRadius:0,
-    fill:false,
-    spanGaps:true,
-    tension:0.3,
-    order:3,
-  });
-  datasets.push({
-    label:'CW ('+swLabel+')',
-    data:allCWSec,
-    borderColor:'rgba(255,64,96,0.25)',
-    borderWidth:1,
-    borderDash:[4,4],
-    pointRadius:0,
-    fill:false,
-    spanGaps:true,
-    tension:0.3,
-    order:3,
+    label:'Spot', data:allSpot,
+    borderColor:'rgba(255,255,255,0.95)', borderWidth:2.5,
+    pointRadius:2, pointBackgroundColor:'rgba(255,255,255,0.95)',
+    fill:false, spanGaps:true, tension:0.3, order:0,
   });
 
-  // --- Gamma flip (selected window, historical only) ---
-  datasets.push({
-    label:'γ Flip ('+pwLabel+')',
-    data:allGF,
-    borderColor:'rgba(255,176,32,0.4)',borderWidth:1.5,borderDash:[3,3],
-    pointRadius:0,fill:false,spanGaps:true,tension:0.3,order:3,
-  });
-
-  // --- Spot (historical only, white, prominent) ---
-  datasets.push({
-    label:'Spot',
-    data:allSpot,
-    borderColor:'rgba(255,255,255,0.95)',borderWidth:2.5,
-    pointRadius:2,pointBackgroundColor:'rgba(255,255,255,0.95)',
-    fill:false,spanGaps:true,tension:0.3,order:1,
-  });
-
-  // --- Venue agreement markers on selected window historical ---
+  // --- Venue agreement markers ---
   function hasVenueAgree(d){
     if(isAll) return allKeys.some(k => data[d]?.windows?.[k]?.venue_agree);
     return data[d]?.windows?.[pw]?.venue_agree;
@@ -2442,17 +2430,17 @@ function renderStructure(data, outlook){
   if(hasAgree){
     datasets.push({
       label:'Venue agree',
-      data:dates.map((d,i) => hasVenueAgree(d) ? histCW[i] : null).concat(new Array(fwdPoints.length).fill(null)),
-      borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
-      pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
-      showLine:false,fill:false,spanGaps:false,order:0,
+      data:dates.map((d,i) => hasVenueAgree(d) ? histCW[i] : null).concat(fwdPad),
+      borderColor:'transparent', backgroundColor:'rgba(0,220,130,0.9)',
+      pointRadius:4, pointStyle:'rectRot', pointBorderColor:'rgba(0,220,130,1)', pointBorderWidth:1,
+      showLine:false, fill:false, spanGaps:false, order:0,
     });
     datasets.push({
       label:'Venue agree',
-      data:dates.map((d,i) => hasVenueAgree(d) ? histPW[i] : null).concat(new Array(fwdPoints.length).fill(null)),
-      borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
-      pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
-      showLine:false,fill:false,spanGaps:false,order:0,
+      data:dates.map((d,i) => hasVenueAgree(d) ? histPW[i] : null).concat(fwdPad),
+      borderColor:'transparent', backgroundColor:'rgba(0,220,130,0.9)',
+      pointRadius:4, pointStyle:'rectRot', pointBorderColor:'rgba(0,220,130,1)', pointBorderWidth:1,
+      showLine:false, fill:false, spanGaps:false, order:0,
     });
   }
 
@@ -2490,12 +2478,22 @@ function renderStructure(data, outlook){
                 const d = data[date];
                 lines.push('Spot: '+fB(d.spot));
                 if(isAll){
-                  const cwVals=allKeys.map(k=>d.windows?.[k]?.call_wall).filter(v=>v);
-                  const pwVals=allKeys.map(k=>d.windows?.[k]?.put_wall).filter(v=>v);
-                  if(cwVals.length&&pwVals.length){
-                    const cw=Math.max(...cwVals), pwv=Math.min(...pwVals);
-                    lines.push('ALL: '+fB(pwv)+' — '+fB(cw));
-                    lines.push('Range: '+Math.round((cw-pwv)/1000)+'K');
+                  for(const key of allKeys){
+                    const w=d.windows?.[key];
+                    if(w&&w.put_wall&&w.call_wall){
+                      const range=Math.round((w.call_wall-w.put_wall)/1000);
+                      lines.push(key+'d: '+fB(w.put_wall)+' — '+fB(w.call_wall)+' ('+range+'K)');
+                    }
+                  }
+                  const allCWs=allKeys.map(k=>d.windows?.[k]?.call_wall).filter(v=>v);
+                  const allPWs=allKeys.map(k=>d.windows?.[k]?.put_wall).filter(v=>v);
+                  if(allCWs.length>=3){
+                    const cwSpread=(Math.max(...allCWs)-Math.min(...allCWs))/d.spot*100;
+                    if(cwSpread<3) lines.push('⚡ CW convergence ('+cwSpread.toFixed(1)+'% spread)');
+                  }
+                  if(allPWs.length>=3){
+                    const pwSpread=(Math.max(...allPWs)-Math.min(...allPWs))/d.spot*100;
+                    if(pwSpread<3) lines.push('⚡ PW convergence ('+pwSpread.toFixed(1)+'% spread)');
                   }
                 } else {
                   const s = d.windows?.[pw];
@@ -2546,15 +2544,23 @@ function renderStructure(data, outlook){
 
   // Dynamic legend
   const L = (swatch, txt) => `<span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4">${swatch}${txt}</span>`;
-  const legendItems = [
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>', 'PW '+pwLabel),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>', 'CW '+pwLabel),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(0,220,130,0.6)"></span>', 'Projected PW'),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(255,64,96,0.6)"></span>', 'Projected CW'),
-  ];
-  if(sw){
-    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>', 'PW '+swLabel));
-    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>', 'CW '+swLabel));
+  const legendItems = [];
+  if(isAll){
+    for(const swDef of [...STRUCT_WINDOWS].reverse()){
+      legendItems.push(L(
+        `<span style="display:inline-block;width:12px;height:4px;background:${swDef.bg.replace(/[\d.]+\)$/,'0.4)')};border:1px solid ${swDef.border};border-radius:1px"></span>`,
+        swDef.label
+      ));
+    }
+  } else {
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>', 'PW '+pwLabel));
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>', 'CW '+pwLabel));
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(0,220,130,0.6)"></span>', 'Projected PW'));
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(255,64,96,0.6)"></span>', 'Projected CW'));
+    if(sw){
+      legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>', 'PW '+swLabel));
+      legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>', 'CW '+swLabel));
+    }
   }
   legendItems.push(L('<span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>', 'Spot'));
   if(!isAll) legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.4)"></span>', '&gamma; Flip'));
