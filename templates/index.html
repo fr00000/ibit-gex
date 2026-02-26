@@ -376,7 +376,8 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="cell cell-gex">
     <div class="cell-label">
       <span class="cell-tab active" data-view="gex" onclick="setGexView('gex')" style="margin-right:8px">GEX Profile</span>
-      <span class="cell-tab" data-view="oi" onclick="setGexView('oi')">Open Interest</span>
+      <span class="cell-tab" data-view="oi" onclick="setGexView('oi')" style="margin-right:8px">Open Interest</span>
+      <span class="cell-tab" data-view="oi-skew" onclick="setGexView('oi-skew')">OI Skew</span>
       <span style="margin-left:auto;display:flex;gap:2px;align-items:center">
         <select id="expiry-filter" onchange="setExpiryFilter(this.value)" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 4px;border-radius:2px;border:1px solid var(--border2);background:var(--bg);color:var(--t2);cursor:pointer;outline:none">
           <option value="all">ALL EXP</option>
@@ -388,6 +389,12 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     </div>
     <canvas id="gex-chart"></canvas>
     <canvas id="oi-chart" style="display:none"></canvas>
+    <canvas id="oi-skew-chart" style="display:none"></canvas>
+    <div id="oi-skew-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#00dc82cc"></span>Call OI</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#ff4060cc"></span>Put OI</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,255,255,0.5)"></span>Spot</span>
+    </div>
   </div>
   <div class="cell cell-delta">
     <div class="cell-label">Dealer Delta Profile</div>
@@ -395,21 +402,14 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   </div>
   <div class="cell cell-structure">
     <div class="cell-label">
-      <span class="cell-tab active" data-view="oi-skew" onclick="setStructView('oi-skew')" style="margin-right:8px">OI Skew</span>
+      <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Wall Migration</span>
       <span class="cell-tab" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
-      <span class="cell-tab" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Walls</span>
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
     </div>
-    <canvas id="oi-skew-chart"></canvas>
     <canvas id="range-cone-chart" style="display:none"></canvas>
-    <canvas id="structure-chart" style="display:none"></canvas>
+    <canvas id="structure-chart"></canvas>
     <canvas id="heatmap-chart" style="display:none"></canvas>
-    <div id="oi-skew-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#00dc82cc"></span>Call OI</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:#ff4060cc"></span>Put OI</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,255,255,0.5)"></span>Spot</span>
-    </div>
     <div id="range-cone-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(168,139,250,0.3)"></span>EM</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:10px;height:3px;background:rgba(0,220,130,0.5)"></span>+GEX</span>
@@ -418,16 +418,15 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:rgba(255,176,32,0.7)"></span>&gamma; Flip</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,255,255,0.5)"></span>Spot</span>
     </div>
-    <div id="struct-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.8)"></span>0-3d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,180,220,0.8)"></span>4-7d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(56,144,255,0.8)"></span>8-14d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,176,32,0.8)"></span>15-30d</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(168,139,250,0.8)"></span>31-45d</span>
-      <span style="display:flex;align-items:center;gap:3px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:0;border-top:2px solid #8892a4"></span>CW</span>
-      <span style="display:flex;align-items:center;gap:3px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:6px;height:0;border-top:2px dashed #8892a4"></span>PW</span>
+    <div id="struct-legend" style="display:flex;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>PW 31-45d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>CW 31-45d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(0,220,130,0.6)"></span>Projected PW</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(255,64,96,0.6)"></span>Projected CW</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>PW 0-3d</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>CW 0-3d</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>Spot</span>
-      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.5)"></span>&gamma; Flip</span>
+      <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.4)"></span>&gamma; Flip</span>
       <span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4"><span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>Venue agree</span>
     </div>
     <div id="heat-legend" style="display:none;gap:6px;padding:2px 0 0;align-items:center;justify-content:center;flex-wrap:wrap;flex-shrink:0">
@@ -481,8 +480,11 @@ function setGexView(view){
   document.querySelectorAll('.cell-gex .cell-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
   document.getElementById('gex-chart').style.display=view==='gex'?'':'none';
   document.getElementById('oi-chart').style.display=view==='oi'?'':'none';
+  document.getElementById('oi-skew-chart').style.display=view==='oi-skew'?'':'none';
+  document.getElementById('oi-skew-legend').style.display=view==='oi-skew'?'flex':'none';
   if(view==='oi'&&window._lastData){try{renderOI(window._lastData)}catch(e){console.warn('OI:',e)}}
   if(view==='gex'&&window._lastData){try{renderGEX(window._lastData)}catch(e){console.warn('GEX:',e)}}
+  if(view==='oi-skew') renderOiSkew();
 }
 
 function setSource(val){
@@ -1437,7 +1439,7 @@ async function loadData(){
       if(seq===_loadSeq&&Array.isArray(flows))renderFlowChart(flows);
     }catch(e){console.warn('Flows:',e)}
     try{renderSidebar(data)}catch(e){console.warn('Sidebar:',e)}
-    if(structView==='oi-skew') renderOiSkew();
+    if(gexView==='oi-skew') renderOiSkew();
 
     if(isExpiryMode){
       // --- EXPIRY MODE ---
@@ -1456,8 +1458,8 @@ async function loadData(){
           t.style.pointerEvents='none';
         }
       });
-      if(['range','walls','heatmap-oi','heatmap-gex'].includes(structView)){
-        setStructView('oi-skew');
+      if(['range','heatmap-oi','heatmap-gex'].includes(structView)){
+        setStructView('walls');
       }
 
       // Skip AI analysis panel (API cost per run)
@@ -1773,26 +1775,22 @@ const STRUCT_WINDOWS=[
   {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
 ];
 
-let structView='oi-skew';
+let structView='walls';
 let heatmapData=null;
 function setStructView(view){
   structView=view;
   document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>t.classList.toggle('active',t.dataset.view===view));
-  const isOiSkew=view==='oi-skew';
-  const isRange=view==='range';
   const isWalls=view==='walls';
-  const isHeat=!isOiSkew&&!isRange&&!isWalls;
-  document.getElementById('oi-skew-chart').style.display=isOiSkew?'':'none';
-  document.getElementById('range-cone-chart').style.display=isRange?'':'none';
+  const isRange=view==='range';
+  const isHeat=!isWalls&&!isRange;
   document.getElementById('structure-chart').style.display=isWalls?'':'none';
+  document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
-  document.getElementById('oi-skew-legend').style.display=isOiSkew?'flex':'none';
-  document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
+  document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
   document.getElementById('heat-legend-gex').style.display=view==='heatmap-gex'?'flex':'none';
-  if(isOiSkew) renderOiSkew();
   if(isRange) loadRangeCone();
   if(isHeat) loadHeatmap();
 }
@@ -1955,11 +1953,15 @@ function renderHeatmap(){
 
 async function loadStructure(){
   try{
-    const r=await fetch(`/api/structure?ticker=${currentTicker}&days=30`);
-    const d=await r.json();
-    renderStructure(d);
+    const [structRes, outlookRes] = await Promise.all([
+      fetch(`/api/structure?ticker=${currentTicker}&days=30`),
+      fetch(`/api/outlook?ticker=${currentTicker}`)
+    ]);
+    const structData = await structRes.json();
+    const outlookData = await outlookRes.json();
+    renderStructure(structData, outlookData);
   }catch(e){console.warn('Structure:',e)}
-  heatmapData=null; // invalidate cache on refresh
+  heatmapData=null;
 }
 
 async function loadRangeCone(){
@@ -2172,72 +2174,226 @@ function renderRangeCone(data){
   }
 }
 
-function renderStructure(data){
+function renderStructure(data, outlook){
   const dates=Object.keys(data).sort();
   if(!dates.length)return;
-  const labels=dates.map(d=>d.slice(5));
-  const datasets=[];
 
-  // Call walls: solid lines, put walls: dashed lines — same color per window
-  for(const w of STRUCT_WINDOWS){
-    // Call wall — solid line
+  // === Build unified time axis: historical dates + forward dates ===
+  const today = new Date();
+  today.setHours(0,0,0,0);
+
+  // Historical data points (from /api/structure)
+  const histLabels = dates.map(d => d.slice(5));
+  const histPW = dates.map(d => data[d]?.windows?.['31-45']?.put_wall || null);
+  const histCW = dates.map(d => data[d]?.windows?.['31-45']?.call_wall || null);
+  const histSpot = dates.map(d => data[d]?.spot || null);
+  const histGF = dates.map(d => data[d]?.windows?.['0-3']?.gamma_flip || null);
+  const histPW03 = dates.map(d => data[d]?.windows?.['0-3']?.put_wall || null);
+  const histCW03 = dates.map(d => data[d]?.windows?.['0-3']?.call_wall || null);
+
+  // Forward projection points (from /api/outlook)
+  const fwdPoints = [];
+  if(outlook && outlook.windows){
+    const dteOffsets = {'0-3d':1, '4-7d':5, '8-14d':11, '15-30d':22, '31-45d':38};
+    for(const w of outlook.windows){
+      const offset = dteOffsets[w.label] || 0;
+      if(offset <= 1) continue;
+      if(w.call_wall && w.put_wall){
+        const fDate = new Date(today);
+        fDate.setDate(fDate.getDate() + offset);
+        fwdPoints.push({
+          label: fDate.toISOString().slice(5,10),
+          dayOffset: offset,
+          cw: w.call_wall,
+          pw: w.put_wall,
+          dte_label: w.label,
+          regime: w.regime,
+          venue_agree: w.venue_agree,
+        });
+      }
+    }
+    fwdPoints.sort((a,b) => a.dayOffset - b.dayOffset);
+  }
+
+  // Build combined labels and data arrays
+  const allLabels = [...histLabels];
+  const allPW = [...histPW];
+  const allCW = [...histCW];
+  const allSpot = [...histSpot];
+  const allGF = [...histGF];
+  const allPW03 = [...histPW03];
+  const allCW03 = [...histCW03];
+
+  // Forward arrays: null for historical portion, values for forward portion
+  const fwdPWArr = new Array(dates.length).fill(null);
+  const fwdCWArr = new Array(dates.length).fill(null);
+  const fwdRegimes = [];
+
+  // Bridge: connect last historical 31-45d wall to forward projection
+  if(fwdPoints.length > 0){
+    const lastHistPW = histPW[histPW.length-1];
+    const lastHistCW = histCW[histCW.length-1];
+    fwdPWArr[fwdPWArr.length-1] = lastHistPW;
+    fwdCWArr[fwdCWArr.length-1] = lastHistCW;
+
+    for(const fp of fwdPoints){
+      allLabels.push(fp.label);
+      allPW.push(null);
+      allCW.push(null);
+      allSpot.push(null);
+      allGF.push(null);
+      allPW03.push(null);
+      allCW03.push(null);
+      fwdPWArr.push(fp.pw);
+      fwdCWArr.push(fp.cw);
+      fwdRegimes.push(fp);
+    }
+  }
+
+  const dividerIdx = dates.length - 1;
+  const datasets = [];
+
+  // --- Historical 31-45d walls (solid) ---
+  datasets.push({
+    label:'Put Wall (31-45d)',
+    data:allPW,
+    borderColor:'rgba(0,220,130,0.9)',
+    backgroundColor:'rgba(0,220,130,0.04)',
+    borderWidth:2,
+    pointRadius:0,
+    fill:false,
+    spanGaps:true,
+    tension:0.3,
+    order:2,
+  });
+  datasets.push({
+    label:'Call Wall (31-45d)',
+    data:allCW,
+    borderColor:'rgba(255,64,96,0.9)',
+    backgroundColor:'rgba(255,64,96,0.04)',
+    borderWidth:2,
+    pointRadius:0,
+    fill:'-1',
+    spanGaps:true,
+    tension:0.3,
+    order:2,
+  });
+
+  // --- Forward projected walls (dashed) ---
+  if(fwdPoints.length > 0){
     datasets.push({
-      label:w.label+' CW',
-      data:dates.map(d=>data[d]?.windows?.[w.key]?.call_wall||null),
-      borderColor:w.border.replace(/[\d.]+\)$/,'0.8)'),
-      borderWidth:w.bw+0.5,
+      label:'Projected PW',
+      data:fwdPWArr,
+      borderColor:'rgba(0,220,130,0.6)',
+      backgroundColor:'rgba(0,220,130,0.03)',
+      borderWidth:2,
+      borderDash:[6,4],
       pointRadius:0,
       fill:false,
       spanGaps:true,
-      tension:0.2,
+      tension:0.3,
+      order:2,
     });
-    // Put wall — dashed line, same color
     datasets.push({
-      label:w.label+' PW',
-      data:dates.map(d=>data[d]?.windows?.[w.key]?.put_wall||null),
-      borderColor:w.border.replace(/[\d.]+\)$/,'0.8)'),
-      borderWidth:w.bw+0.5,
-      borderDash:[6,3],
+      label:'Projected CW',
+      data:fwdCWArr,
+      borderColor:'rgba(255,64,96,0.6)',
+      backgroundColor:'rgba(255,64,96,0.03)',
+      borderWidth:2,
+      borderDash:[6,4],
       pointRadius:0,
-      fill:false,
+      fill:'-1',
       spanGaps:true,
-      tension:0.2,
+      tension:0.3,
+      order:2,
+    });
+
+    // Forward window markers (dots at each DTE window point)
+    datasets.push({
+      label:'Fwd PW',
+      data:fwdPWArr.map((v,i) => i > dividerIdx ? v : null),
+      borderColor:'transparent',
+      backgroundColor:'rgba(0,220,130,0.8)',
+      pointRadius:4,
+      pointStyle:'circle',
+      showLine:false,
+      fill:false,
+      spanGaps:false,
+      order:0,
+    });
+    datasets.push({
+      label:'Fwd CW',
+      data:fwdCWArr.map((v,i) => i > dividerIdx ? v : null),
+      borderColor:'transparent',
+      backgroundColor:'rgba(255,64,96,0.8)',
+      pointRadius:4,
+      pointStyle:'circle',
+      showLine:false,
+      fill:false,
+      spanGaps:false,
+      order:0,
     });
   }
 
-  // Gamma flip (0-3d) — dashed yellow, thinner
+  // --- 0-3d tactical walls (thin dashed, historical only) ---
   datasets.push({
-    label:'γ Flip',
-    data:dates.map(d=>data[d]?.windows?.['0-3']?.gamma_flip||null),
-    borderColor:'rgba(255,176,32,0.5)',borderWidth:1.5,borderDash:[3,3],
-    pointRadius:0,fill:false,spanGaps:true,tension:0.2,
+    label:'PW (0-3d)',
+    data:allPW03,
+    borderColor:'rgba(0,220,130,0.25)',
+    borderWidth:1,
+    borderDash:[4,4],
+    pointRadius:0,
+    fill:false,
+    spanGaps:true,
+    tension:0.3,
+    order:3,
+  });
+  datasets.push({
+    label:'CW (0-3d)',
+    data:allCW03,
+    borderColor:'rgba(255,64,96,0.25)',
+    borderWidth:1,
+    borderDash:[4,4],
+    pointRadius:0,
+    fill:false,
+    spanGaps:true,
+    tension:0.3,
+    order:3,
   });
 
-  // Spot — solid white, prominent
+  // --- Gamma flip (0-3d, historical only) ---
+  datasets.push({
+    label:'γ Flip (0-3d)',
+    data:allGF,
+    borderColor:'rgba(255,176,32,0.4)',borderWidth:1.5,borderDash:[3,3],
+    pointRadius:0,fill:false,spanGaps:true,tension:0.3,order:3,
+  });
+
+  // --- Spot (historical only, white, prominent) ---
   datasets.push({
     label:'Spot',
-    data:dates.map(d=>data[d]?.spot||null),
+    data:allSpot,
     borderColor:'rgba(255,255,255,0.95)',borderWidth:2.5,
     pointRadius:2,pointBackgroundColor:'rgba(255,255,255,0.95)',
-    fill:false,spanGaps:true,tension:0.2,
+    fill:false,spanGaps:true,tension:0.3,order:1,
   });
 
-  // Venue agreement markers
-  const hasAgree=dates.some(d=>data[d]?.windows?.['0-3']?.venue_agree);
+  // --- Venue agreement markers on 31-45d historical ---
+  const hasAgree = dates.some(d => data[d]?.windows?.['31-45']?.venue_agree);
   if(hasAgree){
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d=>{const w=data[d]?.windows?.['0-3'];return(w&&w.venue_agree)?w.call_wall:null}),
+      data:dates.map(d => {const w=data[d]?.windows?.['31-45']; return (w&&w.venue_agree)?w.call_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
-      showLine:false,fill:false,spanGaps:false,
+      showLine:false,fill:false,spanGaps:false,order:0,
     });
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d=>{const w=data[d]?.windows?.['0-3'];return(w&&w.venue_agree)?w.put_wall:null}),
+      data:dates.map(d => {const w=data[d]?.windows?.['31-45']; return (w&&w.venue_agree)?w.put_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
-      showLine:false,fill:false,spanGaps:false,
+      showLine:false,fill:false,spanGaps:false,order:0,
     });
   }
 
@@ -2245,12 +2401,18 @@ function renderStructure(data){
   if(structureChart){structureChart.destroy()}
   structureChart=new Chart(ctx,{
     type:'line',
-    data:{labels,datasets},
+    data:{labels:allLabels, datasets},
     options:{
       responsive:true,maintainAspectRatio:false,animation:false,
       interaction:{mode:'index',intersect:false},
       scales:{
-        x:{grid:{color:'rgba(28,34,48,0.5)'},ticks:{color:'#4a5568',font:{size:8},maxRotation:0,autoSkip:true,maxTicksLimit:7}},
+        x:{
+          grid:{
+            color: (ctx) => ctx.index === dividerIdx ? 'rgba(255,255,255,0.3)' : 'rgba(28,34,48,0.5)',
+            lineWidth: (ctx) => ctx.index === dividerIdx ? 2 : 1,
+          },
+          ticks:{color:'#4a5568',font:{size:8},maxRotation:0,autoSkip:true,maxTicksLimit:10}
+        },
         y:{grace:'5%',grid:{color:'rgba(28,34,48,0.5)'},ticks:{color:'#4a5568',font:{size:9},callback:v=>'$'+(v/1000).toFixed(0)+'K'}}
       },
       plugins:{
@@ -2261,27 +2423,62 @@ function renderStructure(data){
           filter:()=>false,
           callbacks:{
             afterBody:function(items){
-              const date=dates[items[0]?.dataIndex];
-              if(!date||!data[date])return'';
-              const d=data[date];const lines=[];
-              const fB=v=>'$'+Math.round(v).toLocaleString();
-              lines.push('Spot: '+fB(d.spot));
-              for(const w of STRUCT_WINDOWS){
-                const win=d.windows?.[w.key];if(!win)continue;
-                let l=w.key.padEnd(6)+fB(win.put_wall)+' — '+fB(win.call_wall);
-                l+=win.regime==='negative_gamma'?' (neg γ)':' (pos γ)';
-                if(win.venue_agree)l+=' ✓';
-                lines.push(l);
+              const idx = items[0]?.dataIndex;
+              if(idx == null) return '';
+              const fB = v => '$'+Math.round(v).toLocaleString();
+              const lines = [];
+
+              if(idx <= dividerIdx){
+                const date = dates[idx];
+                if(!date || !data[date]) return '';
+                const d = data[date];
+                lines.push('Spot: '+fB(d.spot));
+                const s = d.windows?.['31-45'];
+                if(s){
+                  lines.push('31-45d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
+                  lines.push('Range: '+Math.round((s.call_wall-s.put_wall)/1000)+'K');
+                  lines.push(s.regime==='negative_gamma'?'neg γ':'pos γ');
+                  if(s.venue_agree) lines.push('✓ Venues agree');
+                }
+                const t = d.windows?.['0-3'];
+                if(t) lines.push('0-3d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
+              } else {
+                const fpIdx = idx - dividerIdx - 1;
+                const fp = fwdRegimes[fpIdx];
+                if(fp){
+                  lines.push('PROJECTED ('+fp.dte_label+')');
+                  lines.push('CW: '+fB(fp.cw)+'  PW: '+fB(fp.pw));
+                  lines.push('Range: '+Math.round((fp.cw-fp.pw)/1000)+'K');
+                  lines.push(fp.regime==='negative_gamma'?'neg γ':'pos γ');
+                  if(fp.venue_agree) lines.push('✓ Venues agree');
+                }
               }
-              const gf=d.windows?.['0-3']?.gamma_flip;
-              if(gf)lines.push('γ flip: '+fB(gf));
               return lines.join('\n');
             },
             label:()=>null,
           }
         }
       }
-    }
+    },
+    plugins:[{
+      id:'nowDivider',
+      afterDraw(chart){
+        const meta = chart.getDatasetMeta(0);
+        if(!meta.data[dividerIdx]) return;
+        const x = meta.data[dividerIdx].x;
+        const c = chart.ctx;
+        c.save();
+        c.font = '600 8px "IBM Plex Mono", monospace';
+        c.fillStyle = 'rgba(255,255,255,0.5)';
+        c.textAlign = 'center';
+        c.fillText('NOW', x, chart.chartArea.top + 10);
+
+        const {top, bottom, right} = chart.chartArea;
+        c.fillStyle = 'rgba(255,255,255,0.015)';
+        c.fillRect(x, top, right - x, bottom - top);
+        c.restore();
+      }
+    }]
   });
 }
 
