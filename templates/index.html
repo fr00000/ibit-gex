@@ -2282,12 +2282,20 @@ function renderStructure(data, outlook){
   const fwdCWArr = new Array(dates.length).fill(null);
   const fwdRegimes = [];
 
-  // Bridge: connect last historical wall to forward projection
+  // Bridge: connect historical walls to forward projection
+  // In ALL mode, bridge from 0-3d band (same positioning timeline as forward windows)
   if(fwdPoints.length > 0){
-    const lastHistPW = histPW[histPW.length-1];
-    const lastHistCW = histCW[histCW.length-1];
-    fwdPWArr[fwdPWArr.length-1] = lastHistPW;
-    fwdCWArr[fwdCWArr.length-1] = lastHistCW;
+    let bridgePW = histPW[histPW.length-1];
+    let bridgeCW = histCW[histCW.length-1];
+    if(isAll && outlook && outlook.windows){
+      const w03 = outlook.windows.find(w => w.label === '0-3d');
+      if(w03){
+        if(w03.put_wall) bridgePW = w03.put_wall;
+        if(w03.call_wall) bridgeCW = w03.call_wall;
+      }
+    }
+    fwdPWArr[fwdPWArr.length-1] = bridgePW;
+    fwdCWArr[fwdCWArr.length-1] = bridgeCW;
 
     for(const fp of fwdPoints){
       allLabels.push(fp.label);
