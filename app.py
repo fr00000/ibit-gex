@@ -5689,6 +5689,21 @@ def build_analysis_data(ticker='IBIT'):
             'data_freshness': d.get('data_freshness'),
         }
 
+        # IV term structure for this DTE window
+        iv_ts = d.get('iv_term_structure', [])
+        if iv_ts:
+            summaries[key]['iv_term_structure'] = [
+                {
+                    'expiry': e['expiry'],
+                    'dte': e['dte'],
+                    'atm_iv': e['atm_iv'],
+                    'call_iv': e.get('call_iv'),
+                    'put_iv': e.get('put_iv'),
+                    'source': e.get('source', 'ibit'),
+                }
+                for e in sorted(iv_ts, key=lambda x: x.get('dte', 0))
+            ]
+
         # Per-venue breakdown for divergence analysis
         if deribit_avail:
             summaries[key]['venue_breakdown'] = {
@@ -5883,6 +5898,19 @@ data_freshness shows how stale each venue's data is. IBIT options data updates o
 
 venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
+IV TERM STRUCTURE (when present):
+iv_term_structure shows ATM implied volatility for each expiry within the DTE window, from both IBIT and Deribit sources. Entries are sorted by DTE (shortest first).
+
+Use this to assess:
+- FEAR GAUGE: If the nearest expiry's ATM IV is significantly higher than longer-dated expiries within the same window, there's elevated near-term hedging demand. This often coincides with put buying and precedes volatile moves.
+- CROSS-VENUE IV: When both IBIT and Deribit have entries for similar expiries, compare them. Deribit IV typically leads — crypto-native traders reprice risk faster than ETF market makers. If Deribit IV is significantly higher than IBIT IV for the same expiry, the options market is pricing risk that hasn't fully filtered into the ETF yet.
+- VOL REGIME CONTEXT: High ATM IV (>60%) means the market expects large moves — GEX walls may be tested. Low ATM IV (<30%) means the market is complacent — a vol spike could trigger vanna-driven rebalancing.
+- SKEW: When call_iv and put_iv are both present, compare them. Put IV > call IV = downside fear premium (normal). Call IV > put IV = upside demand (unusual, often precedes squeezes).
+
+When discussing vanna scenarios, reference the IV level directly: "ATM IV at 65% — a 5-point vol crush would trigger $X of vanna buying" is more precise than discussing vanna in a vacuum.
+
+Do NOT compare IV term structure across different DTE windows mechanically (0-3d IV vs 31-45d IV) — each window captures different expiries. The macro signal iv_term_structure already handles the cross-term comparison.
+
 DETECTED PATTERNS (when present):
 detected_patterns contains rule-based pre-screened structural patterns with concrete thresholds. These are NOT predictions — they're mechanical conditions that are currently true. Use them as starting points for your analysis:
 - gamma_squeeze_setup: Spot near flip point + negative gamma + call-heavy flow. Confirm or reject based on dealer delta and volume.
@@ -5977,11 +6005,31 @@ Score interpretation:
 - Score -50 to +50 (NEUTRAL): No macro edge.
 - |Score| > 75 (HIGH CONVICTION): Strong directional signal. Note structural_entry and invalidation levels.
 
-Key combinations:
-- regime_persistence + funding_rate agree -> strongest signal
-- wall_migration disagrees with regime_persistence -> flag conflict
-- aggregate_oi flush + negative funding -> textbook capitulation
-- aggregate_oi at peak + positive funding -> textbook crowded top
+The macro regime has 11 component signals. The original 8:
+- regime_persistence: How long the current gamma regime has held. Persistent regimes mean mechanical flows are entrenched.
+- wall_migration: Structural wall drift over time. Rising put walls = floor lifting. Falling call walls = ceiling compressing.
+- range_compression: How tight the current call-wall-to-put-wall range is vs history, combined with spot position within that range and gamma regime. A compressed range near a wall in negative gamma is a breakout setup.
+- etf_flow_momentum: ETF fund flow reversals and acceleration. Flow reversals (outflow turning to inflow) are the strongest signal.
+- venue_convergence: Whether IBIT and Deribit agree on wall locations. Agreement = high conviction levels.
+- funding_rate: Aggregate perpetual funding. Deeply negative + reverting = capitulation. Deeply positive + still rising = crowded.
+- aggregate_oi: Futures OI flush vs peak. Flushed + stabilizing = reset. Near peak + positive funding = crowded top.
+- liquidation: Liquidation intensity and dominant side. Long capitulation with price stabilizing = bottom. Short squeeze exhaustion = top.
+
+Three new signals:
+- pcr_direction: Put/call ratio trend. Surging PCR = fear building = contrarian bullish (more puts being bought relative to calls). Plunging PCR = greed = contrarian bearish.
+- wall_breach: Whether spot is currently through a GEX wall. This is the most mechanically significant event — spot above call wall in negative gamma means dealer hedging ACCELERATES the move (breakout). Spot below put wall in positive gamma means dealers are buying (support). The regime determines whether a breach amplifies or dampens.
+- iv_term_structure: IV curve shape. Backwardation (short-dated IV > long-dated IV) = near-term fear/hedging demand = contrarian bullish. Steep contango = complacency. Normal mild contango scores 0.
+
+Key combinations (strongest to weakest):
+- wall_breach + negative gamma + backwardation = cascading move in progress (highest urgency)
+- wall_breach + positive gamma = likely pinning/reversion (dealers fighting the move)
+- regime_persistence + funding_rate agree = strongest trending signal
+- aggregate_oi flush + negative funding + long liquidation = textbook capitulation
+- aggregate_oi at peak + positive funding + short squeeze exhaustion = textbook crowded top
+- wall_migration disagrees with regime_persistence = flag conflict, regime may be transitioning
+- pcr_direction confirms funding_rate = flow sentiment alignment (both showing fear or greed)
+- iv_term_backwardation + range_compression = maximum stress, breakout imminent
+- venue_convergence + wall_breach at converged level = highest conviction directional move
 
 Do NOT provide trade recommendations based on macro score. Describe the macro backdrop and let the reader draw conclusions.
 
@@ -6001,6 +6049,8 @@ VENUE PICTURE: Where do IBIT and Deribit agree vs diverge? Which venue dominates
 
 STRUCTURAL BACKDROP: Macro regime score, ETF flow trend, funding rate, aggregate OI flush status. Is the structural backdrop confirming or contradicting the tactical positioning?
 
+VOL SURFACE: If iv_term_structure data is present across multiple windows, describe the vol landscape. Are near-term expiries pricing higher IV than structural (backwardation), or is the curve in normal contango? Is one venue consistently pricing higher vol? If the macro iv_term_structure signal is non-zero, integrate its finding — e.g., "Backwardation confirmed: 0-3d ATM IV 68% vs 31-45d at 52%. Near-term hedging demand elevated, consistent with the negative funding and long liquidation signals."
+
 Do NOT include: trade plans, setups, entry/exit levels, stop losses, invalidation levels, scenario trees, directional recommendations, or language like "lever long/short," "fade rallies," "buy dips," "scalp," or "with confidence."
 
 Lead each timeframe with:
@@ -6010,7 +6060,7 @@ Lead each timeframe with:
 - "No delta flip at any price — $249M of structural selling regardless of direction. Distribution shows -$6.4M concentrated at $66,827 with -$2.5M gradient extending to $61,552."
 - "Regime just flipped — gamma flip at $67,408 is $491 above spot. Positive gamma starts at $67,500 (Deribit) and $67,707 (IBIT)."
 
-Follow with 3-5 concise bullet points covering: what changed, distribution shape, dealer positioning, flows, key risk. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
+Follow with 3-5 concise bullet points covering: what changed, distribution shape, dealer positioning, flows, vol context (if iv_term_structure present), key risk. Be concise and direct — no walls of text. Use trader shorthand where appropriate. Reference specific BTC price levels.
 
 ANALYSIS QUALITY RULES — follow these strictly:
 
