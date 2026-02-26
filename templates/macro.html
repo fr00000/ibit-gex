@@ -947,7 +947,7 @@ function renderIVTermChart(history) {
   const canvas = document.getElementById('chart-ivterm');
 
   const data = history.iv_term_history || [];
-  if (!data.length) {
+  if (data.length < 2) {
     canvas.style.display = 'none';
     let ph = wrap.querySelector('.chart-placeholder');
     if (!ph) {
@@ -955,7 +955,9 @@ function renderIVTermChart(history) {
       ph.className = 'chart-placeholder';
       wrap.appendChild(ph);
     }
-    ph.textContent = 'IV term structure data accumulating (needs ~5 days)';
+    ph.textContent = data.length === 1
+      ? 'IV term structure: 1 day collected, need 2+ for chart'
+      : 'IV term structure data accumulating (needs ~2 days)';
     return;
   }
 
@@ -995,7 +997,8 @@ function renderIVTermChart(history) {
           data: shortIVs,
           borderColor: '#ff4060',
           borderWidth: 1.5,
-          pointRadius: 0,
+          pointRadius: 3,
+          pointHoverRadius: 5,
           tension: 0.3,
           yAxisID: 'y',
         },
@@ -1004,7 +1007,8 @@ function renderIVTermChart(history) {
           data: longIVs,
           borderColor: '#3890ff',
           borderWidth: 1.5,
-          pointRadius: 0,
+          pointRadius: 3,
+          pointHoverRadius: 5,
           tension: 0.3,
           yAxisID: 'y',
         },
@@ -1014,7 +1018,8 @@ function renderIVTermChart(history) {
           borderColor: '#c084fc',
           backgroundColor: slopes.map(v => v < 0 ? 'rgba(255,64,96,0.15)' : 'rgba(0,220,130,0.08)'),
           borderWidth: 2,
-          pointRadius: 0,
+          pointRadius: 3,
+          pointHoverRadius: 5,
           tension: 0.3,
           fill: true,
           yAxisID: 'y1',
