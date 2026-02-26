@@ -2191,6 +2191,25 @@ function renderStructure(data, outlook){
   const histPW03 = dates.map(d => data[d]?.windows?.['0-3']?.put_wall || null);
   const histCW03 = dates.map(d => data[d]?.windows?.['0-3']?.call_wall || null);
 
+  // Override today's data with live values so the chart stays current
+  if(window._lastData && histSpot.length > 0){
+    const live = window._lastData;
+    if(live.btc_spot) histSpot[histSpot.length-1] = live.btc_spot;
+    if(outlook && outlook.windows){
+      const w45 = outlook.windows.find(w => w.label === '31-45d');
+      if(w45){
+        if(w45.call_wall) histCW[histCW.length-1] = w45.call_wall;
+        if(w45.put_wall) histPW[histPW.length-1] = w45.put_wall;
+      }
+      const w03 = outlook.windows.find(w => w.label === '0-3d');
+      if(w03){
+        if(w03.call_wall) histCW03[histCW03.length-1] = w03.call_wall;
+        if(w03.put_wall) histPW03[histPW03.length-1] = w03.put_wall;
+        if(w03.gamma_flip) histGF[histGF.length-1] = w03.gamma_flip;
+      }
+    }
+  }
+
   // Forward projection points (from /api/outlook)
   const fwdPoints = [];
   if(outlook && outlook.windows){
@@ -2229,18 +2248,12 @@ function renderStructure(data, outlook){
   const fwdCWArr = new Array(dates.length).fill(null);
   const fwdRegimes = [];
 
-  // Bridge: connect last historical 31-45d wall to forward projection
   if(fwdPoints.length > 0){
-    const lastHistPW = histPW[histPW.length-1];
-    const lastHistCW = histCW[histCW.length-1];
-    fwdPWArr[fwdPWArr.length-1] = lastHistPW;
-    fwdCWArr[fwdCWArr.length-1] = lastHistCW;
-
     for(const fp of fwdPoints){
       allLabels.push(fp.label);
       allPW.push(null);
       allCW.push(null);
-      allSpot.push(null);
+      allSpot.push(histSpot[histSpot.length-1]);
       allGF.push(null);
       allPW03.push(null);
       allCW03.push(null);
@@ -2279,42 +2292,15 @@ function renderStructure(data, outlook){
     order:2,
   });
 
-  // --- Forward projected walls (dashed) ---
+  // --- Forward projected walls (dots only, no connecting lines) ---
   if(fwdPoints.length > 0){
     datasets.push({
       label:'Projected PW',
       data:fwdPWArr,
-      borderColor:'rgba(0,220,130,0.6)',
-      backgroundColor:'rgba(0,220,130,0.03)',
-      borderWidth:2,
-      borderDash:[6,4],
-      pointRadius:0,
-      fill:false,
-      spanGaps:true,
-      tension:0.3,
-      order:2,
-    });
-    datasets.push({
-      label:'Projected CW',
-      data:fwdCWArr,
-      borderColor:'rgba(255,64,96,0.6)',
-      backgroundColor:'rgba(255,64,96,0.03)',
-      borderWidth:2,
-      borderDash:[6,4],
-      pointRadius:0,
-      fill:'-1',
-      spanGaps:true,
-      tension:0.3,
-      order:2,
-    });
-
-    // Forward window markers (dots at each DTE window point)
-    datasets.push({
-      label:'Fwd PW',
-      data:fwdPWArr.map((v,i) => i > dividerIdx ? v : null),
-      borderColor:'transparent',
+      borderColor:'rgba(0,220,130,0.8)',
       backgroundColor:'rgba(0,220,130,0.8)',
-      pointRadius:4,
+      pointRadius:5,
+      pointHoverRadius:7,
       pointStyle:'circle',
       showLine:false,
       fill:false,
@@ -2322,11 +2308,12 @@ function renderStructure(data, outlook){
       order:0,
     });
     datasets.push({
-      label:'Fwd CW',
-      data:fwdCWArr.map((v,i) => i > dividerIdx ? v : null),
-      borderColor:'transparent',
+      label:'Projected CW',
+      data:fwdCWArr,
+      borderColor:'rgba(255,64,96,0.8)',
       backgroundColor:'rgba(255,64,96,0.8)',
-      pointRadius:4,
+      pointRadius:5,
+      pointHoverRadius:7,
       pointStyle:'circle',
       showLine:false,
       fill:false,
