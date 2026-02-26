@@ -1098,8 +1098,107 @@ def _compute_wall_breach(c, ticker, btc_per_share):
     return score, detail, []
 
 
+def _compute_iv_term_signal(c, ticker, btc_per_share, days=14):
+    """Signal 11: IV Term Structure Shape (-8 to +8).
+    Backwardation (short > long IV) = fear = contrarian bullish.
+    Steep contango = complacency = contrarian bearish."""
+    iv_ts = []
+    used_dte = 3
+    for try_dte in [3, 7, 14, 30, 45]:
+        row = c.execute(
+            'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+            (ticker, try_dte)
+        ).fetchone()
+        if row:
+            try:
+                d = json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            iv_ts = d.get('iv_term_structure', [])
+            if len(iv_ts) >= 2:
+                used_dte = try_dte
+                break
+
+    if not iv_ts or len(iv_ts) < 2:
+        return 0, 'No IV term structure data', []
+
+    # Group by source, prefer deribit (more expiries), fall back to ibit
+    by_source = {}
+    for entry in iv_ts:
+        src = entry.get('source', 'ibit')
+        by_source.setdefault(src, []).append(entry)
+
+    source = 'deribit' if len(by_source.get('deribit', [])) >= 2 else 'ibit'
+    entries = sorted(by_source.get(source, []), key=lambda e: e['dte'])
+
+    if len(entries) < 2:
+        return 0, 'Need at least 2 expiries for term structure', []
+
+    # Build history for charts
+    history = []
+    hist_rows = c.execute(
+        'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT ?',
+        (ticker, used_dte, days)
+    ).fetchall()
+
+    for hr in hist_rows:
+        try:
+            hd = json.loads(hr[1])
+            h_iv_ts = hd.get('iv_term_structure', [])
+            h_entries = sorted(
+                [e for e in h_iv_ts if e.get('source') == source],
+                key=lambda e: e['dte']
+            )
+            if len(h_entries) >= 2:
+                short_iv = h_entries[0]['atm_iv']
+                long_iv = h_entries[-1]['atm_iv']
+                slope = (long_iv - short_iv) / short_iv if short_iv > 0 else 0
+                history.append({
+                    'date': hr[0],
+                    'short_iv': short_iv, 'long_iv': long_iv,
+                    'short_dte': h_entries[0]['dte'],
+                    'long_dte': h_entries[-1]['dte'],
+                    'slope': round(slope, 4),
+                })
+        except (json.JSONDecodeError, TypeError, KeyError):
+            continue
+
+    history.reverse()  # oldest first for charts
+
+    # Current term structure slope
+    short_entry = entries[0]
+    long_entry = entries[-1]
+    short_iv = short_entry['atm_iv']
+    long_iv = long_entry['atm_iv']
+
+    if short_iv <= 0:
+        return 0, 'Invalid short-dated IV', history
+
+    slope = (long_iv - short_iv) / short_iv
+
+    score = 0
+    detail = (f'Short IV {short_iv:.1%} ({short_entry["dte"]}d) vs '
+              f'Long IV {long_iv:.1%} ({long_entry["dte"]}d), '
+              f'slope {slope:+.1%} [{source}]')
+
+    if slope < -0.10:
+        score = 8
+        detail += ' | Strong backwardation (fear, contrarian bullish)'
+    elif slope < -0.03:
+        score = 4
+        detail += ' | Mild backwardation (hedging demand)'
+    elif slope > 0.25:
+        score = -8
+        detail += ' | Steep contango (complacency, contrarian bearish)'
+    elif slope > 0.15:
+        score = -4
+        detail += ' | Elevated contango (low near-term fear)'
+
+    return score, detail, history
+
+
 def _compute_score_history(conn, ticker, days=30):
-    """Recompute full macro score (all 10 signals) for each of the last N days."""
+    """Recompute full macro score (all 11 signals) for each of the last N days."""
     c = conn.cursor()
     cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
     btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
@@ -1169,6 +1268,7 @@ def _compute_score_history(conn, ticker, days=30):
                 'pcr': levels.get('pcr'),
                 'btc_spot': d.get('btc_spot', 0),
                 'regime': levels.get('regime', ''),
+                'iv_term_structure': d.get('iv_term_structure', []),
             }
         except (json.JSONDecodeError, TypeError):
             continue
@@ -1395,8 +1495,33 @@ def _compute_score_history(conn, ticker, days=30):
                 elif pw_dist > 0.005:
                     breach_s = -13 if wb_regime == 'negative_gamma' else -6
 
+        # ── Signal 11: IV Term Structure Shape ────────────────────────
+        iv_term_s = 0
+        if cache_dates:
+            latest_iv = parsed_cache[cache_dates[-1]]
+            iv_ts_data = latest_iv.get('iv_term_structure', [])
+            # Group by source, prefer deribit
+            iv_by_src = {}
+            for iv_e in iv_ts_data:
+                iv_by_src.setdefault(iv_e.get('source', 'ibit'), []).append(iv_e)
+            iv_src = 'deribit' if len(iv_by_src.get('deribit', [])) >= 2 else 'ibit'
+            iv_entries = sorted(iv_by_src.get(iv_src, []), key=lambda e: e.get('dte', 0))
+            if len(iv_entries) >= 2:
+                s_iv = iv_entries[0].get('atm_iv', 0)
+                l_iv = iv_entries[-1].get('atm_iv', 0)
+                if s_iv > 0:
+                    iv_slope = (l_iv - s_iv) / s_iv
+                    if iv_slope < -0.10:
+                        iv_term_s = 8
+                    elif iv_slope < -0.03:
+                        iv_term_s = 4
+                    elif iv_slope > 0.25:
+                        iv_term_s = -8
+                    elif iv_slope > 0.15:
+                        iv_term_s = -4
+
         day_total = max(-100, min(100,
-            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s + liq_s + pcr_s + breach_s))
+            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s + liq_s + pcr_s + breach_s + iv_term_s))
 
         score_history.append({
             'date': date_str,
@@ -1411,6 +1536,7 @@ def _compute_score_history(conn, ticker, days=30):
             'liquidation': liq_s,
             'pcr': pcr_s,
             'breach': breach_s,
+            'iv_term': iv_term_s,
         })
 
     return score_history
@@ -1835,11 +1961,14 @@ def compute_macro_regime(conn, ticker, days=30):
     pcr_score, pcr_detail, pcr_history = _compute_pcr_direction(c, ticker, btc_per_share)
     breach_score, breach_detail, _ = _compute_wall_breach(c, ticker, btc_per_share)
 
+    # ── Phase 4 signals ──────────────────────────────────────────────────
+    iv_term_score, iv_term_detail, iv_term_history = _compute_iv_term_signal(c, ticker, btc_per_share)
+
     # ── Final Score ──────────────────────────────────────────────────────
     total_score = (regime_score + wall_migration_score + compression_score
                    + etf_flow_score + venue_score
                    + funding_score + oi_score + liquidation_score
-                   + pcr_score + breach_score)
+                   + pcr_score + breach_score + iv_term_score)
     total_score = max(-100, min(100, total_score))
 
     # ── Score History ────────────────────────────────────────────────────
@@ -1874,6 +2003,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'liquidation': {'score': liquidation_score, 'max': 13, 'detail': liquidation_detail, 'source': 'coinglass'},
             'pcr_direction': {'score': pcr_score, 'max': 8, 'detail': pcr_detail},
             'wall_breach': {'score': breach_score, 'max': 13, 'detail': breach_detail},
+            'iv_term_structure': {'score': iv_term_score, 'max': 8, 'detail': iv_term_detail},
         },
         'history': {
             'wall_migration': wall_history,
@@ -1883,6 +2013,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'oi_history': oi_hist,
             'liquidation_history': liquidation_history,
             'pcr_history': pcr_history,
+            'iv_term_history': iv_term_history,
             'score_components_daily': score_history,
         },
         'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
@@ -2671,6 +2802,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     strike_data = {}
     cached_chains = {}  # exp_str -> chain, reused for expected move
     expiry_strike_data = {}  # exp_str -> {strike -> {call_oi, put_oi, call_gex, ...}}
+    expiry_iv_data = {}     # exp_str -> list of {strike, iv, oi, opt_type, dte}
     for exp_str in selected_exps:
         exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         dte_float = max((exp_date - now).total_seconds() / 86400.0, 0.0)
@@ -2694,6 +2826,13 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 iv = row.get('impliedVolatility', 0)
                 if pd.isna(iv) or iv <= 0:
                     continue
+
+                # Collect IV for term structure
+                if exp_str not in expiry_iv_data:
+                    expiry_iv_data[exp_str] = []
+                expiry_iv_data[exp_str].append({
+                    'strike': strike, 'iv': iv, 'oi': oi, 'opt_type': opt_type, 'dte': dte_days
+                })
 
                 gamma = bs_gamma(spot, strike, T, rfr, iv)
                 delta = bs_delta(spot, strike, T, rfr, iv, opt_type)
@@ -2758,6 +2897,43 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 esd[strike][f'{opt_type}_charm'] += dealer_charm
                 esd[strike][f'{opt_type}_volume'] += vol
 
+    # Compute ATM IV per expiry for term structure
+    iv_term_structure = []
+    for exp_str, iv_entries in sorted(expiry_iv_data.items()):
+        if not iv_entries:
+            continue
+        dte_val = iv_entries[0]['dte']
+
+        # ATM options: within 2% of spot
+        atm_entries = [e for e in iv_entries if abs(e['strike'] - spot) / spot < 0.02]
+        if not atm_entries:
+            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - spot))
+            atm_entries = sorted_by_dist[:2]
+        if not atm_entries:
+            continue
+
+        total_oi = sum(e['oi'] for e in atm_entries)
+        if total_oi <= 0:
+            continue
+        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+
+        atm_calls = [e for e in atm_entries if e['opt_type'] == 'call']
+        atm_puts = [e for e in atm_entries if e['opt_type'] == 'put']
+        call_oi_sum = sum(e['oi'] for e in atm_calls)
+        put_oi_sum = sum(e['oi'] for e in atm_puts)
+        call_iv = sum(e['iv'] * e['oi'] for e in atm_calls) / call_oi_sum if atm_calls and call_oi_sum > 0 else None
+        put_iv = sum(e['iv'] * e['oi'] for e in atm_puts) / put_oi_sum if atm_puts and put_oi_sum > 0 else None
+
+        iv_term_structure.append({
+            'expiry': exp_str,
+            'dte': dte_val,
+            'atm_iv': round(atm_iv, 4),
+            'call_iv': round(call_iv, 4) if call_iv else None,
+            'put_iv': round(put_iv, 4) if put_iv else None,
+            'num_atm_options': len(atm_entries),
+            'source': 'ibit',
+        })
+
     # Build dataframe
     rows = []
     for strike, d in sorted(strike_data.items()):
@@ -2809,6 +2985,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     deribit_available = False
     deribit_strike_data = {}
     deribit_expiry_strike_data = {}  # exp_str -> {strike_btc -> {call_oi, ...}}
+    deribit_iv_data = {}   # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
     deribit_oi_btc = 0
     deribit_options = []
     deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
@@ -2871,8 +3048,40 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
                     desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
                     desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
+
+                    # Collect IV for term structure
+                    if deribit_exp_str not in deribit_iv_data:
+                        deribit_iv_data[deribit_exp_str] = []
+                    deribit_iv_data[deribit_exp_str].append({
+                        'strike': strike_btc, 'iv': opt['iv'] / 100.0,
+                        'oi': oi, 'opt_type': opt_type,
+                        'dte': opt['dte'], 'underlying': btc_s,
+                    })
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
+
+    # Compute Deribit ATM IV per expiry and merge into IBIT term structure
+    for exp_str, iv_entries in sorted(deribit_iv_data.items()):
+        if not iv_entries:
+            continue
+        dte_val = iv_entries[0]['dte']
+        underlying = iv_entries[0]['underlying']
+        atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
+        if not atm_entries:
+            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
+            atm_entries = sorted_by_dist[:2]
+        if not atm_entries:
+            continue
+        total_oi = sum(e['oi'] for e in atm_entries)
+        if total_oi <= 0:
+            continue
+        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+        iv_term_structure.append({
+            'expiry': exp_str,
+            'dte': round(dte_val, 1),
+            'atm_iv': round(atm_iv, 4),
+            'source': 'deribit',
+        })
 
     # Build Deribit DataFrame
     deribit_rows = []
@@ -3246,6 +3455,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                                 for k, v in combined_levels_btc.items()} if combined_levels_btc else None,
         'deribit_levels_btc': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                                for k, v in deribit_levels_btc.items()} if deribit_levels_btc else None,
+        'iv_term_structure': iv_term_structure,
         'data_freshness': {
             'ibit': _compute_ibit_freshness(),
             'deribit': _compute_deribit_freshness(deribit_currency) if deribit_available else {'age_minutes': None, 'as_of': None},
@@ -3926,6 +4136,7 @@ def _refresh_deribit_only(ticker):
 
             # Process Deribit options (same math as fetch_and_analyze)
             deribit_strike_data = {}
+            deribit_iv_data = {}  # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
             deribit_oi_btc = 0
             for opt in deribit_options:
                 strike_btc = opt['strike']
@@ -3944,6 +4155,38 @@ def _refresh_deribit_only(ticker):
                     deribit_strike_data[strike_btc] = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
                 deribit_strike_data[strike_btc][f'{opt_type}_gex'] += gex
                 deribit_strike_data[strike_btc][f'{opt_type}_oi'] += oi
+
+                # Collect IV for term structure
+                deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+                if deribit_exp_str not in deribit_iv_data:
+                    deribit_iv_data[deribit_exp_str] = []
+                deribit_iv_data[deribit_exp_str].append({
+                    'strike': strike_btc, 'iv': iv,
+                    'oi': oi, 'opt_type': opt_type,
+                    'dte': opt['dte'], 'underlying': btc_s,
+                })
+
+            # Compute Deribit ATM IV per expiry and merge into cached term structure
+            deribit_iv_term = []
+            for exp_str, iv_entries in sorted(deribit_iv_data.items()):
+                if not iv_entries:
+                    continue
+                dte_val = iv_entries[0]['dte']
+                underlying = iv_entries[0]['underlying']
+                atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
+                if not atm_entries:
+                    sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
+                    atm_entries = sorted_by_dist[:2]
+                if not atm_entries:
+                    continue
+                total_oi = sum(e['oi'] for e in atm_entries)
+                if total_oi <= 0:
+                    continue
+                atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+                deribit_iv_term.append({
+                    'expiry': exp_str, 'dte': round(dte_val, 1),
+                    'atm_iv': round(atm_iv, 4), 'source': 'deribit',
+                })
 
             # Build lookup: BTC strike -> net_gex
             deribit_by_btc = {}
@@ -4022,6 +4265,13 @@ def _refresh_deribit_only(ticker):
                                                   for k, v in combined_levels_btc.items()}
             cached['data_freshness']['deribit'] = _compute_deribit_freshness()
             cached['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+            # Merge Deribit IV term structure into cached blob
+            existing_iv = cached.get('iv_term_structure', [])
+            # Remove old deribit entries, add fresh ones
+            existing_iv = [e for e in existing_iv if e.get('source') != 'deribit']
+            existing_iv.extend(deribit_iv_term)
+            cached['iv_term_structure'] = existing_iv
 
             set_cached_data(ticker, max_d, cached)
             log.info(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay done")

@@ -250,6 +250,10 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
       <div class="chart-card-title">Liquidation Volume</div>
       <div id="chart-liq-wrap" class="chart-wrap"><canvas id="chart-liq"></canvas></div>
     </div>
+    <div class="chart-card">
+      <div class="chart-card-title">IV Term Structure</div>
+      <div id="chart-ivterm-wrap" class="chart-wrap"><canvas id="chart-ivterm"></canvas></div>
+    </div>
   </div>
 
   <!-- SWING SETUP BOX -->
@@ -287,6 +291,7 @@ const SIGNAL_NAMES = {
   liquidation: 'Liquidation Intensity',
   pcr_direction: 'PCR Direction',
   wall_breach: 'Wall Breach',
+  iv_term_structure: 'IV Term Structure',
 };
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -935,6 +940,102 @@ function renderLiquidationChart(history, coinglassAvailable) {
   });
 }
 
+/* ── Chart 8: IV Term Structure Slope History ─────────────────────────── */
+function renderIVTermChart(history) {
+  destroyChart('ivterm');
+  const wrap = document.getElementById('chart-ivterm-wrap');
+  const canvas = document.getElementById('chart-ivterm');
+
+  const data = history.iv_term_history || [];
+  if (!data.length) {
+    canvas.style.display = 'none';
+    let ph = wrap.querySelector('.chart-placeholder');
+    if (!ph) {
+      ph = document.createElement('div');
+      ph.className = 'chart-placeholder';
+      wrap.appendChild(ph);
+    }
+    ph.textContent = 'IV term structure data accumulating (needs ~5 days)';
+    return;
+  }
+
+  canvas.style.display = '';
+  const ph = wrap.querySelector('.chart-placeholder');
+  if (ph) ph.remove();
+
+  const labels = data.map(d => fmtDate(d.date));
+  const slopes = data.map(d => d.slope * 100); // percentage
+  const shortIVs = data.map(d => d.short_iv * 100);
+  const longIVs = data.map(d => d.long_iv * 100);
+
+  const opts = chartDefaults();
+  opts.scales.y.ticks = {
+    ...opts.scales.y.ticks,
+    callback: v => v.toFixed(0) + '%'
+  };
+
+  // Second y-axis for slope
+  opts.scales.y1 = {
+    position: 'right',
+    grid: { display: false },
+    ticks: {
+      color: '#64748b',
+      font: { size: 10 },
+      callback: v => v.toFixed(0) + '%'
+    },
+  };
+
+  charts.ivterm = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Short IV',
+          data: shortIVs,
+          borderColor: '#ff4060',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+          yAxisID: 'y',
+        },
+        {
+          label: 'Long IV',
+          data: longIVs,
+          borderColor: '#3890ff',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+          yAxisID: 'y',
+        },
+        {
+          label: 'Slope',
+          data: slopes,
+          borderColor: '#c084fc',
+          backgroundColor: slopes.map(v => v < 0 ? 'rgba(255,64,96,0.15)' : 'rgba(0,220,130,0.08)'),
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.3,
+          fill: true,
+          yAxisID: 'y1',
+        },
+      ]
+    },
+    options: {
+      ...opts,
+      plugins: {
+        ...opts.plugins,
+        tooltip: {
+          ...opts.plugins.tooltip,
+          callbacks: {
+            label: ctx => ctx.dataset.label + ': ' + ctx.raw.toFixed(1) + '%'
+          }
+        }
+      }
+    }
+  });
+}
+
 /* ── Update Swing Box ──────────────────────────────────────────────────── */
 function updateSwingBox(data) {
   const box = document.getElementById('swing-box');
@@ -978,6 +1079,7 @@ async function loadData() {
     renderFundingChart(history, data.coinglass_available);
     renderOIChart(history, data.coinglass_available);
     renderLiquidationChart(history, data.coinglass_available);
+    renderIVTermChart(history);
 
     document.getElementById('loading').classList.add('hidden');
   } catch (e) {

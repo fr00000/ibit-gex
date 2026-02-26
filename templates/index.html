@@ -2310,7 +2310,7 @@ async function loadMacro(){
     else if(m.swing_signal&&m.score<0){badge.classList.add('swing-short');badge.textContent='SWING SHORT';}
     else{badge.classList.add('neutral');badge.textContent=m.bias;}
 
-    const abbr={regime_persistence:'REG',wall_migration:'WALL',range_compression:'RNG',etf_flow_momentum:'FLOW',venue_convergence:'VEN',funding_rate:'FR',aggregate_oi:'OI',liquidation:'LIQ',pcr_direction:'PCR',wall_breach:'BRCH'};
+    const abbr={regime_persistence:'REG',wall_migration:'WALL',range_compression:'RNG',etf_flow_momentum:'FLOW',venue_convergence:'VEN',funding_rate:'FR',aggregate_oi:'OI',liquidation:'LIQ',pcr_direction:'PCR',wall_breach:'BRCH',iv_term_structure:'IV'};
     const pills=document.getElementById('macro-pills');
     pills.innerHTML=Object.entries(m.signals).map(([k,v])=>{
       const cls=!m.coinglass_available&&v.source==='coinglass'?'dim':v.score>0?'pos':v.score<0?'neg':'zero';
