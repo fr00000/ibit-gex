@@ -1223,24 +1223,22 @@ async function loadExpiryOptions(){
     const today=new Date();
     today.setHours(0,0,0,0);
     const dow=today.getDay();
+    const todayStr=today.toISOString().slice(0,10);
 
-    // This week: today through this Friday
+    // This week: today through this Friday (string comparison avoids time-of-day bugs)
     const thisFri=new Date(today);
     thisFri.setDate(today.getDate()+(5-dow));
-    const thisWeekExps=expiryList.filter(e=>{
-      const ed=new Date(e.expiry_date+'T12:00:00');
-      return ed>=today&&ed<=thisFri;
-    });
+    const thisFriStr=thisFri.toISOString().slice(0,10);
+    const thisWeekExps=expiryList.filter(e=>e.expiry_date>=todayStr&&e.expiry_date<=thisFriStr);
 
     // Next week: next Monday through next Friday
     const nextMon=new Date(today);
     nextMon.setDate(today.getDate()+(8-dow));
     const nextFri=new Date(nextMon);
     nextFri.setDate(nextMon.getDate()+4);
-    const nextWeekExps=expiryList.filter(e=>{
-      const ed=new Date(e.expiry_date+'T12:00:00');
-      return ed>=nextMon&&ed<=nextFri;
-    });
+    const nextMonStr=nextMon.toISOString().slice(0,10);
+    const nextFriStr=nextFri.toISOString().slice(0,10);
+    const nextWeekExps=expiryList.filter(e=>e.expiry_date>=nextMonStr&&e.expiry_date<=nextFriStr);
 
     // Next monthly: 3rd Friday of current or next months
     const monthlyDate=findNextMonthly(today);
@@ -1249,9 +1247,7 @@ async function loadExpiryOptions(){
     if(thisWeekExps.length){
       const totalOi=thisWeekExps.reduce((s,e)=>s+(e.total_oi||0),0);
       const opt=document.createElement('option');
-      const fromStr=today.toISOString().slice(0,10);
-      const toStr=thisFri.toISOString().slice(0,10);
-      opt.value=`range:${fromStr}:${toStr}`;
+      opt.value=`range:${todayStr}:${thisFriStr}`;
       opt.textContent=`This Week (${thisWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
       rangeGroup.appendChild(opt);
     }
@@ -1259,7 +1255,7 @@ async function loadExpiryOptions(){
     if(nextWeekExps.length){
       const totalOi=nextWeekExps.reduce((s,e)=>s+(e.total_oi||0),0);
       const opt=document.createElement('option');
-      opt.value=`range:${nextMon.toISOString().slice(0,10)}:${nextFri.toISOString().slice(0,10)}`;
+      opt.value=`range:${nextMonStr}:${nextFriStr}`;
       opt.textContent=`Next Week (${nextWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K OI)`;
       rangeGroup.appendChild(opt);
     }
