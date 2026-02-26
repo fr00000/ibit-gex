@@ -1461,61 +1461,118 @@ def compute_macro_regime(conn, ticker, days=30):
         flow_detail = 'No ETF flow data'
 
     # ── Signal 5: Venue Wall Convergence (-12 to +12) ────────────────────
+    # Compare IBIT and Deribit wall positions. When both venues agree on
+    # where support/resistance sits, that level is high conviction.
+    #
+    # Try DTE windows from widest to narrowest to find one with Deribit data.
+    # Wider windows capture more structural positioning but Deribit coverage
+    # is spotty at longer tenors.
     venue_score = 0
     venue_detail = ''
 
-    latest_cache = c.execute(
-        'SELECT data_json FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT 1',
-        (ticker,)
-    ).fetchone()
+    venue_data = None
+    venue_dte_label = ''
+    for try_dte in [45, 30, 14, 7, 3]:
+        row = c.execute(
+            'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+            (ticker, try_dte)
+        ).fetchone()
+        if row:
+            d = json.loads(row[0])
+            if d.get('combined_levels_btc') and d.get('deribit_levels_btc'):
+                venue_data = d
+                dte_to_label = {3: '0-3d', 7: '4-7d', 14: '8-14d', 30: '15-30d', 45: '31-45d'}
+                venue_dte_label = dte_to_label.get(try_dte, f'{try_dte}d')
+                break
 
-    if latest_cache:
+    if venue_data:
         try:
-            d = json.loads(latest_cache[0])
-            comb = d.get('combined_levels_btc') or {}
-            deribit = d.get('deribit_levels_btc') or {}
-            levels = d.get('levels', {})
+            comb = venue_data.get('combined_levels_btc') or {}
+            deribit = venue_data.get('deribit_levels_btc') or {}
+            levels = venue_data.get('levels', {})
 
-            if comb and deribit:
-                ibit_cw = levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0
-                ibit_pw = levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0
-                deribit_cw = deribit.get('call_wall', 0)
-                deribit_pw = deribit.get('put_wall', 0)
+            ibit_cw = levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0
+            ibit_pw = levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0
+            deribit_cw = deribit.get('call_wall', 0)
+            deribit_pw = deribit.get('put_wall', 0)
 
-                if ibit_pw and deribit_pw and ibit_pw > 0:
-                    pw_diff_pct = abs(ibit_pw - deribit_pw) / ibit_pw
-                    if pw_diff_pct <= 0.02:
-                        if wall_history and len(wall_history) >= 7:
-                            pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
-                            if pw_rising:
-                                venue_score += 12
-                                venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) + rising'
-                            else:
-                                venue_score += 6
-                                venue_detail = f'Put walls converging ({pw_diff_pct:.1%}), stable/falling'
+            CONVERGENCE_PCT = 0.04  # 4% — accounts for strike grid mismatch
 
-                if ibit_cw and deribit_cw and ibit_cw > 0:
-                    cw_diff_pct = abs(ibit_cw - deribit_cw) / ibit_cw
-                    if cw_diff_pct <= 0.02:
-                        if wall_history and len(wall_history) >= 7:
-                            cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
-                            if cw_falling:
-                                venue_score -= 12
-                                venue_detail += f'{" | " if venue_detail else ""}Call walls converging ({cw_diff_pct:.1%}) + falling'
-                            else:
-                                venue_score -= 6
-                                venue_detail += f'{" | " if venue_detail else ""}Call walls converging ({cw_diff_pct:.1%}), stable/rising'
+            pw_converging = False
+            cw_converging = False
+            pw_diff_pct = 0
+            cw_diff_pct = 0
 
-                venue_score = max(-12, min(12, venue_score))
+            if ibit_pw and deribit_pw and ibit_pw > 0:
+                pw_diff_pct = abs(ibit_pw - deribit_pw) / ibit_pw
+                if pw_diff_pct <= CONVERGENCE_PCT:
+                    pw_converging = True
 
-                if not venue_detail:
-                    venue_detail = 'Venue walls not converging'
+            if ibit_cw and deribit_cw and ibit_cw > 0:
+                cw_diff_pct = abs(ibit_cw - deribit_cw) / ibit_cw
+                if cw_diff_pct <= CONVERGENCE_PCT:
+                    cw_converging = True
+
+            if pw_converging and cw_converging:
+                # Both venues agree on a range — high-conviction channel
+                if wall_history and len(wall_history) >= 7:
+                    pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
+                    cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
+                    pw_falling = wall_history[-1]['put_wall'] < wall_history[0]['put_wall'] * 0.98
+                    cw_rising = wall_history[-1]['call_wall'] > wall_history[0]['call_wall'] * 1.02
+
+                    if pw_rising and cw_falling:
+                        venue_score = 12
+                        venue_detail = f'Venue range pinch upward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}]'
+                    elif pw_falling and cw_rising:
+                        venue_score = -12
+                        venue_detail = f'Venue range pinch downward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}]'
+                    elif pw_rising:
+                        venue_score = 8
+                        venue_detail = f'Venue range confirmed, support rising — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                    elif cw_falling:
+                        venue_score = -8
+                        venue_detail = f'Venue range confirmed, resistance falling — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                    else:
+                        venue_score = 0
+                        venue_detail = f'Venue range confirmed, stable — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                else:
+                    venue_score = 0
+                    venue_detail = f'Venue range confirmed (no migration data) — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+
+            elif pw_converging:
+                if wall_history and len(wall_history) >= 7:
+                    pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
+                    if pw_rising:
+                        venue_score = 12
+                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) + rising [{venue_dte_label}]'
+                    else:
+                        venue_score = 6
+                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}), stable/falling [{venue_dte_label}]'
+                else:
+                    venue_score = 4
+                    venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) [{venue_dte_label}]'
+
+            elif cw_converging:
+                if wall_history and len(wall_history) >= 7:
+                    cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
+                    if cw_falling:
+                        venue_score = -12
+                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) + falling [{venue_dte_label}]'
+                    else:
+                        venue_score = -6
+                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}), stable/rising [{venue_dte_label}]'
+                else:
+                    venue_score = -4
+                    venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) [{venue_dte_label}]'
+
             else:
-                venue_detail = 'Deribit data not available'
+                venue_detail = f'Venue walls not converging — PW diff {pw_diff_pct:.1%}, CW diff {cw_diff_pct:.1%} [{venue_dte_label}]'
+
         except (json.JSONDecodeError, TypeError) as e:
             venue_detail = f'Parse error: {e}'
     else:
-        venue_detail = 'No 31-45d cache data'
+        venue_detail = 'Deribit data not available in any DTE window'
 
     # ── Phase 2 signals ──────────────────────────────────────────────────
     funding_score, funding_detail, funding_history = _compute_funding_signal(c)
