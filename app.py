@@ -975,8 +975,131 @@ def _compute_liquidation_signal(c):
     return score, detail, history
 
 
+def _compute_pcr_direction(c, ticker, btc_per_share, days=14):
+    """Signal 9: Put/Call Ratio Direction (-8 to +8). Returns (score, detail, history)."""
+    rows = []
+    pcr_dte = 3
+    for try_dte in [3, 7, 14]:
+        rows = c.execute(
+            'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT ?',
+            (ticker, try_dte, days)
+        ).fetchall()
+        if len(rows) >= 5:
+            pcr_dte = try_dte
+            break
+
+    if not rows or len(rows) < 5:
+        return 0, 'Insufficient PCR data', []
+
+    pcr_history = []
+    for r in rows:
+        try:
+            d = json.loads(r[1])
+            pcr_val = d.get('levels', {}).get('pcr', None)
+            if pcr_val is not None:
+                pcr_history.append({'date': r[0], 'pcr': pcr_val})
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    pcr_history.reverse()  # oldest first for charts
+
+    if len(pcr_history) < 5:
+        return 0, 'Insufficient PCR data', pcr_history
+
+    recent_3 = [p['pcr'] for p in pcr_history[-3:]]
+    prior = [p['pcr'] for p in pcr_history[:-3]]
+    avg_recent = sum(recent_3) / len(recent_3)
+    avg_prior = sum(prior) / len(prior)
+    current_pcr = pcr_history[-1]['pcr']
+
+    score = 0
+    dte_to_label = {3: '0-3d', 7: '4-7d', 14: '8-14d'}
+    dte_label = dte_to_label.get(pcr_dte, f'{pcr_dte}d')
+    detail = f'PCR {current_pcr:.2f}, 3d avg {avg_recent:.2f} vs prior {avg_prior:.2f} [{dte_label}]'
+
+    pct_change = (avg_recent - avg_prior) / avg_prior if avg_prior else 0
+
+    # Rising PCR = more puts = fear building = contrarian bullish
+    # Falling PCR = more calls = greed building = contrarian bearish
+    if pct_change > 0.15:
+        score = 8
+        detail += ' | PCR surging (fear, contrarian bullish)'
+    elif pct_change > 0.08:
+        score = 4
+        detail += ' | PCR rising (put buying increasing)'
+    elif pct_change < -0.15:
+        score = -8
+        detail += ' | PCR plunging (greed, contrarian bearish)'
+    elif pct_change < -0.08:
+        score = -4
+        detail += ' | PCR falling (call buying increasing)'
+
+    return score, detail, pcr_history
+
+
+def _compute_wall_breach(c, ticker, btc_per_share):
+    """Signal 10: Wall Breach Detection (-13 to +13). Returns (score, detail, [])."""
+    for try_dte in [3, 7, 14, 30]:
+        row = c.execute(
+            'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
+            (ticker, try_dte)
+        ).fetchone()
+        if row:
+            try:
+                d = json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            spot = d.get('btc_spot', 0)
+            comb = d.get('combined_levels_btc') or {}
+            lvl = d.get('levels', {})
+            cw = comb.get('call_wall') or (lvl.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+            pw = comb.get('put_wall') or (lvl.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+            regime = lvl.get('regime', '')
+
+            if spot and cw and pw:
+                break
+    else:
+        return 0, 'No wall data for breach check', []
+
+    dte_to_label = {3: '0-3d', 7: '4-7d', 14: '8-14d', 30: '15-30d'}
+    dte_label = dte_to_label.get(try_dte, f'{try_dte}d')
+    detail = f'Spot ${spot:,.0f}, CW ${cw:,.0f}, PW ${pw:,.0f} [{dte_label}]'
+
+    # Breach thresholds: within 0.5% = testing, beyond = breached
+    cw_dist_pct = (spot - cw) / cw if cw else 0
+    pw_dist_pct = (pw - spot) / pw if pw else 0
+
+    score = 0
+    if cw_dist_pct > 0.005:
+        # Spot ABOVE call wall
+        if regime == 'negative_gamma':
+            score = 13
+            detail += f' | ABOVE call wall ({cw_dist_pct:.1%}) + neg \u03b3 \u2192 breakout'
+        else:
+            score = 6
+            detail += f' | ABOVE call wall ({cw_dist_pct:.1%}) + pos \u03b3 \u2192 likely pin'
+    elif cw_dist_pct > -0.005:
+        # Testing call wall
+        detail += f' | Testing call wall ({abs(cw_dist_pct):.1%} away)'
+    elif pw_dist_pct > 0.005:
+        # Spot BELOW put wall
+        if regime == 'negative_gamma':
+            score = -13
+            detail += f' | BELOW put wall ({pw_dist_pct:.1%}) + neg \u03b3 \u2192 breakdown'
+        else:
+            score = -6
+            detail += f' | BELOW put wall ({pw_dist_pct:.1%}) + pos \u03b3 \u2192 dealer support'
+    elif pw_dist_pct > -0.005:
+        # Testing put wall
+        detail += f' | Testing put wall ({abs(pw_dist_pct):.1%} away)'
+    else:
+        detail += ' | Between walls, no breach'
+
+    return score, detail, []
+
+
 def _compute_score_history(conn, ticker, days=30):
-    """Recompute full macro score (all 8 signals) for each of the last N days."""
+    """Recompute full macro score (all 10 signals) for each of the last N days."""
     c = conn.cursor()
     cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
     btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
@@ -1043,6 +1166,9 @@ def _compute_score_history(conn, ticker, days=30):
                 'deribit_cw': deribit.get('call_wall', 0),
                 'deribit_pw': deribit.get('put_wall', 0),
                 'has_deribit': bool(comb and deribit),
+                'pcr': levels.get('pcr'),
+                'btc_spot': d.get('btc_spot', 0),
+                'regime': levels.get('regime', ''),
             }
         except (json.JSONDecodeError, TypeError):
             continue
@@ -1080,7 +1206,7 @@ def _compute_score_history(conn, ticker, days=30):
                             old_count += 1
                         else:
                             break
-                    if old_count >= 20:
+                    if old_count >= 7:
                         regime_s = 12 if recent_regime == 'positive_gamma' else -12
 
         # ── Signal 2: Wall Migration ──────────────────────────────────
@@ -1088,13 +1214,14 @@ def _compute_score_history(conn, ticker, days=30):
         cache_dates = sorted(dt for dt in parsed_cache if dt <= date_str)
         wall_entries = [parsed_cache[dt] for dt in cache_dates if parsed_cache[dt]['call_wall'] and parsed_cache[dt]['put_wall']]
 
-        if len(wall_entries) >= 14:
-            first_7 = wall_entries[:7]
-            last_7 = wall_entries[-7:]
-            avg_pw_f = sum(w['put_wall'] for w in first_7) / 7
-            avg_pw_l = sum(w['put_wall'] for w in last_7) / 7
-            avg_cw_f = sum(w['call_wall'] for w in first_7) / 7
-            avg_cw_l = sum(w['call_wall'] for w in last_7) / 7
+        if len(wall_entries) >= 7:
+            half = len(wall_entries) // 2
+            first_half = wall_entries[:half]
+            last_half = wall_entries[half:]
+            avg_pw_f = sum(w['put_wall'] for w in first_half) / len(first_half)
+            avg_pw_l = sum(w['put_wall'] for w in last_half) / len(last_half)
+            avg_cw_f = sum(w['call_wall'] for w in first_half) / len(first_half)
+            avg_cw_l = sum(w['call_wall'] for w in last_half) / len(last_half)
             pw_chg = (avg_pw_l - avg_pw_f) / avg_pw_f if avg_pw_f else 0
             cw_chg = (avg_cw_l - avg_cw_f) / avg_cw_f if avg_cw_f else 0
             wall_s = (6 if pw_chg > 0.02 else (-6 if pw_chg < -0.02 else 0)) + \
@@ -1146,20 +1273,22 @@ def _compute_score_history(conn, ticker, days=30):
         if cache_dates:
             latest = parsed_cache[cache_dates[-1]]
             if latest['has_deribit']:
-                ibit_pw = latest['ibit_pw']
-                ibit_cw = latest['ibit_cw']
+                combined_pw = latest['put_wall']
+                combined_cw = latest['call_wall']
                 d_pw = latest['deribit_pw']
                 d_cw = latest['deribit_cw']
+                # Use dte=45 threshold for score history (structural data)
+                conv_thresh = 0.04
 
-                if ibit_pw and d_pw and ibit_pw > 0:
-                    pw_diff = abs(ibit_pw - d_pw) / ibit_pw
-                    if pw_diff <= 0.02 and len(wall_entries) >= 7:
+                if combined_pw and d_pw and combined_pw > 0:
+                    pw_diff = abs(combined_pw - d_pw) / combined_pw
+                    if pw_diff <= conv_thresh and len(wall_entries) >= 7:
                         pw_rising = wall_entries[-1]['put_wall'] > wall_entries[0]['put_wall'] * 1.02
                         venue_s += 12 if pw_rising else 6
 
-                if ibit_cw and d_cw and ibit_cw > 0:
-                    cw_diff = abs(ibit_cw - d_cw) / ibit_cw
-                    if cw_diff <= 0.02 and len(wall_entries) >= 7:
+                if combined_cw and d_cw and combined_cw > 0:
+                    cw_diff = abs(combined_cw - d_cw) / combined_cw
+                    if cw_diff <= conv_thresh and len(wall_entries) >= 7:
                         cw_falling = wall_entries[-1]['call_wall'] < wall_entries[0]['call_wall'] * 0.98
                         venue_s -= 12 if cw_falling else 6
 
@@ -1220,8 +1349,54 @@ def _compute_score_history(conn, ticker, days=30):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        # ── Signal 9: PCR Direction ───────────────────────────────────
+        pcr_s = 0
+        # Use parsed_cache for PCR — it stores levels.pcr from dte=45 data
+        # For history, just check if PCR data exists in the latest entry
+        if cache_dates:
+            latest_pc = parsed_cache[cache_dates[-1]]
+            pcr_val = latest_pc.get('pcr')
+            if pcr_val is not None:
+                # Build PCR series from available dates
+                pcr_vals = []
+                for dt in cache_dates:
+                    pv = parsed_cache[dt].get('pcr')
+                    if pv is not None:
+                        pcr_vals.append(pv)
+                if len(pcr_vals) >= 5:
+                    recent_3 = pcr_vals[-3:]
+                    prior_pcr = pcr_vals[:-3]
+                    if prior_pcr:
+                        avg_r = sum(recent_3) / len(recent_3)
+                        avg_p = sum(prior_pcr) / len(prior_pcr)
+                        pct_chg = (avg_r - avg_p) / avg_p if avg_p else 0
+                        if pct_chg > 0.15:
+                            pcr_s = 8
+                        elif pct_chg > 0.08:
+                            pcr_s = 4
+                        elif pct_chg < -0.15:
+                            pcr_s = -8
+                        elif pct_chg < -0.08:
+                            pcr_s = -4
+
+        # ── Signal 10: Wall Breach Detection ─────────────────────────
+        breach_s = 0
+        if cache_dates:
+            latest_wb = parsed_cache[cache_dates[-1]]
+            wb_spot = latest_wb.get('btc_spot', 0)
+            wb_cw = latest_wb.get('call_wall', 0)
+            wb_pw = latest_wb.get('put_wall', 0)
+            wb_regime = latest_wb.get('regime', '')
+            if wb_spot and wb_cw and wb_pw:
+                cw_dist = (wb_spot - wb_cw) / wb_cw if wb_cw else 0
+                pw_dist = (wb_pw - wb_spot) / wb_pw if wb_pw else 0
+                if cw_dist > 0.005:
+                    breach_s = 13 if wb_regime == 'negative_gamma' else 6
+                elif pw_dist > 0.005:
+                    breach_s = -13 if wb_regime == 'negative_gamma' else -6
+
         day_total = max(-100, min(100,
-            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s + liq_s))
+            regime_s + wall_s + comp_s + flow_s + venue_s + funding_s + oi_s + liq_s + pcr_s + breach_s))
 
         score_history.append({
             'date': date_str,
@@ -1234,6 +1409,8 @@ def _compute_score_history(conn, ticker, days=30):
             'funding': funding_s,
             'oi': oi_s,
             'liquidation': liq_s,
+            'pcr': pcr_s,
+            'breach': breach_s,
         })
 
     return score_history
@@ -1295,7 +1472,7 @@ def compute_macro_regime(conn, ticker, days=30):
                     else:
                         break
 
-                if old_regime_count >= 20:
+                if old_regime_count >= 7:
                     if recent_regime == 'positive_gamma':
                         regime_score = 12
                         regime_detail += f' | TRANSITION: {old_regime_count}d neg->pos (streak {recent_streak}d)'
@@ -1313,7 +1490,7 @@ def compute_macro_regime(conn, ticker, days=30):
         (ticker, days)
     ).fetchall()
 
-    if len(cache_rows) >= 14:
+    if len(cache_rows) >= 7:
         for row in cache_rows:
             try:
                 d = json.loads(row[1])
@@ -1328,14 +1505,15 @@ def compute_macro_regime(conn, ticker, days=30):
 
         wall_history.reverse()  # Oldest first
 
-        if len(wall_history) >= 14:
-            first_7 = wall_history[:7]
-            last_7 = wall_history[-7:]
+        if len(wall_history) >= 7:
+            half = len(wall_history) // 2
+            first_half = wall_history[:half]
+            last_half = wall_history[half:]
 
-            avg_pw_first = sum(w['put_wall'] for w in first_7) / 7
-            avg_pw_last = sum(w['put_wall'] for w in last_7) / 7
-            avg_cw_first = sum(w['call_wall'] for w in first_7) / 7
-            avg_cw_last = sum(w['call_wall'] for w in last_7) / 7
+            avg_pw_first = sum(w['put_wall'] for w in first_half) / len(first_half)
+            avg_pw_last = sum(w['put_wall'] for w in last_half) / len(last_half)
+            avg_cw_first = sum(w['call_wall'] for w in first_half) / len(first_half)
+            avg_cw_last = sum(w['call_wall'] for w in last_half) / len(last_half)
 
             pw_change = (avg_pw_last - avg_pw_first) / avg_pw_first if avg_pw_first else 0
             cw_change = (avg_cw_last - avg_cw_first) / avg_cw_first if avg_cw_first else 0
@@ -1349,7 +1527,7 @@ def compute_macro_regime(conn, ticker, days=30):
             wall_detail = f'Put wall {pw_dir} ({pw_change:+.1%}), Call wall {cw_dir} ({cw_change:+.1%})'
 
     if not wall_detail:
-        wall_detail = f'Insufficient data ({len(cache_rows)} days of 31-45d cache)'
+        wall_detail = f'Insufficient data ({len(cache_rows)} days, need 7+ of 31-45d cache)'
 
     # ── Signal 3: Range Compression + Spot Position (-12 to +12) ─────────
     # Compressed range = coiled spring. Direction depends on WHERE spot sits
@@ -1379,22 +1557,32 @@ def compute_macro_regime(conn, ticker, days=30):
                 current_pw = pw
                 break
 
-    # Build range history from structural data (cache_rows = dte=45, already loaded)
-    if len(cache_rows) >= 10:
-        ranges = []
-        for row in cache_rows:
-            try:
-                d = json.loads(row[1])
-                comb = d.get('combined_levels_btc') or {}
-                levels = d.get('levels', {})
-                cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
-                pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
-                if cw and pw and cw > pw:
-                    ranges.append(cw - pw)
-            except (json.JSONDecodeError, TypeError):
-                continue
+    # Build range history from same DTE window as spot data
+    compression_dte = 3
+    range_rows = []
+    for try_dte in [3, 7, 14, 30, 45]:
+        range_rows = c.execute(
+            'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT ?',
+            (ticker, try_dte, days)
+        ).fetchall()
+        if len(range_rows) >= 7:
+            compression_dte = try_dte
+            break
 
-        if ranges:
+    ranges = []
+    for row in range_rows:
+        try:
+            d = json.loads(row[1])
+            comb = d.get('combined_levels_btc') or {}
+            levels = d.get('levels', {})
+            cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+            pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+            if cw and pw and cw > pw:
+                ranges.append(cw - pw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if ranges:
             current_range = ranges[0]
             sorted_ranges = sorted(ranges)
             below = sum(1 for r in sorted_ranges if r < current_range)
@@ -1530,8 +1718,11 @@ def compute_macro_regime(conn, ticker, days=30):
     venue_score = 0
     venue_detail = ''
 
+    CONVERGENCE_THRESHOLDS = {3: 0.02, 7: 0.025, 14: 0.03, 30: 0.035, 45: 0.04}
+
     venue_data = None
     venue_dte_label = ''
+    venue_dte_used = 3
     for try_dte in [3, 7, 14, 30, 45]:
         row = c.execute(
             'SELECT data_json FROM data_cache WHERE ticker=? AND dte=? ORDER BY date DESC LIMIT 1',
@@ -1541,6 +1732,7 @@ def compute_macro_regime(conn, ticker, days=30):
             d = json.loads(row[0])
             if d.get('combined_levels_btc') and d.get('deribit_levels_btc'):
                 venue_data = d
+                venue_dte_used = try_dte
                 dte_to_label = {3: '0-3d', 7: '4-7d', 14: '8-14d', 30: '15-30d', 45: '31-45d'}
                 venue_dte_label = dte_to_label.get(try_dte, f'{try_dte}d')
                 break
@@ -1549,32 +1741,32 @@ def compute_macro_regime(conn, ticker, days=30):
         try:
             comb = venue_data.get('combined_levels_btc') or {}
             deribit = venue_data.get('deribit_levels_btc') or {}
-            levels = venue_data.get('levels', {})
 
-            ibit_cw = levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0
-            ibit_pw = levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0
+            combined_cw = comb.get('call_wall', 0)
+            combined_pw = comb.get('put_wall', 0)
             deribit_cw = deribit.get('call_wall', 0)
             deribit_pw = deribit.get('put_wall', 0)
 
-            CONVERGENCE_PCT = 0.04  # 4% — accounts for strike grid mismatch
+            convergence_pct = CONVERGENCE_THRESHOLDS.get(venue_dte_used, 0.04)
 
             pw_converging = False
             cw_converging = False
             pw_diff_pct = 0
             cw_diff_pct = 0
 
-            if ibit_pw and deribit_pw and ibit_pw > 0:
-                pw_diff_pct = abs(ibit_pw - deribit_pw) / ibit_pw
-                if pw_diff_pct <= CONVERGENCE_PCT:
+            if combined_pw and deribit_pw and combined_pw > 0:
+                pw_diff_pct = abs(combined_pw - deribit_pw) / combined_pw
+                if pw_diff_pct <= convergence_pct:
                     pw_converging = True
 
-            if ibit_cw and deribit_cw and ibit_cw > 0:
-                cw_diff_pct = abs(ibit_cw - deribit_cw) / ibit_cw
-                if cw_diff_pct <= CONVERGENCE_PCT:
+            if combined_cw and deribit_cw and combined_cw > 0:
+                cw_diff_pct = abs(combined_cw - deribit_cw) / combined_cw
+                if cw_diff_pct <= convergence_pct:
                     cw_converging = True
 
+            thresh_label = f'{convergence_pct:.0%} thresh'
+
             if pw_converging and cw_converging:
-                # Both venues agree on a range — high-conviction channel
                 if wall_history and len(wall_history) >= 7:
                     pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
                     cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
@@ -1583,51 +1775,51 @@ def compute_macro_regime(conn, ticker, days=30):
 
                     if pw_rising and cw_falling:
                         venue_score = 12
-                        venue_detail = f'Venue range pinch upward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}]'
+                        venue_detail = f'Venue range pinch upward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     elif pw_falling and cw_rising:
                         venue_score = -12
-                        venue_detail = f'Venue range pinch downward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}]'
+                        venue_detail = f'Venue range pinch downward — PW conv {pw_diff_pct:.1%}, CW conv {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     elif pw_rising:
                         venue_score = 8
-                        venue_detail = f'Venue range confirmed, support rising — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                        venue_detail = f'Venue range confirmed, support rising — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     elif cw_falling:
                         venue_score = -8
-                        venue_detail = f'Venue range confirmed, resistance falling — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                        venue_detail = f'Venue range confirmed, resistance falling — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     else:
                         venue_score = 0
-                        venue_detail = f'Venue range confirmed, stable — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                        venue_detail = f'Venue range confirmed, stable — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                 else:
                     venue_score = 0
-                    venue_detail = f'Venue range confirmed (no migration data) — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}]'
+                    venue_detail = f'Venue range confirmed (no migration data) — PW {pw_diff_pct:.1%}, CW {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label})'
 
             elif pw_converging:
                 if wall_history and len(wall_history) >= 7:
                     pw_rising = wall_history[-1]['put_wall'] > wall_history[0]['put_wall'] * 1.02
                     if pw_rising:
                         venue_score = 12
-                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) + rising [{venue_dte_label}]'
+                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) + rising [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     else:
                         venue_score = 6
-                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}), stable/falling [{venue_dte_label}]'
+                        venue_detail = f'Put walls converging ({pw_diff_pct:.1%}), stable/falling [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                 else:
                     venue_score = 4
-                    venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) [{venue_dte_label}]'
+                    venue_detail = f'Put walls converging ({pw_diff_pct:.1%}) [{venue_dte_label}] ({thresh_label})'
 
             elif cw_converging:
                 if wall_history and len(wall_history) >= 7:
                     cw_falling = wall_history[-1]['call_wall'] < wall_history[0]['call_wall'] * 0.98
                     if cw_falling:
                         venue_score = -12
-                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) + falling [{venue_dte_label}]'
+                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) + falling [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                     else:
                         venue_score = -6
-                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}), stable/rising [{venue_dte_label}]'
+                        venue_detail = f'Call walls converging ({cw_diff_pct:.1%}), stable/rising [{venue_dte_label}] ({thresh_label}, migration from 31-45d)'
                 else:
                     venue_score = -4
-                    venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) [{venue_dte_label}]'
+                    venue_detail = f'Call walls converging ({cw_diff_pct:.1%}) [{venue_dte_label}] ({thresh_label})'
 
             else:
-                venue_detail = f'Venue walls not converging — PW diff {pw_diff_pct:.1%}, CW diff {cw_diff_pct:.1%} [{venue_dte_label}]'
+                venue_detail = f'Venue walls not converging — PW diff {pw_diff_pct:.1%}, CW diff {cw_diff_pct:.1%} [{venue_dte_label}] ({thresh_label})'
 
         except (json.JSONDecodeError, TypeError) as e:
             venue_detail = f'Parse error: {e}'
@@ -1637,13 +1829,17 @@ def compute_macro_regime(conn, ticker, days=30):
     # ── Phase 2 signals ──────────────────────────────────────────────────
     funding_score, funding_detail, funding_history = _compute_funding_signal(c)
     oi_score, oi_detail, oi_hist = _compute_oi_signal(c)
-
     liquidation_score, liquidation_detail, liquidation_history = _compute_liquidation_signal(c)
+
+    # ── Phase 3 signals ──────────────────────────────────────────────────
+    pcr_score, pcr_detail, pcr_history = _compute_pcr_direction(c, ticker, btc_per_share)
+    breach_score, breach_detail, _ = _compute_wall_breach(c, ticker, btc_per_share)
 
     # ── Final Score ──────────────────────────────────────────────────────
     total_score = (regime_score + wall_migration_score + compression_score
                    + etf_flow_score + venue_score
-                   + funding_score + oi_score + liquidation_score)
+                   + funding_score + oi_score + liquidation_score
+                   + pcr_score + breach_score)
     total_score = max(-100, min(100, total_score))
 
     # ── Score History ────────────────────────────────────────────────────
@@ -1676,6 +1872,8 @@ def compute_macro_regime(conn, ticker, days=30):
             'funding_rate': {'score': funding_score, 'max': 13, 'detail': funding_detail, 'source': 'coinglass'},
             'aggregate_oi': {'score': oi_score, 'max': 13, 'detail': oi_detail, 'source': 'coinglass'},
             'liquidation': {'score': liquidation_score, 'max': 13, 'detail': liquidation_detail, 'source': 'coinglass'},
+            'pcr_direction': {'score': pcr_score, 'max': 8, 'detail': pcr_detail},
+            'wall_breach': {'score': breach_score, 'max': 13, 'detail': breach_detail},
         },
         'history': {
             'wall_migration': wall_history,
@@ -1684,6 +1882,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'funding_rates': funding_history,
             'oi_history': oi_hist,
             'liquidation_history': liquidation_history,
+            'pcr_history': pcr_history,
             'score_components_daily': score_history,
         },
         'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
