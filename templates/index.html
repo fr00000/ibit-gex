@@ -402,17 +402,19 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="cell cell-structure">
     <div class="cell-label">
       <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Wall Migration</span>
-      <select id="struct-dte-selector" onchange="setStructDte(this.value)" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer;margin-right:8px">
-        <option value="all">ALL DTE</option>
-        <option value="0-3">0-3 DTE</option>
-        <option value="4-7">4-7 DTE</option>
-        <option value="8-14">8-14 DTE</option>
-        <option value="15-30">15-30 DTE</option>
-        <option value="31-45" selected>31-45 DTE</option>
-      </select>
       <span class="cell-tab" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
+      <span id="struct-dte-selector" style="margin-left:auto;display:flex;align-items:center">
+        <select onchange="setStructDte(this.value)" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 4px;border-radius:2px;border:1px solid var(--border2);background:var(--bg);color:var(--t2);cursor:pointer;outline:none">
+          <option value="all">ALL DTE</option>
+          <option value="0-3">0-3 DTE</option>
+          <option value="4-7">4-7 DTE</option>
+          <option value="8-14">8-14 DTE</option>
+          <option value="15-30">15-30 DTE</option>
+          <option value="31-45" selected>31-45 DTE</option>
+        </select>
+      </span>
     </div>
     <canvas id="range-cone-chart" style="display:none"></canvas>
     <canvas id="structure-chart"></canvas>
@@ -1799,7 +1801,7 @@ function setStructView(view){
   document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
-  document.getElementById('struct-dte-selector').style.display=isWalls?'inline-block':'none';
+  document.getElementById('struct-dte-selector').style.display=isWalls?'flex':'none';
   document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
