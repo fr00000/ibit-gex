@@ -113,6 +113,9 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .cell-tab{cursor:pointer;opacity:0.4;transition:opacity .15s}
 .cell-tab.active{opacity:1}
 .cell-tab:hover{opacity:0.7}
+.struct-dte-opt{cursor:pointer;font-size:8px;font-family:'IBM Plex Mono',monospace;color:#4a5568;padding:1px 4px;border-radius:2px;transition:color .15s,background .15s}
+.struct-dte-opt.active{color:#e2e8f0;background:#1c2230}
+.struct-dte-opt:hover{color:#8892a4}
 
 /* RIGHT PANEL */
 .right{grid-row:1/4;grid-column:3;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
@@ -403,6 +406,7 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="cell cell-structure">
     <div class="cell-label">
       <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Wall Migration</span>
+      <span id="struct-dte-selector" style="display:inline-flex;gap:1px;margin-right:8px;vertical-align:middle"><span class="struct-dte-opt" data-dte="0-3" onclick="setStructDte('0-3')">0-3</span><span class="struct-dte-opt" data-dte="4-7" onclick="setStructDte('4-7')">4-7</span><span class="struct-dte-opt" data-dte="8-14" onclick="setStructDte('8-14')">8-14</span><span class="struct-dte-opt" data-dte="15-30" onclick="setStructDte('15-30')">15-30</span><span class="struct-dte-opt active" data-dte="31-45" onclick="setStructDte('31-45')">31-45</span></span>
       <span class="cell-tab" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
@@ -1776,6 +1780,12 @@ const STRUCT_WINDOWS=[
 ];
 
 let structView='walls';
+let structDteWindow='31-45';
+function setStructDte(w){
+  structDteWindow=w;
+  document.querySelectorAll('.struct-dte-opt').forEach(el=>el.classList.toggle('active',el.dataset.dte===w));
+  if(window._structData&&window._outlookData) renderStructure(window._structData,window._outlookData);
+}
 let heatmapData=null;
 function setStructView(view){
   structView=view;
@@ -1787,6 +1797,7 @@ function setStructView(view){
   document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
+  document.getElementById('struct-dte-selector').style.display=isWalls?'inline-flex':'none';
   document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
@@ -1957,9 +1968,9 @@ async function loadStructure(){
       fetch(`/api/structure?ticker=${currentTicker}&days=30`),
       fetch(`/api/outlook?ticker=${currentTicker}`)
     ]);
-    const structData = await structRes.json();
-    const outlookData = await outlookRes.json();
-    renderStructure(structData, outlookData);
+    window._structData = await structRes.json();
+    window._outlookData = await outlookRes.json();
+    renderStructure(window._structData, window._outlookData);
   }catch(e){console.warn('Structure:',e)}
   heatmapData=null;
 }
@@ -2183,29 +2194,31 @@ function renderStructure(data, outlook){
   today.setHours(0,0,0,0);
 
   // Historical data points (from /api/structure)
+  const pw = structDteWindow;
+  const sw = pw === '0-3' ? '31-45' : '0-3';
   const histLabels = dates.map(d => d.slice(5));
-  const histPW = dates.map(d => data[d]?.windows?.['31-45']?.put_wall || null);
-  const histCW = dates.map(d => data[d]?.windows?.['31-45']?.call_wall || null);
+  const histPW = dates.map(d => data[d]?.windows?.[pw]?.put_wall || null);
+  const histCW = dates.map(d => data[d]?.windows?.[pw]?.call_wall || null);
   const histSpot = dates.map(d => data[d]?.spot || null);
-  const histGF = dates.map(d => data[d]?.windows?.['0-3']?.gamma_flip || null);
-  const histPW03 = dates.map(d => data[d]?.windows?.['0-3']?.put_wall || null);
-  const histCW03 = dates.map(d => data[d]?.windows?.['0-3']?.call_wall || null);
+  const histGF = dates.map(d => data[d]?.windows?.[pw]?.gamma_flip || null);
+  const histPWSec = dates.map(d => data[d]?.windows?.[sw]?.put_wall || null);
+  const histCWSec = dates.map(d => data[d]?.windows?.[sw]?.call_wall || null);
 
   // Override today's data with live values so the chart stays current
   if(window._lastData && histSpot.length > 0){
     const live = window._lastData;
     if(live.btc_spot) histSpot[histSpot.length-1] = live.btc_spot;
     if(outlook && outlook.windows){
-      const w45 = outlook.windows.find(w => w.label === '31-45d');
-      if(w45){
-        if(w45.call_wall) histCW[histCW.length-1] = w45.call_wall;
-        if(w45.put_wall) histPW[histPW.length-1] = w45.put_wall;
+      const wPri = outlook.windows.find(w => w.label === pw+'d');
+      if(wPri){
+        if(wPri.call_wall) histCW[histCW.length-1] = wPri.call_wall;
+        if(wPri.put_wall) histPW[histPW.length-1] = wPri.put_wall;
+        if(wPri.gamma_flip) histGF[histGF.length-1] = wPri.gamma_flip;
       }
-      const w03 = outlook.windows.find(w => w.label === '0-3d');
-      if(w03){
-        if(w03.call_wall) histCW03[histCW03.length-1] = w03.call_wall;
-        if(w03.put_wall) histPW03[histPW03.length-1] = w03.put_wall;
-        if(w03.gamma_flip) histGF[histGF.length-1] = w03.gamma_flip;
+      const wSec = outlook.windows.find(w => w.label === sw+'d');
+      if(wSec){
+        if(wSec.call_wall) histCWSec[histCWSec.length-1] = wSec.call_wall;
+        if(wSec.put_wall) histPWSec[histPWSec.length-1] = wSec.put_wall;
       }
     }
   }
@@ -2240,8 +2253,8 @@ function renderStructure(data, outlook){
   const allCW = [...histCW];
   const allSpot = [...histSpot];
   const allGF = [...histGF];
-  const allPW03 = [...histPW03];
-  const allCW03 = [...histCW03];
+  const allPWSec = [...histPWSec];
+  const allCWSec = [...histCWSec];
 
   // Forward arrays: null for historical portion, values for forward portion
   const fwdPWArr = new Array(dates.length).fill(null);
@@ -2261,8 +2274,8 @@ function renderStructure(data, outlook){
       allCW.push(null);
       allSpot.push(null);
       allGF.push(null);
-      allPW03.push(null);
-      allCW03.push(null);
+      allPWSec.push(null);
+      allCWSec.push(null);
       fwdPWArr.push(fp.pw);
       fwdCWArr.push(fp.cw);
       fwdRegimes.push(fp);
@@ -2272,9 +2285,9 @@ function renderStructure(data, outlook){
   const dividerIdx = dates.length - 1;
   const datasets = [];
 
-  // --- Historical 31-45d walls (solid) ---
+  // --- Primary window walls (solid) ---
   datasets.push({
-    label:'Put Wall (31-45d)',
+    label:'Put Wall ('+pw+'d)',
     data:allPW,
     borderColor:'rgba(0,220,130,0.9)',
     backgroundColor:'rgba(0,220,130,0.04)',
@@ -2286,7 +2299,7 @@ function renderStructure(data, outlook){
     order:2,
   });
   datasets.push({
-    label:'Call Wall (31-45d)',
+    label:'Call Wall ('+pw+'d)',
     data:allCW,
     borderColor:'rgba(255,64,96,0.9)',
     backgroundColor:'rgba(255,64,96,0.04)',
@@ -2354,10 +2367,10 @@ function renderStructure(data, outlook){
     });
   }
 
-  // --- 0-3d tactical walls (thin dashed, historical only) ---
+  // --- Secondary window walls (thin dashed, historical only) ---
   datasets.push({
-    label:'PW (0-3d)',
-    data:allPW03,
+    label:'PW ('+sw+'d)',
+    data:allPWSec,
     borderColor:'rgba(0,220,130,0.25)',
     borderWidth:1,
     borderDash:[4,4],
@@ -2368,8 +2381,8 @@ function renderStructure(data, outlook){
     order:3,
   });
   datasets.push({
-    label:'CW (0-3d)',
-    data:allCW03,
+    label:'CW ('+sw+'d)',
+    data:allCWSec,
     borderColor:'rgba(255,64,96,0.25)',
     borderWidth:1,
     borderDash:[4,4],
@@ -2380,9 +2393,9 @@ function renderStructure(data, outlook){
     order:3,
   });
 
-  // --- Gamma flip (0-3d, historical only) ---
+  // --- Gamma flip (selected window, historical only) ---
   datasets.push({
-    label:'γ Flip (0-3d)',
+    label:'γ Flip ('+pw+'d)',
     data:allGF,
     borderColor:'rgba(255,176,32,0.4)',borderWidth:1.5,borderDash:[3,3],
     pointRadius:0,fill:false,spanGaps:true,tension:0.3,order:3,
@@ -2397,19 +2410,19 @@ function renderStructure(data, outlook){
     fill:false,spanGaps:true,tension:0.3,order:1,
   });
 
-  // --- Venue agreement markers on 31-45d historical ---
-  const hasAgree = dates.some(d => data[d]?.windows?.['31-45']?.venue_agree);
+  // --- Venue agreement markers on selected window historical ---
+  const hasAgree = dates.some(d => data[d]?.windows?.[pw]?.venue_agree);
   if(hasAgree){
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d => {const w=data[d]?.windows?.['31-45']; return (w&&w.venue_agree)?w.call_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
+      data:dates.map(d => {const w=data[d]?.windows?.[pw]; return (w&&w.venue_agree)?w.call_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
       showLine:false,fill:false,spanGaps:false,order:0,
     });
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d => {const w=data[d]?.windows?.['31-45']; return (w&&w.venue_agree)?w.put_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
+      data:dates.map(d => {const w=data[d]?.windows?.[pw]; return (w&&w.venue_agree)?w.put_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
       showLine:false,fill:false,spanGaps:false,order:0,
@@ -2449,15 +2462,15 @@ function renderStructure(data, outlook){
                 if(!date || !data[date]) return '';
                 const d = data[date];
                 lines.push('Spot: '+fB(d.spot));
-                const s = d.windows?.['31-45'];
+                const s = d.windows?.[pw];
                 if(s){
-                  lines.push('31-45d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
+                  lines.push(pw+'d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
                   lines.push('Range: '+Math.round((s.call_wall-s.put_wall)/1000)+'K');
                   lines.push(s.regime==='negative_gamma'?'neg γ':'pos γ');
                   if(s.venue_agree) lines.push('✓ Venues agree');
                 }
-                const t = d.windows?.['0-3'];
-                if(t) lines.push('0-3d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
+                const t = d.windows?.[sw];
+                if(t) lines.push(sw+'d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
               } else {
                 const fpIdx = idx - dividerIdx - 1;
                 const fp = fwdRegimes[fpIdx];
@@ -2491,6 +2504,20 @@ function renderStructure(data, outlook){
       }
     }]
   });
+
+  // Dynamic legend
+  const L = (swatch, txt) => `<span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4">${swatch}${txt}</span>`;
+  document.getElementById('struct-legend').innerHTML = [
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>', 'PW '+pw+'d'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>', 'CW '+pw+'d'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(0,220,130,0.6)"></span>', 'Projected PW'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(255,64,96,0.6)"></span>', 'Projected CW'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>', 'PW '+sw+'d'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>', 'CW '+sw+'d'),
+    L('<span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>', 'Spot'),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.4)"></span>', '&gamma; Flip'),
+    L('<span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>', 'Venue agree'),
+  ].join('');
 }
 
 // Init
