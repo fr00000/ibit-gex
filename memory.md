@@ -71,6 +71,9 @@ This file captures the "why" behind design choices, debugging outcomes, and sign
 **Root cause:** `dte` field stored at write time, never updated. A Feb 22 expiry with `dte=0` stored on Feb 22 still matched `e.dte >= 0 && e.dte <= 3` on Feb 25.
 **Fix:** Client-side filter: `expiryList.filter(e => e.expiry_date >= today)` then recompute DTE from actual date diff.
 
+### Database Location Gotcha
+**The SQLite database is `~/.ibit_gex_history.db`** — a hidden file in the HOME directory, NOT in the project directory. Defined by `DB_PATH = os.path.join(str(Path.home()), ".ibit_gex_history.db")` at the top of app.py. When querying manually: `sqlite3 ~/.ibit_gex_history.db "SELECT ..."`. Previous documentation incorrectly said `gex_data.db` — this caused confusion when trying to query the database.
+
 ### Weekend Deribit Data (prior)
 **Problem:** IBIT data is stale over weekends (no Yahoo updates), but Deribit keeps trading. Dashboard showed stale combined data.
 **Fix:** `_refresh_deribit_only()` runs Deribit overlay on cached IBIT data during weekends. Deribit levels update while IBIT levels stay frozen. `data_freshness` shows age for each venue so the UI can flag staleness.

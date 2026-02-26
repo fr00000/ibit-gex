@@ -13,7 +13,7 @@ app.py                  # Everything: Flask app, data fetching, analysis, all lo
 templates/index.html    # Dashboard UI: Chart.js + custom canvas charts, all frontend JS
 templates/macro.html    # Standalone macro regime page with signal charts (~1100 lines)
 .env                    # ANTHROPIC_API_KEY, COINGLASS_API_KEY (not committed)
-gex_data.db             # SQLite database (auto-created)
+~/.ibit_gex_history.db  # SQLite database (auto-created in HOME dir, NOT project dir)
 ```
 
 ## app.py Section Map (approximate line ranges)
@@ -178,3 +178,4 @@ Add to `DTE_WINDOWS` list. Everything else (caching, analysis, charts) automatic
 - IBIT data is daily (stale overnight/weekends). Deribit is near real-time. The `data_freshness` field tracks this.
 - `btc_per_share` converts between IBIT share prices and BTC prices. All analysis uses BTC prices.
 - The `combined_levels_btc` field in cache has the merged IBIT+Deribit levels. `levels` has IBIT-only. `deribit_levels_btc` has Deribit-only.
+- The SQLite database lives at `~/.ibit_gex_history.db` (hidden file in HOME directory), NOT in the project directory. The path is set by `DB_PATH` at the top of app.py. When querying manually: `sqlite3 ~/.ibit_gex_history.db "SELECT ..."`
