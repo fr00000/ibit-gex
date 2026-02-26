@@ -113,10 +113,6 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .cell-tab{cursor:pointer;opacity:0.4;transition:opacity .15s}
 .cell-tab.active{opacity:1}
 .cell-tab:hover{opacity:0.7}
-.struct-dte-opt{cursor:pointer;font-size:8px;font-family:'IBM Plex Mono',monospace;color:#4a5568;padding:1px 4px;border-radius:2px;transition:color .15s,background .15s}
-.struct-dte-opt.active{color:#e2e8f0;background:#1c2230}
-.struct-dte-opt:hover{color:#8892a4}
-
 /* RIGHT PANEL */
 .right{grid-row:1/4;grid-column:3;background:var(--bg2);overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
 .right::-webkit-scrollbar{width:4px}
@@ -406,7 +402,14 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
   <div class="cell cell-structure">
     <div class="cell-label">
       <span class="cell-tab active" data-view="walls" onclick="setStructView('walls')" style="margin-right:8px">Wall Migration</span>
-      <span id="struct-dte-selector" style="display:inline-flex;gap:1px;margin-right:8px;vertical-align:middle"><span class="struct-dte-opt" data-dte="0-3" onclick="setStructDte('0-3')">0-3</span><span class="struct-dte-opt" data-dte="4-7" onclick="setStructDte('4-7')">4-7</span><span class="struct-dte-opt" data-dte="8-14" onclick="setStructDte('8-14')">8-14</span><span class="struct-dte-opt" data-dte="15-30" onclick="setStructDte('15-30')">15-30</span><span class="struct-dte-opt active" data-dte="31-45" onclick="setStructDte('31-45')">31-45</span></span>
+      <select id="struct-dte-selector" onchange="setStructDte(this.value)" style="background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:2px;padding:2px 4px;font-family:var(--mono);font-size:10px;cursor:pointer;margin-right:8px">
+        <option value="all">ALL DTE</option>
+        <option value="0-3">0-3 DTE</option>
+        <option value="4-7">4-7 DTE</option>
+        <option value="8-14">8-14 DTE</option>
+        <option value="15-30">15-30 DTE</option>
+        <option value="31-45" selected>31-45 DTE</option>
+      </select>
       <span class="cell-tab" data-view="range" onclick="setStructView('range')" style="margin-right:8px">Range</span>
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
@@ -1783,7 +1786,6 @@ let structView='walls';
 let structDteWindow='31-45';
 function setStructDte(w){
   structDteWindow=w;
-  document.querySelectorAll('.struct-dte-opt').forEach(el=>el.classList.toggle('active',el.dataset.dte===w));
   if(window._structData&&window._outlookData) renderStructure(window._structData,window._outlookData);
 }
 let heatmapData=null;
@@ -1797,7 +1799,7 @@ function setStructView(view){
   document.getElementById('range-cone-chart').style.display=isRange?'':'none';
   document.getElementById('heatmap-chart').style.display=isHeat?'':'none';
   document.getElementById('struct-legend').style.display=isWalls?'flex':'none';
-  document.getElementById('struct-dte-selector').style.display=isWalls?'inline-flex':'none';
+  document.getElementById('struct-dte-selector').style.display=isWalls?'inline-block':'none';
   document.getElementById('range-cone-legend').style.display=isRange?'flex':'none';
   document.getElementById('heat-legend').style.display=isHeat?'flex':'none';
   document.getElementById('heat-legend-oi').style.display=view==='heatmap-oi'?'flex':'none';
@@ -2195,30 +2197,47 @@ function renderStructure(data, outlook){
 
   // Historical data points (from /api/structure)
   const pw = structDteWindow;
-  const sw = pw === '0-3' ? '31-45' : '0-3';
+  const isAll = pw === 'all';
+  const allKeys = ['0-3','4-7','8-14','15-30','31-45'];
+  const sw = isAll ? null : (pw === '0-3' ? '31-45' : '0-3');
   const histLabels = dates.map(d => d.slice(5));
-  const histPW = dates.map(d => data[d]?.windows?.[pw]?.put_wall || null);
-  const histCW = dates.map(d => data[d]?.windows?.[pw]?.call_wall || null);
   const histSpot = dates.map(d => data[d]?.spot || null);
-  const histGF = dates.map(d => data[d]?.windows?.[pw]?.gamma_flip || null);
-  const histPWSec = dates.map(d => data[d]?.windows?.[sw]?.put_wall || null);
-  const histCWSec = dates.map(d => data[d]?.windows?.[sw]?.call_wall || null);
+
+  function pickWall(d, field, agg) {
+    if (!isAll) return data[d]?.windows?.[pw]?.[field] || null;
+    const vals = allKeys.map(k => data[d]?.windows?.[k]?.[field]).filter(v => v != null);
+    return vals.length ? agg(...vals) : null;
+  }
+  const histPW = dates.map(d => pickWall(d, 'put_wall', Math.min));
+  const histCW = dates.map(d => pickWall(d, 'call_wall', Math.max));
+  const histGF = isAll ? dates.map(() => null) : dates.map(d => data[d]?.windows?.[pw]?.gamma_flip || null);
+  const histPWSec = sw ? dates.map(d => data[d]?.windows?.[sw]?.put_wall || null) : dates.map(() => null);
+  const histCWSec = sw ? dates.map(d => data[d]?.windows?.[sw]?.call_wall || null) : dates.map(() => null);
 
   // Override today's data with live values so the chart stays current
   if(window._lastData && histSpot.length > 0){
     const live = window._lastData;
     if(live.btc_spot) histSpot[histSpot.length-1] = live.btc_spot;
     if(outlook && outlook.windows){
-      const wPri = outlook.windows.find(w => w.label === pw+'d');
-      if(wPri){
-        if(wPri.call_wall) histCW[histCW.length-1] = wPri.call_wall;
-        if(wPri.put_wall) histPW[histPW.length-1] = wPri.put_wall;
-        if(wPri.gamma_flip) histGF[histGF.length-1] = wPri.gamma_flip;
+      if(isAll){
+        const cws = outlook.windows.map(w => w.call_wall).filter(v => v);
+        const pws = outlook.windows.map(w => w.put_wall).filter(v => v);
+        if(cws.length) histCW[histCW.length-1] = Math.max(...cws);
+        if(pws.length) histPW[histPW.length-1] = Math.min(...pws);
+      } else {
+        const wPri = outlook.windows.find(w => w.label === pw+'d');
+        if(wPri){
+          if(wPri.call_wall) histCW[histCW.length-1] = wPri.call_wall;
+          if(wPri.put_wall) histPW[histPW.length-1] = wPri.put_wall;
+          if(wPri.gamma_flip) histGF[histGF.length-1] = wPri.gamma_flip;
+        }
       }
-      const wSec = outlook.windows.find(w => w.label === sw+'d');
-      if(wSec){
-        if(wSec.call_wall) histCWSec[histCWSec.length-1] = wSec.call_wall;
-        if(wSec.put_wall) histPWSec[histPWSec.length-1] = wSec.put_wall;
+      if(sw){
+        const wSec = outlook.windows.find(w => w.label === sw+'d');
+        if(wSec){
+          if(wSec.call_wall) histCWSec[histCWSec.length-1] = wSec.call_wall;
+          if(wSec.put_wall) histPWSec[histPWSec.length-1] = wSec.put_wall;
+        }
       }
     }
   }
@@ -2286,8 +2305,10 @@ function renderStructure(data, outlook){
   const datasets = [];
 
   // --- Primary window walls (solid) ---
+  const pwLabel = isAll ? 'all' : pw+'d';
+  const swLabel = sw ? sw+'d' : '';
   datasets.push({
-    label:'Put Wall ('+pw+'d)',
+    label:'Put Wall ('+pwLabel+')',
     data:allPW,
     borderColor:'rgba(0,220,130,0.9)',
     backgroundColor:'rgba(0,220,130,0.04)',
@@ -2299,7 +2320,7 @@ function renderStructure(data, outlook){
     order:2,
   });
   datasets.push({
-    label:'Call Wall ('+pw+'d)',
+    label:'Call Wall ('+pwLabel+')',
     data:allCW,
     borderColor:'rgba(255,64,96,0.9)',
     backgroundColor:'rgba(255,64,96,0.04)',
@@ -2369,7 +2390,7 @@ function renderStructure(data, outlook){
 
   // --- Secondary window walls (thin dashed, historical only) ---
   datasets.push({
-    label:'PW ('+sw+'d)',
+    label:'PW ('+swLabel+')',
     data:allPWSec,
     borderColor:'rgba(0,220,130,0.25)',
     borderWidth:1,
@@ -2381,7 +2402,7 @@ function renderStructure(data, outlook){
     order:3,
   });
   datasets.push({
-    label:'CW ('+sw+'d)',
+    label:'CW ('+swLabel+')',
     data:allCWSec,
     borderColor:'rgba(255,64,96,0.25)',
     borderWidth:1,
@@ -2395,7 +2416,7 @@ function renderStructure(data, outlook){
 
   // --- Gamma flip (selected window, historical only) ---
   datasets.push({
-    label:'γ Flip ('+pw+'d)',
+    label:'γ Flip ('+pwLabel+')',
     data:allGF,
     borderColor:'rgba(255,176,32,0.4)',borderWidth:1.5,borderDash:[3,3],
     pointRadius:0,fill:false,spanGaps:true,tension:0.3,order:3,
@@ -2411,18 +2432,22 @@ function renderStructure(data, outlook){
   });
 
   // --- Venue agreement markers on selected window historical ---
-  const hasAgree = dates.some(d => data[d]?.windows?.[pw]?.venue_agree);
+  function hasVenueAgree(d){
+    if(isAll) return allKeys.some(k => data[d]?.windows?.[k]?.venue_agree);
+    return data[d]?.windows?.[pw]?.venue_agree;
+  }
+  const hasAgree = dates.some(d => hasVenueAgree(d));
   if(hasAgree){
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d => {const w=data[d]?.windows?.[pw]; return (w&&w.venue_agree)?w.call_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
+      data:dates.map((d,i) => hasVenueAgree(d) ? histCW[i] : null).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
       showLine:false,fill:false,spanGaps:false,order:0,
     });
     datasets.push({
       label:'Venue agree',
-      data:dates.map(d => {const w=data[d]?.windows?.[pw]; return (w&&w.venue_agree)?w.put_wall:null}).concat(new Array(fwdPoints.length).fill(null)),
+      data:dates.map((d,i) => hasVenueAgree(d) ? histPW[i] : null).concat(new Array(fwdPoints.length).fill(null)),
       borderColor:'transparent',backgroundColor:'rgba(0,220,130,0.9)',
       pointRadius:4,pointStyle:'rectRot',pointBorderColor:'rgba(0,220,130,1)',pointBorderWidth:1,
       showLine:false,fill:false,spanGaps:false,order:0,
@@ -2462,15 +2487,27 @@ function renderStructure(data, outlook){
                 if(!date || !data[date]) return '';
                 const d = data[date];
                 lines.push('Spot: '+fB(d.spot));
-                const s = d.windows?.[pw];
-                if(s){
-                  lines.push(pw+'d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
-                  lines.push('Range: '+Math.round((s.call_wall-s.put_wall)/1000)+'K');
-                  lines.push(s.regime==='negative_gamma'?'neg γ':'pos γ');
-                  if(s.venue_agree) lines.push('✓ Venues agree');
+                if(isAll){
+                  const cwVals=allKeys.map(k=>d.windows?.[k]?.call_wall).filter(v=>v);
+                  const pwVals=allKeys.map(k=>d.windows?.[k]?.put_wall).filter(v=>v);
+                  if(cwVals.length&&pwVals.length){
+                    const cw=Math.max(...cwVals), pwv=Math.min(...pwVals);
+                    lines.push('ALL: '+fB(pwv)+' — '+fB(cw));
+                    lines.push('Range: '+Math.round((cw-pwv)/1000)+'K');
+                  }
+                } else {
+                  const s = d.windows?.[pw];
+                  if(s){
+                    lines.push(pw+'d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
+                    lines.push('Range: '+Math.round((s.call_wall-s.put_wall)/1000)+'K');
+                    lines.push(s.regime==='negative_gamma'?'neg γ':'pos γ');
+                    if(s.venue_agree) lines.push('✓ Venues agree');
+                  }
+                  if(sw){
+                    const t = d.windows?.[sw];
+                    if(t) lines.push(sw+'d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
+                  }
                 }
-                const t = d.windows?.[sw];
-                if(t) lines.push(sw+'d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
               } else {
                 const fpIdx = idx - dividerIdx - 1;
                 const fp = fwdRegimes[fpIdx];
@@ -2507,17 +2544,20 @@ function renderStructure(data, outlook){
 
   // Dynamic legend
   const L = (swatch, txt) => `<span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4">${swatch}${txt}</span>`;
-  document.getElementById('struct-legend').innerHTML = [
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>', 'PW '+pw+'d'),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>', 'CW '+pw+'d'),
+  const legendItems = [
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(0,220,130,0.9)"></span>', 'PW '+pwLabel),
+    L('<span style="display:inline-block;width:12px;height:0;border-top:2px solid rgba(255,64,96,0.9)"></span>', 'CW '+pwLabel),
     L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(0,220,130,0.6)"></span>', 'Projected PW'),
     L('<span style="display:inline-block;width:12px;height:0;border-top:2px dashed rgba(255,64,96,0.6)"></span>', 'Projected CW'),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>', 'PW '+sw+'d'),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>', 'CW '+sw+'d'),
-    L('<span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>', 'Spot'),
-    L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.4)"></span>', '&gamma; Flip'),
-    L('<span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>', 'Venue agree'),
-  ].join('');
+  ];
+  if(sw){
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(0,220,130,0.25)"></span>', 'PW '+swLabel));
+    legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,64,96,0.25)"></span>', 'CW '+swLabel));
+  }
+  legendItems.push(L('<span style="display:inline-block;width:12px;height:2px;background:rgba(255,255,255,0.95)"></span>', 'Spot'));
+  if(!isAll) legendItems.push(L('<span style="display:inline-block;width:12px;height:0;border-top:1px dashed rgba(255,176,32,0.4)"></span>', '&gamma; Flip'));
+  legendItems.push(L('<span style="color:rgba(0,220,130,0.9);font-size:8px">&#9670;</span>', 'Venue agree'));
+  document.getElementById('struct-legend').innerHTML = legendItems.join('');
 }
 
 // Init
