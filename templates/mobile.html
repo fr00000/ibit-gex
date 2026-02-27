@@ -133,9 +133,10 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 .tf-btn.active{background:var(--blue);color:var(--bg);border-color:var(--blue)}
 
 /* SELECTORS */
-.selectors{position:sticky;top:48px;z-index:99;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:6px 12px}
-.selectors label{font-size:10px;color:var(--t3);font-weight:600;letter-spacing:.5px}
-.selectors select{font-family:var(--mono);font-size:16px;background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:3px;padding:4px 8px;min-height:36px}
+.selectors{position:sticky;top:48px;z-index:99;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:6px 12px;overflow:hidden}
+.selectors label{font-size:10px;color:var(--t3);font-weight:600;letter-spacing:.5px;flex-shrink:0}
+.selectors select{font-family:var(--mono);font-size:16px;background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:3px;padding:4px 8px;min-height:36px;min-width:0;flex:1 1 0;overflow:hidden;text-overflow:ellipsis}
+.selectors #src-select{flex:0 0 auto;width:auto}
 
 /* FOOTER */
 .footer{padding:16px 14px;text-align:center;font-size:10px;color:var(--t3);border-top:1px solid var(--border);margin-top:10px}
