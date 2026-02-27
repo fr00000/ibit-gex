@@ -6341,6 +6341,11 @@ def macro_page():
     return render_template('macro.html')
 
 
+@app.route('/m')
+def mobile_page():
+    return render_template('mobile.html')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', '-p', type=int, default=5000)
