@@ -2150,7 +2150,7 @@ _deribit_caches = {
 }
 _deribit_lock = threading.Lock()
 DERIBIT_BASE_URL = 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?kind=option&currency='
-DERIBIT_CACHE_SECONDS = 3600
+DERIBIT_CACHE_SECONDS = 900
 
 
 def fetch_farside_flows():
@@ -4421,7 +4421,7 @@ def _bg_refresh():
                 try:
                     freshness = _compute_deribit_freshness(deribit_currency)
                     age_min = freshness.get('age_minutes')
-                    deribit_stale = age_min is None or age_min >= 65
+                    deribit_stale = age_min is None or age_min >= 16
 
                     if deribit_stale:
                         with _deribit_lock:
