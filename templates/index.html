@@ -311,6 +311,11 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 </style>
 </head>
 <body>
+<script>
+if(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && window.location.pathname === '/'){
+  window.location.replace('/m');
+}
+</script>
 
 <div id="loading">
   <div class="spin"></div>
