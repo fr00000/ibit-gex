@@ -350,10 +350,13 @@ async function loadAll(){
       data.combined_levels_btc = data.levels_btc || {};
       data.deribit_available = true;
       data.timestamp = data.date || '';
-      data.dealer_delta_profile = [];
+      data.dealer_delta_profile = data.dealer_delta_profile || [];
       data.expirations = data.included_expiries || [];
       data.etf_flows = null;
       data.data_freshness = null;
+      data.flow_forecast = data.flow_forecast || null;
+      data.significant_levels = data.significant_levels || [];
+      data.delta_flip_points = data.delta_flip_points || [];
       if(!data.levels.regime) data.levels.regime = data.regime || 'positive_gamma';
     }
 
@@ -812,40 +815,70 @@ async function loadExpiryOptions(){
     const dow = today.getDay();
     const todayStr = today.toISOString().slice(0,10);
 
-    // This week
-    const thisFri = new Date(today);
-    thisFri.setDate(today.getDate() + (5 - dow));
-    const thisFriStr = thisFri.toISOString().slice(0,10);
-    const thisWeekExps = expiryList.filter(e => e.expiry_date >= todayStr && e.expiry_date <= thisFriStr);
+    // Generate 4 weeks of ranges
+    const weeks = [
+      {label: 'This Week', startOffset: 0, endDow: 5},
+      {label: 'Next Week', startOffset: 8 - dow, days: 4},
+      {label: 'Week 3', startOffset: 15 - dow, days: 4},
+      {label: 'Week 4', startOffset: 22 - dow, days: 4},
+    ];
 
-    // Next week
-    const nextMon = new Date(today);
-    nextMon.setDate(today.getDate() + (8 - dow));
-    const nextFri = new Date(nextMon);
-    nextFri.setDate(nextMon.getDate() + 4);
-    const nextMonStr = nextMon.toISOString().slice(0,10);
-    const nextFriStr = nextFri.toISOString().slice(0,10);
-    const nextWeekExps = expiryList.filter(e => e.expiry_date >= nextMonStr && e.expiry_date <= nextFriStr);
+    weeks.forEach(w => {
+      let monDate, friDate;
+      if(w.endDow !== undefined){
+        monDate = new Date(today);
+        friDate = new Date(today);
+        friDate.setDate(today.getDate() + (w.endDow - dow));
+      } else {
+        monDate = new Date(today);
+        monDate.setDate(today.getDate() + w.startOffset);
+        friDate = new Date(monDate);
+        friDate.setDate(monDate.getDate() + w.days);
+      }
+      const monStr = monDate.toISOString().slice(0,10);
+      const friStr = friDate.toISOString().slice(0,10);
+      const startStr = w.endDow !== undefined ? todayStr : monStr;
+      const weekExps = expiryList.filter(e => e.expiry_date >= startStr && e.expiry_date <= friStr);
+      if(weekExps.length){
+        const totalOi = weekExps.reduce((s,e) => s + (e.total_oi||0), 0);
+        const opt = document.createElement('option');
+        opt.value = `range:${startStr}:${friStr}`;
+        opt.textContent = `${w.label} (${weekExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+        rangeGroup.appendChild(opt);
+      }
+    });
 
-    // Monthly
+    // This month: today through last day of current month
+    const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    const endOfMonthStr = endOfMonth.toISOString().slice(0,10);
+    const thisMonthExps = expiryList.filter(e => e.expiry_date >= todayStr && e.expiry_date <= endOfMonthStr);
+    if(thisMonthExps.length){
+      const totalOi = thisMonthExps.reduce((s,e) => s + (e.total_oi||0), 0);
+      const opt = document.createElement('option');
+      opt.value = `range:${todayStr}:${endOfMonthStr}`;
+      const monName = today.toLocaleString('en', {month:'short'});
+      opt.textContent = `This Month (${monName}, ${thisMonthExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    // Next month: 1st through last day of next month
+    const nextMonth1 = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+    const endOfNextMonth = new Date(today.getFullYear(), today.getMonth() + 2, 0);
+    const nextMonth1Str = nextMonth1.toISOString().slice(0,10);
+    const endOfNextMonthStr = endOfNextMonth.toISOString().slice(0,10);
+    const nextMonthExps = expiryList.filter(e => e.expiry_date >= nextMonth1Str && e.expiry_date <= endOfNextMonthStr);
+    if(nextMonthExps.length){
+      const totalOi = nextMonthExps.reduce((s,e) => s + (e.total_oi||0), 0);
+      const opt = document.createElement('option');
+      opt.value = `range:${nextMonth1Str}:${endOfNextMonthStr}`;
+      const monName = nextMonth1.toLocaleString('en', {month:'short'});
+      opt.textContent = `Next Month (${monName}, ${nextMonthExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    // Monthly (3rd Friday)
     const monthlyDate = findNextMonthly(today);
     const monthlyExp = expiryList.find(e => e.expiry_date === monthlyDate);
-
-    if(thisWeekExps.length){
-      const totalOi = thisWeekExps.reduce((s,e) => s + (e.total_oi||0), 0);
-      const opt = document.createElement('option');
-      opt.value = `range:${todayStr}:${thisFriStr}`;
-      opt.textContent = `This Week (${thisWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
-      rangeGroup.appendChild(opt);
-    }
-
-    if(nextWeekExps.length){
-      const totalOi = nextWeekExps.reduce((s,e) => s + (e.total_oi||0), 0);
-      const opt = document.createElement('option');
-      opt.value = `range:${nextMonStr}:${nextFriStr}`;
-      opt.textContent = `Next Week (${nextWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
-      rangeGroup.appendChild(opt);
-    }
 
     if(monthlyExp){
       const opt = document.createElement('option');

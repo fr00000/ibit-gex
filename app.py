@@ -2861,6 +2861,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                                            'call_charm': 0, 'put_charm': 0,
                                            'call_volume': 0, 'put_volume': 0,
                                            'call_vol_gex': 0, 'put_vol_gex': 0,
+                                           'call_iv_sum': 0, 'call_iv_oi': 0,
+                                           'put_iv_sum': 0, 'put_iv_oi': 0,
                                            'expiry_gex': {}}
                 strike_data[strike][f'{opt_type}_oi'] += oi
                 strike_data[strike][f'{opt_type}_gex'] += gex
@@ -2869,6 +2871,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 strike_data[strike][f'{opt_type}_delta'] += dealer_delta
                 strike_data[strike][f'{opt_type}_vanna'] += dealer_vanna
                 strike_data[strike][f'{opt_type}_charm'] += dealer_charm
+                strike_data[strike][f'{opt_type}_iv_sum'] += iv * oi
+                strike_data[strike][f'{opt_type}_iv_oi'] += oi
                 # Per-expiry breakdown
                 if exp_str not in strike_data[strike]['expiry_gex']:
                     strike_data[strike]['expiry_gex'][exp_str] = {
@@ -3376,6 +3380,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                         (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
                     'call_volume': ib['call_volume'] if ib else 0,
                     'put_volume': ib['put_volume'] if ib else 0,
+                    'call_iv': round(ib['call_iv_sum'] / ib['call_iv_oi'], 4) if ib and ib.get('call_iv_oi', 0) > 0 else 0,
+                    'put_iv': round(ib['put_iv_sum'] / ib['put_iv_oi'], 4) if ib and ib.get('put_iv_oi', 0) > 0 else 0,
                 })
 
             # Compute per-expiry levels
@@ -5068,6 +5074,61 @@ def api_expiry_data():
     total_call = sum(s['call_oi'] for s in gex_chart)
     total_put = sum(s['put_oi'] for s in gex_chart)
 
+    # Flow forecast (charm/vanna overnight rebalancing)
+    flow_forecast = None
+    if not level_df.empty and levels_btc:
+        try:
+            flow_forecast = compute_flow_forecast(level_df, spot_btc, levels_btc, True)
+        except Exception as e:
+            log.warning(f"[expiry-data] flow_forecast failed: {e}")
+
+    # Significant levels
+    sig_levels = []
+    if not level_df.empty and levels_btc:
+        try:
+            sig_levels = compute_significant_levels(level_df, spot_btc, levels_btc, {}, True, 1.0)
+        except Exception as e:
+            log.warning(f"[expiry-data] significant_levels failed: {e}")
+
+    # Delta flip points from cumulative dealer delta
+    delta_flip_points = []
+    if not level_df.empty:
+        try:
+            sorted_df = level_df.sort_values('strike')
+            cum_dd = sorted_df['net_dealer_delta'].cumsum()
+            for i in range(len(cum_dd) - 1):
+                d1, d2 = cum_dd.iloc[i], cum_dd.iloc[i+1]
+                s1, s2 = sorted_df.iloc[i]['strike'], sorted_df.iloc[i+1]['strike']
+                if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
+                    if (d2 - d1) != 0:
+                        flip = s1 + (s2 - s1) * (-d1) / (d2 - d1)
+                        delta_flip_points.append({
+                            'price_btc': round(float(flip)),
+                            'price_ibit': round(float(flip * first_blob.get('btc_per_share', 0.000568)), 2),
+                        })
+            # Keep only the flip nearest to spot
+            if delta_flip_points:
+                delta_flip_points.sort(key=lambda x: abs(x['price_btc'] - spot_btc))
+                delta_flip_points = delta_flip_points[:2]
+        except Exception as e:
+            log.warning(f"[expiry-data] delta_flip failed: {e}")
+
+    # Dealer delta profile from stored per-strike data
+    dealer_delta_profile = []
+    if not level_df.empty:
+        try:
+            sorted_df = level_df.sort_values('strike')
+            cum_dd = 0.0
+            for _, row in sorted_df.iterrows():
+                cum_dd += row['net_dealer_delta']
+                dealer_delta_profile.append({
+                    'price_btc': float(row['strike']),
+                    'price_ibit': float(row['strike'] * first_blob.get('btc_per_share', 0.000568)),
+                    'net_dealer_delta': float(cum_dd),
+                })
+        except Exception as e:
+            log.warning(f"[expiry-data] dealer_delta_profile failed: {e}")
+
     result = {
         'date': snapshot_date,
         'spot_btc': spot_btc,
@@ -5082,6 +5143,10 @@ def api_expiry_data():
         'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
         'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
         'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in gex_chart),
+        'flow_forecast': flow_forecast,
+        'significant_levels': sig_levels,
+        'delta_flip_points': delta_flip_points,
+        'dealer_delta_profile': dealer_delta_profile,
     }
 
     return Response(json.dumps(result, default=str), mimetype='application/json')
