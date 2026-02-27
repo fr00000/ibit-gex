@@ -26,6 +26,7 @@ import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -37,6 +38,12 @@ import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+ET = ZoneInfo('America/New_York')
+
+def now_et():
+    """Current time in Eastern, used for all timestamps and date keys."""
+    return datetime.now(ET)
 
 app = Flask(__name__)
 
@@ -111,7 +118,7 @@ _rfr_cache = {'rate': None, 'date': None}
 
 def get_risk_free_rate():
     """Fetch 13-week T-bill rate (^IRX) from Yahoo Finance, cached daily."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     if _rfr_cache['rate'] is not None and _rfr_cache['date'] == today:
         return _rfr_cache['rate']
     try:
@@ -332,7 +339,7 @@ def get_db():
 
 def get_prev_strikes(conn, ticker):
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('SELECT date FROM snapshots WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -348,7 +355,7 @@ def get_prev_strikes(conn, ticker):
 
 
 def save_snapshot(conn, ticker, spot, btc_price, levels, df):
-    date_str = datetime.now().strftime('%Y-%m-%d')
+    date_str = now_et().strftime('%Y-%m-%d')
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO snapshots
         (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
@@ -684,7 +691,7 @@ def summarize_history_trends(conn, ticker, btc_per_share, current_levels):
 def summarize_structure_trends(conn, ticker, days=7):
     """Summarize per-DTE-window level migration for AI analysis."""
     c = conn.cursor()
-    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    cutoff = (now_et() - timedelta(days=days)).strftime('%Y-%m-%d')
 
     dte_to_window = {3: '0-3', 7: '4-7', 14: '8-14', 30: '15-30', 45: '31-45'}
 
@@ -1548,7 +1555,7 @@ def compute_macro_regime(conn, ticker, days=30):
     c = conn.cursor()
     cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
     btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
 
     # ── Signal 1: Regime Persistence & Transition (-12 to +12) ───────────
     regime_score = 0
@@ -2019,7 +2026,7 @@ def compute_macro_regime(conn, ticker, days=30):
         'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
         'structural_entry': structural_entry,
         'invalidation': invalidation,
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': now_et().isoformat(),
         'data_freshness': _get_data_freshness(c, ticker),
     }
 
@@ -2089,26 +2096,24 @@ def _parse_farside_value(text):
 
 def _compute_ibit_freshness():
     """Compute hours since last US options market close (Mon-Fri 4:15 PM ET)."""
-    from zoneinfo import ZoneInfo
-    et = ZoneInfo('America/New_York')
-    now_et = datetime.now(et)
+    t = now_et()
 
-    candidate = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+    candidate = t.replace(hour=16, minute=15, second=0, microsecond=0)
 
-    if now_et.weekday() < 5:  # Mon-Fri
-        if now_et >= candidate:
+    if t.weekday() < 5:  # Mon-Fri
+        if t >= candidate:
             last_close = candidate
         else:
-            days_back = 1 if now_et.weekday() > 0 else 3
+            days_back = 1 if t.weekday() > 0 else 3
             last_close = candidate - timedelta(days=days_back)
     else:
-        days_back = now_et.weekday() - 4
+        days_back = t.weekday() - 4
         last_close = candidate - timedelta(days=days_back)
 
-    age_hours = (now_et - last_close).total_seconds() / 3600
+    age_hours = (t - last_close).total_seconds() / 3600
     as_of_str = last_close.strftime('%Y-%m-%d %H:%M ET')
-    in_market = (now_et.weekday() < 5 and
-                 now_et.replace(hour=9, minute=30) <= now_et <= candidate)
+    in_market = (t.weekday() < 5 and
+                 t.replace(hour=9, minute=30) <= t <= candidate)
 
     return {
         'age_hours': round(age_hours, 1),
@@ -2125,8 +2130,7 @@ def _compute_deribit_freshness(currency='BTC'):
     if cache_time == 0:
         return {'age_minutes': None, 'as_of': None}
     age_min = (time.time() - cache_time) / 60
-    from zoneinfo import ZoneInfo
-    as_of_str = datetime.fromtimestamp(cache_time, tz=ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M ET')
+    as_of_str = datetime.fromtimestamp(cache_time, tz=ET).strftime('%Y-%m-%d %H:%M ET')
     return {
         'age_minutes': round(age_min, 0),
         'as_of': as_of_str,
@@ -2282,7 +2286,7 @@ def fetch_coinglass_data():
     if not api_key:
         return  # Graceful - Phase 2 signals just return 0
 
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
 
     with _coinglass_lock:
         conn = get_db()
@@ -3331,7 +3335,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     try:
         conn_exp = get_db()
         c_exp = conn_exp.cursor()
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_str = now_et().strftime('%Y-%m-%d')
 
         all_exp_dates = sorted(set(
             list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
@@ -3455,7 +3459,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         'btc_spot': float(btc_spot) if btc_spot else None,
         'btc_per_share': float(ref_per_share),
         'is_btc': bool(is_crypto),
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
+        'timestamp': now_et().strftime('%Y-%m-%d %H:%M'),
         'dte_window': {'min': min_dte, 'max': max_dte},
         'levels': {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                    for k, v in levels.items()},
@@ -4072,7 +4076,7 @@ def get_prev_cache(ticker, dte):
     """Return the second most recent cached data (yesterday's), or None."""
     conn = get_db()
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, dte, today))
     row = c.fetchone()
@@ -4086,7 +4090,7 @@ def set_cached_data(ticker, dte, data):
     """Cache the full response JSON keyed to today's date."""
     conn = get_db()
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('INSERT OR REPLACE INTO data_cache (date, ticker, dte, data_json) VALUES (?,?,?,?)',
               (today, ticker, dte, json.dumps(data, cls=NumpyEncoder)))
     conn.commit()
@@ -4096,7 +4100,7 @@ def set_cached_data(ticker, dte, data):
 def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
     """Return cached data if fresh, otherwise check Yahoo for new OI.
     force_refresh=True bypasses date check and OI comparison (used for Deribit refresh)."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     cache_date, cached = get_latest_cache(ticker, dte)
 
     # Already confirmed today's data (and min_dte matches) — unless force_refresh
@@ -4110,13 +4114,13 @@ def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
     with _yahoo_check_lock:
         last_check = _last_yahoo_check.get(check_key)
         if cached and last_check and not force_refresh and \
-           (datetime.now() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
+           (now_et() - last_check).total_seconds() < YAHOO_CHECK_INTERVAL:
             return cached
 
     # Fetch from Yahoo (+ Deribit if applicable)
     data = fetch_and_analyze(ticker, dte, min_dte)
     with _yahoo_check_lock:
-        _last_yahoo_check[check_key] = datetime.now()
+        _last_yahoo_check[check_key] = now_et()
 
     # Compare OI to detect if data actually changed
     # When force_refresh, always save (Deribit data changed even if IBIT didn't)
@@ -4288,7 +4292,7 @@ def _refresh_deribit_only(ticker):
                 cached['combined_levels_btc'] = {k: float(v) if isinstance(v, (int, float, np.floating)) else v
                                                   for k, v in combined_levels_btc.items()}
             cached['data_freshness']['deribit'] = _compute_deribit_freshness()
-            cached['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+            cached['timestamp'] = now_et().strftime('%Y-%m-%d %H:%M')
 
             # Merge Deribit IV term structure into cached blob
             existing_iv = cached.get('iv_term_structure', [])
@@ -4367,7 +4371,7 @@ def _bg_refresh():
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
-            today = datetime.now().strftime('%Y-%m-%d')
+            today = now_et().strftime('%Y-%m-%d')
             all_fresh = True
             stale_windows = []
             for label, min_d, max_d in REFRESH_DTES:
@@ -4450,10 +4454,9 @@ def _bg_refresh():
             # Post-close analysis: force-refresh IBIT windows after market close
             # Yahoo options data updates ~4:15 PM ET. We trigger at 4:20 PM ET.
             try:
-                from zoneinfo import ZoneInfo
-                now_et = datetime.now(ZoneInfo('America/New_York'))
-                is_trading_day = now_et.weekday() < 5
-                post_close_window = (now_et.hour == 16 and now_et.minute >= 20) or now_et.hour == 17
+                t = now_et()
+                is_trading_day = t.weekday() < 5
+                post_close_window = (t.hour == 16 and t.minute >= 20) or t.hour == 17
                 already_done_today = post_close_done.get(tk) == today
 
                 if is_trading_day and post_close_window and not already_done_today:
@@ -4753,7 +4756,7 @@ def api_structure():
     ticker = request.args.get('ticker', 'IBIT').upper()
     days = int(request.args.get('days', 30))
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    cutoff = (now_et() - timedelta(days=days)).strftime('%Y-%m-%d')
 
     rows = c.execute('''
         SELECT p.analysis_date, p.dte_window, p.spot_btc, p.call_wall_btc, p.put_wall_btc,
@@ -4859,7 +4862,7 @@ def api_structure_heatmap():
     days = int(request.args.get('days', 30))
     bucket_size = int(request.args.get('bucket', 1000))
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    cutoff = (now_et() - timedelta(days=days)).strftime('%Y-%m-%d')
 
     rows = c.execute('''
         SELECT sh.date, sh.strike, sh.total_oi, sh.net_gex, sh.call_oi, sh.put_oi,
@@ -5287,7 +5290,7 @@ def get_cached_analysis(ticker):
     """Return cached analysis for today if it exists."""
     conn = get_db()
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('SELECT analysis_json FROM analysis_cache WHERE date=? AND ticker=?',
               (today, ticker))
     row = c.fetchone()
@@ -5301,7 +5304,7 @@ def get_prev_analysis(ticker):
     """Return the most recent analysis before today, or None."""
     conn = get_db()
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('SELECT date, analysis_json FROM analysis_cache WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -5315,10 +5318,10 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
     """Cache AI analysis for today, with the BTC price at analysis time."""
     if btc_price is not None:
         analysis['_btc_price'] = btc_price
-        analysis['_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        analysis['_timestamp'] = now_et().strftime('%Y-%m-%d %H:%M')
     conn = get_db()
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
               (today, ticker, json.dumps(analysis)))
     conn.commit()
@@ -5327,7 +5330,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
 
 def save_predictions(ticker, dtes, results, analysis_text=None):
     """Save structured predictions for each expiry date in each DTE window."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
     conn = get_db()
     c = conn.cursor()
 
@@ -5441,7 +5444,7 @@ def save_predictions(ticker, dtes, results, analysis_text=None):
 def score_expired_predictions(conn):
     """Score predictions whose expiry date has passed."""
     c = conn.cursor()
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = now_et().strftime('%Y-%m-%d')
 
     c.execute('''SELECT DISTINCT expiry_date, ticker FROM predictions
                  WHERE scored=0 AND expiry_date < ?''', (today,))
@@ -6279,7 +6282,7 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
                 break
     if btc_price is not None:
         analysis['_btc_price'] = btc_price
-        analysis['_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+        analysis['_timestamp'] = now_et().strftime('%Y-%m-%d %H:%M')
     if save:
         set_cached_analysis(ticker, analysis, btc_price)
     return analysis
