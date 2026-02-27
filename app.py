@@ -3191,17 +3191,20 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         level_trajectory[lname] = traj
     levels['level_trajectory'] = level_trajectory
 
-    # Breakout signals (prev_strikes already available from early fetch)
-    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share, etf_flows)
-
-    # Significant levels with regime behavior
-    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows)
-
     # Dealer flow forecast (vanna + charm) — use combined data when available
     if deribit_available and combined_levels_btc and not combined_df.empty:
         flow_forecast = compute_flow_forecast(combined_df, btc_spot, combined_levels_btc, is_crypto)
     else:
         flow_forecast = compute_flow_forecast(df, spot, levels, is_crypto)
+
+    # Breakout signals — now with flow_forecast + venue data
+    breakout = compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share,
+                                etf_flows=etf_flows, flow_forecast=flow_forecast,
+                                deribit_levels_btc=deribit_levels_btc,
+                                btc_per_share=ref_per_share, btc_spot=btc_spot)
+
+    # Significant levels with regime behavior
+    sig_levels = compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_per_share, etf_flows)
 
     # Dealer delta scenario analysis
     dealer_delta_profile = None
@@ -3931,7 +3934,9 @@ def compute_significant_levels(df, spot, levels, prev_strikes, is_crypto, ref_pe
     return result
 
 
-def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share, etf_flows=None):
+def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_share,
+                     etf_flows=None, flow_forecast=None, deribit_levels_btc=None,
+                     btc_per_share=None, btc_spot=None):
     """Compute breakout signals for both directions."""
     cw = levels['call_wall']
     pw = levels['put_wall']
@@ -3949,25 +3954,26 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         elif ratio > 2.0:
             down_signals.append(f"Weak floor: put wall GEX is {1/ratio:.1f}x call wall")
 
-    # Wall decay
+    # Wall decay: only meaningful if strike was significant yesterday (not migration)
     if prev_strikes:
+        oi_80 = df['total_oi'].quantile(0.80) if not df.empty else 0
         if cw in prev_strikes:
-            prev = prev_strikes[cw]['total_oi']
-            curr = int(df[df['strike'] == cw]['total_oi'].sum()) if cw in df['strike'].values else 0
-            if prev > 0:
-                chg = ((curr - prev) / prev) * 100
-                if chg < -10:
+            prev_total = prev_strikes[cw]['total_oi']
+            curr_total = int(df[df['strike'] == cw]['total_oi'].sum()) if cw in df['strike'].values else 0
+            if prev_total > 0 and prev_total > oi_80:
+                chg = ((curr_total - prev_total) / prev_total) * 100
+                if chg < -20:
                     up_signals.append(f"Call wall DECAYING: OI down {chg:.0f}%")
-                elif chg > 15:
+                elif chg > 25:
                     down_signals.append(f"Call wall BUILDING: OI up +{chg:.0f}%")
         if pw in prev_strikes:
-            prev = prev_strikes[pw]['total_oi']
-            curr = int(df[df['strike'] == pw]['total_oi'].sum()) if pw in df['strike'].values else 0
-            if prev > 0:
-                chg = ((curr - prev) / prev) * 100
-                if chg < -10:
+            prev_total = prev_strikes[pw]['total_oi']
+            curr_total = int(df[df['strike'] == pw]['total_oi'].sum()) if pw in df['strike'].values else 0
+            if prev_total > 0 and prev_total > oi_80:
+                chg = ((curr_total - prev_total) / prev_total) * 100
+                if chg < -20:
                     down_signals.append(f"Put wall DECAYING: OI down {chg:.0f}%")
-                elif chg > 15:
+                elif chg > 25:
                     up_signals.append(f"Put wall BUILDING: OI up +{chg:.0f}%")
 
     # Expected move vs range (non-directional — tracked separately)
@@ -3978,21 +3984,23 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         if range_width > 0.5 and em_width > range_width:
             em_note = f"Expected move ({em_width:.1f}%) > range ({range_width:.1f}%) — breakout likely"
 
-    # Neg gamma near wall
-    if regime == 'negative_gamma':
-        if ((cw - spot) / spot) * 100 < 5:
+    # Neg gamma near wall — threshold scaled to range width, not fixed 5%
+    if regime == 'negative_gamma' and cw > pw:
+        range_pct = (cw - pw) / spot
+        near_thresh = max(range_pct * 0.3, 0.005)  # at least 0.5%, scaled to range
+        if ((cw - spot) / spot) < near_thresh:
             up_signals.append("Negative gamma near call wall — gamma squeeze potential")
-        if ((spot - pw) / spot) * 100 < 5:
+        if ((spot - pw) / spot) < near_thresh:
             down_signals.append("Negative gamma near put wall — waterfall risk")
 
-    # OI beyond walls
+    # OI beyond walls — raised threshold from 40% to 65%
     total_call = df['call_oi'].sum()
     total_put = df['put_oi'].sum()
     above = df[df['strike'] > cw]['call_oi'].sum()
     below = df[df['strike'] < pw]['put_oi'].sum()
-    if total_call > 0 and (above / total_call) * 100 > 40:
+    if total_call > 0 and (above / total_call) * 100 > 65:
         up_signals.append(f"{(above/total_call)*100:.0f}% of call OI above call wall")
-    if total_put > 0 and (below / total_put) * 100 > 40:
+    if total_put > 0 and (below / total_put) * 100 > 65:
         down_signals.append(f"{(below/total_put)*100:.0f}% of put OI below put wall")
 
     # P/C ratio
@@ -4014,6 +4022,38 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
         elif etf_flows['avg_flow_5d'] < -100_000_000:
             down_signals.append(f"5d avg outflow ${abs(etf_flows['avg_flow_5d'])/1e6:.0f}M — sustained selling pressure")
 
+    # Venue wall convergence: IBIT + Deribit agreement strengthens wall, divergence shows room
+    if deribit_levels_btc and btc_per_share and btc_spot:
+        ibit_cw_btc = cw / btc_per_share if btc_per_share else 0
+        ibit_pw_btc = pw / btc_per_share if btc_per_share else 0
+        deribit_cw = deribit_levels_btc.get('call_wall', 0)
+        deribit_pw = deribit_levels_btc.get('put_wall', 0)
+
+        if deribit_cw and ibit_cw_btc:
+            cw_diff_pct = abs(deribit_cw - ibit_cw_btc) / ibit_cw_btc * 100
+            if cw_diff_pct < 2:
+                down_signals.append(f"Venue-reinforced call wall (IBIT+Deribit within {cw_diff_pct:.1f}%)")
+            elif cw_diff_pct > 5 and deribit_cw > ibit_cw_btc:
+                up_signals.append(f"Deribit call wall ${deribit_cw:,.0f} above IBIT — room to run")
+
+        if deribit_pw and ibit_pw_btc:
+            pw_diff_pct = abs(deribit_pw - ibit_pw_btc) / ibit_pw_btc * 100
+            if pw_diff_pct < 2:
+                up_signals.append(f"Venue-reinforced put wall (IBIT+Deribit within {pw_diff_pct:.1f}%)")
+            elif pw_diff_pct > 5 and deribit_pw < ibit_pw_btc:
+                down_signals.append(f"Deribit put wall ${deribit_pw:,.0f} below IBIT — deeper downside")
+
+    # Overnight charm flow: significant dealer rebalancing gives directional pressure
+    if flow_forecast:
+        charm = flow_forecast.get('charm', {})
+        charm_str = charm.get('strength', 'negligible')
+        charm_dir = charm.get('direction')
+        if charm_str in ('moderate', 'significant'):
+            if charm_dir == 'buy':
+                up_signals.append(f"Overnight charm flow: dealers BUY ${abs(charm.get('net_notional',0))/1e6:.0f}M")
+            elif charm_dir == 'sell':
+                down_signals.append(f"Overnight charm flow: dealers SELL ${abs(charm.get('net_notional',0))/1e6:.0f}M")
+
     # Targets
     up_targets = df[(df['strike'] > cw) & (df['net_gex'] > 0)].nlargest(2, 'net_gex')[
         ['strike', 'total_oi', 'net_gex']].to_dict('records')
@@ -4022,9 +4062,9 @@ def compute_breakout(df, spot, levels, expected_move, prev_strikes, ref_per_shar
 
     up_score = len(up_signals)
     down_score = len(down_signals)
-    if up_score > down_score + 1:
+    if up_score >= down_score + 2:
         bias = 'upside'
-    elif down_score > up_score + 1:
+    elif down_score >= up_score + 2:
         bias = 'downside'
     else:
         bias = 'balanced'
