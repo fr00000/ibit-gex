@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>GEX Terminal</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -164,12 +165,16 @@ select,input,textarea{font-size:16px}
 <div class="selectors">
   <label>DTE</label>
   <select id="dte-select" onchange="onDteChange()">
-    <option value="0-3" selected>0-3</option>
-    <option value="4-7">4-7</option>
-    <option value="8-14">8-14</option>
-    <option value="15-30">15-30</option>
-    <option value="31-45">31-45</option>
-    <option value="0-100">ALL</option>
+    <optgroup label="DTE Windows">
+      <option value="0-3" selected>0-3d</option>
+      <option value="4-7">4-7d</option>
+      <option value="8-14">8-14d</option>
+      <option value="15-30">15-30d</option>
+      <option value="31-45">31-45d</option>
+      <option value="0-100">ALL DTE</option>
+    </optgroup>
+    <optgroup label="Expiry Ranges" id="dte-range-group"></optgroup>
+    <optgroup label="Single Expiry" id="dte-expiry-group"></optgroup>
   </select>
   <label>SRC</label>
   <select id="src-select" onchange="onSrcChange()">
@@ -198,6 +203,12 @@ select,input,textarea{font-size:16px}
     <button class="tf-btn" data-tf="1d" onclick="switchTF('1d')">1d</button>
   </div>
   <div class="chart-wrap"><div id="tv-chart"></div></div>
+</div>
+
+<!-- POSITIONING OUTLOOK -->
+<div class="card" id="outlook-card">
+  <div class="card-title purple">Positioning Outlook</div>
+  <div class="chart-wrap" style="height:35vh;min-height:220px"><canvas id="outlook-chart"></canvas></div>
 </div>
 
 <!-- KEY LEVELS -->
@@ -246,6 +257,8 @@ let refreshTimer = null;
 let analysisTimer = null;
 let currentDte = '0-3';
 let currentSource = 'all';
+let outlookChart = null;
+let expiryList = [];
 
 // ── Helpers ──
 const TICKER_WS = {IBIT:'btcusdt', ETHA:'ethusdt'};
@@ -262,6 +275,7 @@ function formatAiText(text){
 document.addEventListener('DOMContentLoaded', () => {
   initTV();
   loadAll();
+  loadExpiryOptions();
   refreshTimer = setInterval(loadAll, 60000);
 });
 
@@ -272,6 +286,7 @@ function switchTicker(tk){
   document.querySelectorAll('.hdr-tab').forEach(b => b.classList.toggle('active', b.dataset.ticker === tk));
   lastData = null;
   loadAll();
+  loadExpiryOptions();
 }
 
 function onDteChange(){
@@ -298,20 +313,54 @@ function switchTF(tf){
 // ── Load All Data ──
 async function loadAll(){
   try{
-    const [dataResp, outlookResp, macroResp, analysisResp] = await Promise.all([
-      fetch(`/api/data?ticker=${currentTicker}&dte=${currentDte.split('-').map(Number).pop()}&min_dte=${currentDte.split('-').map(Number)[0]}`),
+    let dataResp;
+    let isExpiryMode = false;
+
+    if(currentDte.startsWith('exp:')){
+      const expDate = currentDte.slice(4);
+      dataResp = fetch(`/api/expiry-data?ticker=${currentTicker}&expiry=${expDate}`);
+      isExpiryMode = true;
+    } else if(currentDte.startsWith('range:')){
+      const parts = currentDte.split(':');
+      dataResp = fetch(`/api/expiry-data?ticker=${currentTicker}&from_date=${parts[1]}&to_date=${parts[2]}`);
+      isExpiryMode = true;
+    } else {
+      const [minDte, maxDte] = currentDte.split('-').map(Number);
+      dataResp = fetch(`/api/data?ticker=${currentTicker}&dte=${maxDte}&min_dte=${minDte}`);
+    }
+
+    const [dataRaw, outlookResp, macroResp, analysisResp] = await Promise.all([
+      dataResp,
       fetch(`/api/outlook?ticker=${currentTicker}`),
       fetch(`/api/macro-regime?ticker=${currentTicker}`),
       fetch(`/api/analysis?ticker=${currentTicker}`)
     ]);
-    const [data, outlook, macro, analysis] = await Promise.all([
-      dataResp.json(), outlookResp.json(), macroResp.json(), analysisResp.json()
+
+    let data = await dataRaw.json();
+    const [outlook, macro, analysis] = await Promise.all([
+      outlookResp.json(), macroResp.json(), analysisResp.json()
     ]);
+
+    // Normalize expiry-data response to match /api/data shape
+    if(isExpiryMode){
+      data.btc_spot = data.spot_btc || 0;
+      data.spot = data.spot || 0;
+      data.levels = data.levels_btc || {};
+      data.combined_levels_btc = data.levels_btc || {};
+      data.deribit_available = data.deribit_available || false;
+      data.timestamp = data.date || '';
+      data.dealer_delta_profile = [];
+      data.expirations = data.included_expiries || [];
+      data.etf_flows = null;
+      data.data_freshness = null;
+      if(!data.levels.regime) data.levels.regime = data.regime || 'positive_gamma';
+    }
 
     lastData = data;
     renderHero(data);
     renderLevels(data);
     renderDTEWindows(outlook);
+    renderOutlook(outlook);
     renderMacro(macro);
     renderAnalysis(analysis);
     updateChartOverlay(data);
@@ -598,8 +647,8 @@ function renderAnalysis(analysis){
     html += `<div class="ai-ts">Updated ${esc(analysis._timestamp)}${analysis._btc_price ? ' · BTC ' + fB(analysis._btc_price) : ''}</div>`;
   }
 
-  // Show analysis for selected DTE window
-  const dteKey = currentDte + 'd';
+  // Show analysis for selected DTE window (fallback to 0-3d in expiry mode)
+  const dteKey = currentDte.startsWith('exp:') || currentDte.startsWith('range:') ? '0-3d' : currentDte + 'd';
   const dteTxt = analysis[dteKey];
   if(dteTxt){
     html += `<div class="ai-content">${formatAiText(dteTxt)}</div>`;
@@ -687,6 +736,258 @@ function updateChartOverlay(data){
 
   lv.deltaFlips.forEach((fp, i) => {
     addLine(fp.price_btc, '#c084fc', `Δ Flip${lv.deltaFlips.length>1?' '+(i+1):''}`, 1, 2);
+  });
+}
+
+// ── Expiry Options ──
+function findNextMonthly(fromDate){
+  for(let m=0;m<3;m++){
+    const d=new Date(fromDate.getFullYear(),fromDate.getMonth()+m,1);
+    const firstDow=d.getDay();
+    const firstFriDay=firstDow<=5?(5-firstDow+1):(5+7-firstDow+1);
+    const thirdFriDay=firstFriDay+14;
+    const thirdFri=new Date(d.getFullYear(),d.getMonth(),thirdFriDay);
+    if(thirdFri>=fromDate)return thirdFri.toISOString().slice(0,10);
+  }
+  return fromDate.toISOString().slice(0,10);
+}
+
+async function loadExpiryOptions(){
+  try{
+    const r = await fetch(`/api/expiry-data?ticker=${currentTicker}`);
+    const d = await r.json();
+    if(!d.expiries || !d.expiries.length) return;
+
+    const now = new Date();
+    now.setHours(0,0,0,0);
+    expiryList = d.expiries.filter(e => e.expiry_date >= now.toISOString().slice(0,10))
+      .map(e => {
+        const ed = new Date(e.expiry_date + 'T12:00:00');
+        const freshDte = Math.max(0, Math.round((ed - now) / 86400000));
+        return {...e, dte: freshDte};
+      });
+
+    // Annotate DTE window options with expiry count + OI
+    const dteWindows = [{v:'0-3',min:0,max:3},{v:'4-7',min:4,max:7},{v:'8-14',min:8,max:14},{v:'15-30',min:15,max:30},{v:'31-45',min:31,max:45}];
+    for(const w of dteWindows){
+      const matching = expiryList.filter(e => e.dte >= w.min && e.dte <= w.max);
+      const opt = document.querySelector(`#dte-select option[value="${w.v}"]`);
+      if(opt){
+        if(matching.length){
+          const totalOi = matching.reduce((s,e) => s + (e.total_oi||0), 0);
+          opt.textContent = `${w.v}d (${matching.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+        } else {
+          opt.textContent = `${w.v}d`;
+        }
+      }
+    }
+
+    // ALL DTE annotation
+    const allOpt = document.querySelector('#dte-select option[value="0-100"]');
+    if(allOpt){
+      const totalOi = expiryList.reduce((s,e) => s + (e.total_oi||0), 0);
+      allOpt.textContent = `ALL (${expiryList.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+    }
+
+    // Single expiry options
+    const expGroup = document.getElementById('dte-expiry-group');
+    expGroup.innerHTML = '';
+    for(const exp of expiryList){
+      const dt = new Date(exp.expiry_date + 'T12:00:00');
+      const mon = dt.toLocaleString('en', {month:'short'});
+      const day = dt.getDate();
+      const oi = ((exp.total_oi||0)/1000).toFixed(0);
+      const opt = document.createElement('option');
+      opt.value = `exp:${exp.expiry_date}`;
+      opt.textContent = `${mon} ${day} (${exp.dte}d) ${oi}K`;
+      expGroup.appendChild(opt);
+    }
+
+    // Range options
+    const rangeGroup = document.getElementById('dte-range-group');
+    rangeGroup.innerHTML = '';
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    const dow = today.getDay();
+    const todayStr = today.toISOString().slice(0,10);
+
+    // This week
+    const thisFri = new Date(today);
+    thisFri.setDate(today.getDate() + (5 - dow));
+    const thisFriStr = thisFri.toISOString().slice(0,10);
+    const thisWeekExps = expiryList.filter(e => e.expiry_date >= todayStr && e.expiry_date <= thisFriStr);
+
+    // Next week
+    const nextMon = new Date(today);
+    nextMon.setDate(today.getDate() + (8 - dow));
+    const nextFri = new Date(nextMon);
+    nextFri.setDate(nextMon.getDate() + 4);
+    const nextMonStr = nextMon.toISOString().slice(0,10);
+    const nextFriStr = nextFri.toISOString().slice(0,10);
+    const nextWeekExps = expiryList.filter(e => e.expiry_date >= nextMonStr && e.expiry_date <= nextFriStr);
+
+    // Monthly
+    const monthlyDate = findNextMonthly(today);
+    const monthlyExp = expiryList.find(e => e.expiry_date === monthlyDate);
+
+    if(thisWeekExps.length){
+      const totalOi = thisWeekExps.reduce((s,e) => s + (e.total_oi||0), 0);
+      const opt = document.createElement('option');
+      opt.value = `range:${todayStr}:${thisFriStr}`;
+      opt.textContent = `This Week (${thisWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    if(nextWeekExps.length){
+      const totalOi = nextWeekExps.reduce((s,e) => s + (e.total_oi||0), 0);
+      const opt = document.createElement('option');
+      opt.value = `range:${nextMonStr}:${nextFriStr}`;
+      opt.textContent = `Next Week (${nextWeekExps.length} exp, ${(totalOi/1000).toFixed(0)}K)`;
+      rangeGroup.appendChild(opt);
+    }
+
+    if(monthlyExp){
+      const opt = document.createElement('option');
+      opt.value = `exp:${monthlyDate}`;
+      const md = new Date(monthlyDate + 'T12:00:00');
+      opt.textContent = `Monthly ${md.toLocaleString('en',{month:'short'})} ${md.getDate()} (${monthlyExp.dte}d) ${((monthlyExp.total_oi||0)/1000).toFixed(0)}K`;
+      rangeGroup.appendChild(opt);
+    }
+
+    rangeGroup.style.display = rangeGroup.children.length ? '' : 'none';
+  } catch(e){ console.warn('Expiry options:', e) }
+}
+
+// ── Positioning Outlook Chart ──
+function renderOutlook(data){
+  const ctx = document.getElementById('outlook-chart');
+  if(!ctx) return;
+  const wins = data.windows;
+  const spot = data.spot;
+  if(!wins || !wins.length || !spot) return;
+
+  if(outlookChart){ outlookChart.destroy(); outlookChart = null }
+
+  const xPositions = wins.map(w => (w.min_dte + w.max_dte) / 2);
+  const labels = wins.map(w => w.label);
+
+  const point = (i, val) => val != null ? {x: xPositions[i], y: val} : null;
+
+  const emUpperPts = wins.map((w,i) => point(i, w.em_upper)).filter(Boolean);
+  const emLowerPts = wins.map((w,i) => point(i, w.em_lower)).filter(Boolean);
+  const callWallPts = wins.map((w,i) => point(i, w.call_wall)).filter(Boolean);
+  const putWallPts = wins.map((w,i) => point(i, w.put_wall)).filter(Boolean);
+  const gammaFlipPts = wins.map((w,i) => point(i, w.gamma_flip)).filter(Boolean);
+  const deltaFlipPts = wins.map((w,i) => w.delta_flip_btc ? {x:xPositions[i], y:w.delta_flip_btc} : null).filter(Boolean);
+  const venueAgreeCW = wins.map((w,i) => w.venue_agree ? {x:xPositions[i], y:w.call_wall} : null).filter(Boolean);
+  const venueAgreePW = wins.map((w,i) => w.venue_agree ? {x:xPositions[i], y:w.put_wall} : null).filter(Boolean);
+
+  const allVals = [
+    ...wins.map(w=>w.call_wall), ...wins.map(w=>w.put_wall),
+    ...wins.map(w=>w.gamma_flip), ...wins.map(w=>w.em_upper), ...wins.map(w=>w.em_lower),
+    ...wins.map(w=>w.delta_flip_btc)
+  ].filter(v => v != null && isFinite(v));
+  const yMin = Math.min(...allVals);
+  const yMax = Math.max(...allVals);
+  const yPad = (yMax - yMin) * 0.1 || 1000;
+
+  outlookChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      datasets: [
+        {label:'EM Upper', data:emUpperPts, borderColor:'rgba(168,139,250,0.3)', borderWidth:1, borderDash:[3,4], pointRadius:0, fill:false, tension:0.3, order:10},
+        {label:'EM Lower', data:emLowerPts, borderColor:'rgba(168,139,250,0.3)', borderWidth:1, borderDash:[3,4], pointRadius:0, fill:false, tension:0.3, order:10},
+        {label:'Call Wall', data:callWallPts, borderColor:'rgba(255,64,96,0.85)', borderWidth:2.5, pointRadius:4, pointBackgroundColor:'rgba(255,64,96,1)', fill:false, tension:0.2, order:2},
+        {label:'Put Wall', data:putWallPts, borderColor:'rgba(0,220,130,0.85)', borderWidth:2.5, pointRadius:4, pointBackgroundColor:'rgba(0,220,130,1)', fill:false, tension:0.2, order:2},
+        {label:'γ Flip', data:gammaFlipPts, borderColor:'rgba(255,176,32,0.3)', borderWidth:1, borderDash:[5,3], pointRadius:2, pointBackgroundColor:'rgba(255,176,32,0.5)', fill:false, tension:0.2, order:3},
+        {label:'Δ Flip', data:deltaFlipPts, borderColor:'rgba(192,132,252,0.3)', borderWidth:1, borderDash:[4,3], backgroundColor:'rgba(192,132,252,0.9)', pointRadius:4, pointStyle:'triangle', pointBorderColor:'rgba(192,132,252,1)', pointBorderWidth:1, showLine:true, fill:false, tension:0.2, order:1},
+        {label:'Venue Agree', data:venueAgreeCW, borderColor:'transparent', backgroundColor:'rgba(0,220,130,0.9)', pointRadius:5, pointStyle:'rectRot', pointBorderWidth:0, showLine:false, fill:false, order:1},
+        {label:'Venue Agree PW', data:venueAgreePW, borderColor:'transparent', backgroundColor:'rgba(0,220,130,0.9)', pointRadius:5, pointStyle:'rectRot', pointBorderWidth:0, showLine:false, fill:false, order:1},
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: {duration: 300},
+      layout: {padding: {bottom: 4}},
+      interaction: {mode:'nearest', intersect:false, axis:'x'},
+      plugins: {
+        legend: {display: false},
+        tooltip: {
+          backgroundColor: 'rgba(6,8,12,0.95)',
+          borderColor: 'rgba(28,34,48,0.8)',
+          borderWidth: 1,
+          titleFont: {family:'IBM Plex Mono', size:10},
+          bodyFont: {family:'IBM Plex Mono', size:10},
+          padding: 8,
+          callbacks: {
+            title(items){
+              const xVal = items[0]?.parsed?.x;
+              const idx = xPositions.indexOf(xVal);
+              return idx >= 0 ? labels[idx] : '';
+            },
+            label(item){
+              const ds = item.dataset.label;
+              if(ds==='EM Upper'||ds==='EM Lower') return '';
+              if(ds==='Call Wall'){
+                const idx = xPositions.indexOf(item.parsed?.x);
+                const w = idx>=0 ? wins[idx] : null;
+                return `Call Wall: ${fB(item.parsed.y)} (${w?.regime==='negative_gamma'?'NEG γ':'POS γ'})`;
+              }
+              if(ds==='Put Wall') return `Put Wall: ${fB(item.parsed.y)}`;
+              if(ds==='γ Flip') return `γ Flip: ${fB(item.parsed.y)}`;
+              if(ds==='Δ Flip') return `Δ Flip: ${fB(item.parsed.y)}`;
+              if(ds==='Venue Agree') return '◆ Venues agree (CW)';
+              if(ds==='Venue Agree PW') return '◆ Venues agree (PW)';
+              return '';
+            },
+            afterBody(items){
+              const xVal = items[0]?.parsed?.x;
+              const idx = xPositions.indexOf(xVal);
+              const w = idx>=0 ? wins[idx] : null;
+              if(!w) return '';
+              const lines = [];
+              if(w.dealer_delta_dir) lines.push(`Dealers: net ${w.dealer_delta_dir}`);
+              if(w.charm_dir) lines.push(`Charm: ${w.charm_dir}`);
+              if(w.delta_flip_btc) lines.push(`Δ Flip: ${fB(w.delta_flip_btc)}`);
+              return lines.join('\n');
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: 46,
+          grid: {color:'rgba(28,34,48,0.3)', lineWidth:0.5},
+          ticks: {
+            font: {family:'IBM Plex Mono', size:9}, color:'#4a5568',
+            callback(value){ const idx=xPositions.indexOf(value); return idx>=0?labels[idx]:''; },
+            autoSkip: false, stepSize: 1
+          },
+          afterBuildTicks(axis){ axis.ticks = xPositions.map(x=>({value:x})); }
+        },
+        y: {
+          min: Math.floor((yMin-yPad)/1000)*1000,
+          max: Math.ceil((yMax+yPad)/1000)*1000,
+          grid: {color:'rgba(28,34,48,0.3)', lineWidth:0.5},
+          ticks: {font:{family:'IBM Plex Mono',size:9}, color:'#4a5568', callback:v=>fB(v)},
+          position: 'right'
+        }
+      }
+    },
+    plugins: [{
+      id: 'regimeBand',
+      beforeDatasetsDraw(chart){
+        const {ctx:c, chartArea:{top,bottom}, scales:{x:xScale}} = chart;
+        const stripHeight = 4;
+        wins.forEach((w,i) => {
+          const x1 = xScale.getPixelForValue(w.min_dte);
+          const x2 = xScale.getPixelForValue(w.max_dte);
+          c.fillStyle = w.regime==='negative_gamma' ? 'rgba(255,64,96,0.7)' : 'rgba(0,220,130,0.7)';
+          c.fillRect(x1, top, x2-x1, stripHeight);
+        });
+      }
+    }]
   });
 }
 
