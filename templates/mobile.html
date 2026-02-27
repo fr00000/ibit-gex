@@ -131,6 +131,11 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
 .tf-btn{font-family:var(--mono);font-size:11px;font-weight:600;padding:6px 14px;border-radius:3px;border:1px solid var(--border);background:var(--bg3);color:var(--t3);cursor:pointer;min-height:44px;display:flex;align-items:center}
 .tf-btn.active{background:var(--blue);color:var(--bg);border-color:var(--blue)}
 
+/* SELECTORS */
+.selectors{position:sticky;top:48px;z-index:99;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:6px 12px}
+.selectors label{font-size:10px;color:var(--t3);font-weight:600;letter-spacing:.5px}
+.selectors select{font-family:var(--mono);font-size:16px;background:var(--bg3);color:var(--t1);border:1px solid var(--border2);border-radius:3px;padding:4px 8px;min-height:36px}
+
 /* FOOTER */
 .footer{padding:16px 14px;text-align:center;font-size:10px;color:var(--t3);border-top:1px solid var(--border);margin-top:10px}
 .footer a{color:var(--t3);text-decoration:none}
@@ -154,6 +159,24 @@ select,input,textarea{font-size:16px}
   <div class="hdr-right">
     <a href="/" class="hdr-desktop" title="Desktop version">&#x2197;</a>
   </div>
+</div>
+
+<div class="selectors">
+  <label>DTE</label>
+  <select id="dte-select" onchange="onDteChange()">
+    <option value="0-3" selected>0-3</option>
+    <option value="4-7">4-7</option>
+    <option value="8-14">8-14</option>
+    <option value="15-30">15-30</option>
+    <option value="31-45">31-45</option>
+    <option value="0-100">ALL</option>
+  </select>
+  <label>SRC</label>
+  <select id="src-select" onchange="onSrcChange()">
+    <option value="all" selected>ALL</option>
+    <option value="ibit">IBIT</option>
+    <option value="deribit">DERIBIT</option>
+  </select>
 </div>
 
 <div class="content">
@@ -221,6 +244,8 @@ let priceLines = [];
 let lastData = null;
 let refreshTimer = null;
 let analysisTimer = null;
+let currentDte = '0-3';
+let currentSource = 'all';
 
 // ── Helpers ──
 const TICKER_WS = {IBIT:'btcusdt', ETHA:'ethusdt'};
@@ -249,6 +274,20 @@ function switchTicker(tk){
   loadAll();
 }
 
+function onDteChange(){
+  currentDte = document.getElementById('dte-select').value;
+  loadAll();
+}
+
+function onSrcChange(){
+  currentSource = document.getElementById('src-select').value;
+  if(lastData){
+    renderHero(lastData);
+    renderLevels(lastData);
+    updateChartOverlay(lastData);
+  }
+}
+
 function switchTF(tf){
   if(tf === currentTF) return;
   currentTF = tf;
@@ -260,7 +299,7 @@ function switchTF(tf){
 async function loadAll(){
   try{
     const [dataResp, outlookResp, macroResp, analysisResp] = await Promise.all([
-      fetch(`/api/data?ticker=${currentTicker}&dte=3&min_dte=0`),
+      fetch(`/api/data?ticker=${currentTicker}&dte=${currentDte.split('-').map(Number).pop()}&min_dte=${currentDte.split('-').map(Number)[0]}`),
       fetch(`/api/outlook?ticker=${currentTicker}`),
       fetch(`/api/macro-regime?ticker=${currentTicker}`),
       fetch(`/api/analysis?ticker=${currentTicker}`)
@@ -315,11 +354,16 @@ async function pollAnalysis(){
   }catch(e){}
 }
 
-// ── Resolve Levels (combined > IBIT-only) ──
+// ── Resolve Levels (respects source toggle) ──
 function resolveLevels(data){
   const bps = data.btc_per_share;
   let cw, pw, gf, mp, support=[], resistance=[], regime, deltaFlips=[];
-  if(data.deribit_available && data.combined_levels_btc){
+
+  if(currentSource === 'deribit' && data.deribit_available && data.deribit_levels_btc){
+    const dl = data.deribit_levels_btc;
+    cw=dl.call_wall; pw=dl.put_wall; gf=dl.gamma_flip; mp=dl.max_pain;
+    regime=dl.regime; support=dl.support||[]; resistance=dl.resistance||[];
+  } else if(currentSource === 'all' && data.deribit_available && data.combined_levels_btc){
     const cl = data.combined_levels_btc;
     cw=cl.call_wall; pw=cl.put_wall; gf=cl.gamma_flip; mp=cl.max_pain;
     regime=cl.regime; support=cl.support||[]; resistance=cl.resistance||[];
@@ -364,6 +408,16 @@ function renderHero(data){
   }
 
   document.getElementById('hero-badges').innerHTML = badges;
+
+  // Hide SRC selector when Deribit unavailable
+  const srcSelect = document.getElementById('src-select');
+  if(data.deribit_available){
+    srcSelect.style.display = '';
+    srcSelect.previousElementSibling.style.display = '';
+  } else {
+    srcSelect.style.display = 'none';
+    srcSelect.previousElementSibling.style.display = 'none';
+  }
 
   // Start/restart WebSocket for live price
   startCryptoWs(currentTF, TICKER_WS[currentTicker] || 'btcusdt');
@@ -544,8 +598,9 @@ function renderAnalysis(analysis){
     html += `<div class="ai-ts">Updated ${esc(analysis._timestamp)}${analysis._btc_price ? ' · BTC ' + fB(analysis._btc_price) : ''}</div>`;
   }
 
-  // Show 0-3d analysis by default
-  const dteTxt = analysis['0-3d'];
+  // Show analysis for selected DTE window
+  const dteKey = currentDte + 'd';
+  const dteTxt = analysis[dteKey];
   if(dteTxt){
     html += `<div class="ai-content">${formatAiText(dteTxt)}</div>`;
   }
