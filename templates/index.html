@@ -234,6 +234,48 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
 .ai-content strong{color:var(--t1);font-weight:600}
 .ai-empty{color:var(--t3);font-size:10px;font-style:italic}
 
+/* AI MODAL */
+.ai-modal-overlay{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+.ai-modal-overlay.hidden{display:none}
+.ai-modal{background:var(--bg2);border:1px solid var(--border2);border-radius:6px;width:min(720px,90vw);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+.ai-modal-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+.ai-modal-header .sec-title{margin-bottom:0;font-size:12px}
+.ai-modal-close{background:none;border:none;color:var(--t3);font-size:18px;cursor:pointer;padding:0 4px;line-height:1;font-family:var(--mono)}
+.ai-modal-close:hover{color:var(--t1)}
+.ai-modal-body{padding:14px;overflow-y:auto;font-size:13px;line-height:1.7;color:var(--t2);white-space:pre-wrap;word-wrap:break-word;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.ai-modal-body::-webkit-scrollbar{width:4px}
+.ai-modal-body::-webkit-scrollbar-track{background:transparent}
+.ai-modal-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+.ai-modal-body strong{color:var(--t1);font-weight:600}
+.ai-modal-body .ai-modal-section{background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:12px 14px;margin-bottom:10px}
+.ai-modal-body .ai-modal-section:last-child{margin-bottom:0}
+.ai-modal-body .ai-modal-section-label{font-size:10px;font-weight:600;color:var(--blue);margin-bottom:6px;letter-spacing:.4px}
+
+/* SIDEBAR MODAL */
+.sidebar-modal-overlay{position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(2px)}
+.sidebar-modal-overlay.hidden{display:none}
+.sidebar-modal{background:var(--bg2);border:1px solid var(--border2);border-radius:6px;width:min(720px,90vw);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+.sidebar-modal-header{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);flex-shrink:0}
+.sidebar-modal-header .sec-title{margin-bottom:0;font-size:12px}
+.sidebar-modal-body{padding:14px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.sidebar-modal-body::-webkit-scrollbar{width:4px}
+.sidebar-modal-body::-webkit-scrollbar-track{background:transparent}
+.sidebar-modal-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+.sidebar-modal-body .sec{margin-bottom:10px;padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-radius:4px}
+.sidebar-modal-body .sec:last-child{margin-bottom:0}
+.sidebar-modal-body .sec-title{font-size:11px}
+.sidebar-modal-body .kl-row{font-size:12px;padding:4px 0}
+.sidebar-modal-body .kl-btc{font-size:13px}
+.sidebar-modal-body .sl-row{padding:6px 0}
+.sidebar-modal-body .sl-price{font-size:12px}
+.sidebar-modal-body .sl-beh{font-size:11px}
+.sidebar-modal-body .ds-row{font-size:11px;padding:3px 0}
+.sidebar-modal-body .ff-row{font-size:11px}
+.sidebar-modal-body .bo-sig{font-size:11px}
+.sidebar-modal-body .hist-row{font-size:11px}
+.sidebar-modal-body .regime-banner{font-size:11px}
+.sidebar-modal-body .em-bar{font-size:11px}
+
 /* RESPONSIVE */
 @media(max-width:1400px){
   .grid{grid-template-columns:1fr 1fr 300px;grid-template-rows:1fr 1fr 1fr auto}
@@ -448,9 +490,11 @@ body{font-family:var(--mono);background:var(--bg);color:var(--t1);font-size:11px
     <div class="cell-label">ETF Flows</div>
     <canvas id="flow-chart"></canvas>
   </div>
-  <div class="right" id="sidebar"></div>
+  <div class="right" id="sidebar" onclick="openSidebarModal()" style="cursor:pointer"></div>
   <div class="ai-panel" id="ai-panel"></div>
 </div>
+<div id="ai-modal" class="ai-modal-overlay hidden"></div>
+<div id="sidebar-modal" class="sidebar-modal-overlay hidden"></div>
 
 <script>
 let gexChart=null,oiChart=null,flowChart=null,deltaChart=null,tvChart=null,tvSeries=null,priceLines=[],outlookChart=null,structureChart=null;
@@ -1169,6 +1213,9 @@ function renderSidebar(data){
   }
 
   document.getElementById('sidebar').innerHTML=h;
+  // Sync sidebar modal if open
+  const sModal=document.getElementById('sidebar-modal');
+  if(sModal&&!sModal.classList.contains('hidden'))openSidebarModal();
 }
 
 let expiryList=[];
@@ -1519,6 +1566,7 @@ function renderAiPanel(){
     h+=`<button class="ai-btn" id="ai-analyze-btn" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
   }
   h+=`<button class="ai-btn" id="ai-copy-data-btn" onclick="copyAnalysisData()" title="Copy raw data to clipboard">DATA</button>`;
+  h+=`<button class="ai-btn" onclick="openAiModal()" title="Expand analysis">\u26F6</button>`;
   h+=`</div></div>`;
   if(aiData&&aiData._timestamp){
     h+=`<div style="font-size:9px;color:var(--t3);margin-bottom:4px">Updated ${esc(aiData._timestamp)}${aiData._btc_price?' · BTC '+fB(aiData._btc_price):''}</div>`;
@@ -1526,12 +1574,66 @@ function renderAiPanel(){
   if(aiData){
     const dteTxt=aiData[aiDte];
     const allTxt=aiData['all'];
-    if(dteTxt){h+=`<div class="ai-content">${formatAiText(dteTxt)}</div>`}
-    if(allTxt){h+=`<div class="ai-content" style="margin-top:6px;border-left:2px solid var(--blue)"><div style="font-size:9px;font-weight:600;color:var(--blue);margin-bottom:4px;letter-spacing:.4px">CROSS-TIMEFRAME</div>${formatAiText(allTxt)}</div>`}
+    if(dteTxt){h+=`<div class="ai-content" onclick="openAiModal()" style="cursor:pointer">${formatAiText(dteTxt)}</div>`}
+    if(allTxt){h+=`<div class="ai-content" onclick="openAiModal()" style="cursor:pointer;margin-top:6px;border-left:2px solid var(--blue)"><div style="font-size:9px;font-weight:600;color:var(--blue);margin-bottom:4px;letter-spacing:.4px">CROSS-TIMEFRAME</div>${formatAiText(allTxt)}</div>`}
   }else{
     h+=`<div class="ai-content"><div class="ai-loading"><div class="spin"></div>Waiting for analysis...</div></div>`;
   }
   panel.innerHTML=h;
+  // Sync modal if open
+  const modal=document.getElementById('ai-modal');
+  if(modal&&!modal.classList.contains('hidden'))openAiModal();
+}
+
+function openAiModal(){
+  const modal=document.getElementById('ai-modal');
+  if(!modal||!aiData)return;
+  const aiDte=document.getElementById('dte-select').value+'d';
+  const dteTxt=aiData[aiDte];
+  const allTxt=aiData['all'];
+  let h='<div class="ai-modal"><div class="ai-modal-header">';
+  h+=`<div class="sec-title"><span class="dot" style="background:var(--blue)"></span>AI Analysis${aiUnsaved?'<span class="ai-unsaved">UNSAVED</span>':''}</div>`;
+  h+=`<div style="display:flex;align-items:center;gap:6px">`;
+  if(adminKey){
+    if(aiUnsaved)h+=`<button class="ai-btn ai-btn-save" id="ai-save-btn-modal" onclick="saveAnalysis()" title="Save analysis">SAVE</button>`;
+    h+=`<button class="ai-btn" id="ai-analyze-btn-modal" onclick="runAnalysis()" title="Re-run analysis">&#x21bb;</button>`;
+  }
+  h+=`<button class="ai-btn" id="ai-copy-data-btn-modal" onclick="copyAnalysisData()" title="Copy raw data">DATA</button>`;
+  h+=`<button class="ai-modal-close" onclick="closeAiModal()" title="Close">&times;</button>`;
+  h+=`</div></div>`;
+  h+=`<div class="ai-modal-body">`;
+  if(aiData._timestamp){
+    h+=`<div style="font-size:10px;color:var(--t3);margin-bottom:8px">Updated ${esc(aiData._timestamp)}${aiData._btc_price?' · BTC '+fB(aiData._btc_price):''}</div>`;
+  }
+  if(dteTxt){h+=`<div class="ai-modal-section">${formatAiText(dteTxt)}</div>`}
+  if(allTxt){h+=`<div class="ai-modal-section" style="border-left:2px solid var(--blue)"><div class="ai-modal-section-label">CROSS-TIMEFRAME</div>${formatAiText(allTxt)}</div>`}
+  h+=`</div></div>`;
+  modal.innerHTML=h;
+  modal.classList.remove('hidden');
+}
+
+function closeAiModal(){
+  const modal=document.getElementById('ai-modal');
+  if(modal)modal.classList.add('hidden');
+}
+
+function openSidebarModal(){
+  const modal=document.getElementById('sidebar-modal');
+  const sidebar=document.getElementById('sidebar');
+  if(!modal||!sidebar||!sidebar.innerHTML)return;
+  let h='<div class="sidebar-modal"><div class="sidebar-modal-header">';
+  h+=`<div class="sec-title"><span class="dot" style="background:var(--blue)"></span>Positioning Data</div>`;
+  h+=`<button class="ai-modal-close" onclick="closeSidebarModal()" title="Close">&times;</button>`;
+  h+=`</div><div class="sidebar-modal-body">`;
+  h+=sidebar.innerHTML;
+  h+=`</div></div>`;
+  modal.innerHTML=h;
+  modal.classList.remove('hidden');
+}
+
+function closeSidebarModal(){
+  const modal=document.getElementById('sidebar-modal');
+  if(modal)modal.classList.add('hidden');
 }
 
 function formatAiText(text){
@@ -1556,7 +1658,7 @@ async function loadAnalysis(){
 }
 
 async function runAnalysis(){
-  const btn=document.getElementById('ai-analyze-btn');
+  const btn=document.getElementById('ai-analyze-btn')||document.getElementById('ai-analyze-btn-modal');
   if(!btn)return;
   btn.disabled=true;
   btn.innerHTML='<div class="spin" style="width:10px;height:10px;display:inline-block;vertical-align:middle;border-width:1.5px"></div>';
@@ -1569,13 +1671,13 @@ async function runAnalysis(){
     renderAiPanel();
   }catch(e){
     console.error('Analysis error:',e);
-    const b2=document.getElementById('ai-analyze-btn');
+    const b2=document.getElementById('ai-analyze-btn')||document.getElementById('ai-analyze-btn-modal');
     if(b2){b2.disabled=false;b2.innerHTML='&#x21bb;'}
   }
 }
 
 async function copyAnalysisData(){
-  const btn=document.getElementById('ai-copy-data-btn');
+  const btn=document.getElementById('ai-copy-data-btn')||document.getElementById('ai-copy-data-btn-modal');
   if(!btn)return;
   btn.disabled=true;
   btn.textContent='...';
@@ -1608,7 +1710,7 @@ async function copyAnalysisData(){
 
 async function saveAnalysis(){
   if(!aiData)return;
-  const btn=document.getElementById('ai-save-btn');
+  const btn=document.getElementById('ai-save-btn')||document.getElementById('ai-save-btn-modal');
   if(btn){btn.disabled=true;btn.textContent='...';}
   try{
     const resp=await fetch(`/api/analysis/save?ticker=${currentTicker}`,{method:'POST',headers:{...adminHeaders(),'Content-Type':'application/json'},body:JSON.stringify(aiData)});
@@ -2582,6 +2684,10 @@ loadData();
 loadExpiryOptions();
 loadAnalysis();
 loadSnapshotDates();
+// Modal dismiss: backdrop click + Escape
+document.getElementById('ai-modal').addEventListener('click',function(e){if(e.target===this)closeAiModal()});
+document.getElementById('sidebar-modal').addEventListener('click',function(e){if(e.target===this)closeSidebarModal()});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){const a=document.getElementById('ai-modal');if(a&&!a.classList.contains('hidden')){closeAiModal();return}const s=document.getElementById('sidebar-modal');if(s&&!s.classList.contains('hidden'))closeSidebarModal()}});
 async function loadMacro(){
   try{
     const r=await fetch(`/api/macro-regime?ticker=${currentTicker}`);
