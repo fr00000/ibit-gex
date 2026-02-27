@@ -1537,8 +1537,8 @@ async function loadData(){
 
     if(isExpiryMode){
       // --- EXPIRY MODE ---
-      // Clear dealer delta chart (profile not computed per-expiry)
-      if(deltaChart){deltaChart.destroy();deltaChart=null}
+      // Render dealer delta if profile available from enriched expiry data
+      try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
 
       // Hide GEX per-expiry filter (redundant in expiry mode)
       const expFilter=document.getElementById('expiry-filter');
