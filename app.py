@@ -2892,6 +2892,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                         'call_vanna': 0, 'put_vanna': 0,
                         'call_charm': 0, 'put_charm': 0,
                         'call_volume': 0, 'put_volume': 0,
+                        'call_iv_sum': 0, 'call_iv_oi': 0,
+                        'put_iv_sum': 0, 'put_iv_oi': 0,
                         'dte': dte_days,
                     }
                 esd[strike][f'{opt_type}_oi'] += oi
@@ -2900,6 +2902,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 esd[strike][f'{opt_type}_vanna'] += dealer_vanna
                 esd[strike][f'{opt_type}_charm'] += dealer_charm
                 esd[strike][f'{opt_type}_volume'] += vol
+                esd[strike][f'{opt_type}_iv_sum'] += iv * oi
+                esd[strike][f'{opt_type}_iv_oi'] += oi
 
     # Compute ATM IV per expiry for term structure
     iv_term_structure = []
@@ -3045,6 +3049,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                             'call_delta': 0, 'put_delta': 0,
                             'call_vanna': 0, 'put_vanna': 0,
                             'call_charm': 0, 'put_charm': 0,
+                            'call_iv_sum': 0, 'call_iv_oi': 0,
+                            'put_iv_sum': 0, 'put_iv_oi': 0,
                             'dte': int(opt['dte']),
                         }
                     desd[strike_btc][f'{opt_type}_oi'] += oi
@@ -3052,6 +3058,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
                     desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
                     desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
+                    desd[strike_btc][f'{opt_type}_iv_sum'] += iv * oi
+                    desd[strike_btc][f'{opt_type}_iv_oi'] += oi
 
                     # Collect IV for term structure
                     if deribit_exp_str not in deribit_iv_data:
@@ -3359,11 +3367,21 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                 d_call_gex = db_entry['call_gex'] if db_entry else 0
                 d_put_gex = db_entry['put_gex'] if db_entry else 0
 
+                # Blended OI-weighted IV from both venues
+                c_iv_sum = (ib.get('call_iv_sum', 0) if ib else 0) + (db_entry.get('call_iv_sum', 0) if db_entry else 0)
+                c_iv_oi = (ib.get('call_iv_oi', 0) if ib else 0) + (db_entry.get('call_iv_oi', 0) if db_entry else 0)
+                p_iv_sum = (ib.get('put_iv_sum', 0) if ib else 0) + (db_entry.get('put_iv_sum', 0) if db_entry else 0)
+                p_iv_oi = (ib.get('put_iv_oi', 0) if ib else 0) + (db_entry.get('put_iv_oi', 0) if db_entry else 0)
+
                 strike_rows.append({
                     'strike': ibit_strike,
                     'btc': float(btc_p),
                     'call_oi': (ib['call_oi'] if ib else 0) + (db_entry['call_oi'] if db_entry else 0),
                     'put_oi': (ib['put_oi'] if ib else 0) + (db_entry['put_oi'] if db_entry else 0),
+                    'ibit_call_oi': ib['call_oi'] if ib else 0,
+                    'ibit_put_oi': ib['put_oi'] if ib else 0,
+                    'deribit_call_oi': db_entry['call_oi'] if db_entry else 0,
+                    'deribit_put_oi': db_entry['put_oi'] if db_entry else 0,
                     'call_gex': round(i_call_gex + d_call_gex, 2),
                     'put_gex': round(i_put_gex + d_put_gex, 2),
                     'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
@@ -3380,8 +3398,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                         (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
                     'call_volume': ib['call_volume'] if ib else 0,
                     'put_volume': ib['put_volume'] if ib else 0,
-                    'call_iv': round(ib['call_iv_sum'] / ib['call_iv_oi'], 4) if ib and ib.get('call_iv_oi', 0) > 0 else 0,
-                    'put_iv': round(ib['put_iv_sum'] / ib['put_iv_oi'], 4) if ib and ib.get('put_iv_oi', 0) > 0 else 0,
+                    'call_iv': round(c_iv_sum / c_iv_oi, 4) if c_iv_oi > 0 else 0,
+                    'put_iv': round(p_iv_sum / p_iv_oi, 4) if p_iv_oi > 0 else 0,
                 })
 
             # Compute per-expiry levels
@@ -5022,10 +5040,13 @@ def api_expiry_data():
     strike_agg = {}
     included_expiries = []
     first_blob = json.loads(rows[0][0])
+    repricing_rows = []  # (strike_btc, T, call_iv, put_iv, ibit_c_oi, ibit_p_oi, deri_c_oi, deri_p_oi)
 
     for row in rows:
         d = json.loads(row[0])
         included_expiries.append(d['expiry_date'])
+        dte_val = d.get('dte', 1)
+        T_exp = max(dte_val / 365.0, 0.5 / 365)
         for s in d['strikes']:
             btc = round(s['btc'])
             if btc not in strike_agg:
@@ -5051,6 +5072,21 @@ def api_expiry_data():
             a['call_volume'] += s['call_volume']
             a['put_volume'] += s['put_volume']
             a['total_volume'] += s['call_volume'] + s['put_volume']
+
+            # Collect per-strike data for BS repricing
+            c_iv = s.get('call_iv', 0)
+            p_iv = s.get('put_iv', 0)
+            ibit_c_oi = s.get('ibit_call_oi', 0)
+            ibit_p_oi = s.get('ibit_put_oi', 0)
+            deri_c_oi = s.get('deribit_call_oi', 0)
+            deri_p_oi = s.get('deribit_put_oi', 0)
+            # Old cache fallback: if no venue separation, treat all OI as IBIT
+            if ibit_c_oi == 0 and deri_c_oi == 0 and s.get('call_oi', 0) > 0:
+                ibit_c_oi = s['call_oi']
+            if ibit_p_oi == 0 and deri_p_oi == 0 and s.get('put_oi', 0) > 0:
+                ibit_p_oi = s['put_oi']
+            if c_iv > 0 or p_iv > 0:
+                repricing_rows.append((s['btc'], T_exp, c_iv, p_iv, ibit_c_oi, ibit_p_oi, deri_c_oi, deri_p_oi))
 
     gex_chart = sorted(strike_agg.values(), key=lambda x: x['btc'])
 
@@ -5090,42 +5126,98 @@ def api_expiry_data():
         except Exception as e:
             log.warning(f"[expiry-data] significant_levels failed: {e}")
 
-    # Delta flip points from cumulative dealer delta
+    # Dealer delta profile via BS re-pricing (same approach as compute_dealer_delta_scenarios)
+    dealer_delta_profile = []
     delta_flip_points = []
-    if not level_df.empty:
+    if repricing_rows and spot_btc > 0 and levels_btc:
         try:
-            sorted_df = level_df.sort_values('strike')
-            cum_dd = sorted_df['net_dealer_delta'].cumsum()
-            for i in range(len(cum_dd) - 1):
-                d1, d2 = cum_dd.iloc[i], cum_dd.iloc[i+1]
-                s1, s2 = sorted_df.iloc[i]['strike'], sorted_df.iloc[i+1]['strike']
+            btc_per_share = first_blob.get('btc_per_share', 0.000568)
+            rfr = 0.05
+
+            # Build price grid in BTC terms
+            cw = levels_btc.get('call_wall', spot_btc * 1.05)
+            pw = levels_btc.get('put_wall', spot_btc * 0.95)
+            grid_prices = set()
+            grid_prices.update([cw, pw, spot_btc])
+            gf = levels_btc.get('gamma_flip')
+            if gf:
+                grid_prices.add(gf)
+
+            step = spot_btc * 0.005
+            if step > 0:
+                p = pw
+                while p <= cw:
+                    grid_prices.add(p)
+                    p += step
+                p = pw * 0.98
+                while p <= cw * 1.02:
+                    grid_prices.add(p)
+                    p += step
+
+            lo_bound = spot_btc * 0.85
+            hi_bound = spot_btc * 1.15
+            grid_prices = sorted([p for p in grid_prices if lo_bound <= p <= hi_bound])
+            if len(grid_prices) > 80:
+                indices = np.linspace(0, len(grid_prices) - 1, 80, dtype=int)
+                grid_prices = [grid_prices[i] for i in indices]
+                if spot_btc not in grid_prices:
+                    grid_prices.append(spot_btc)
+                    grid_prices.sort()
+
+            # Re-price dealer delta at each grid point
+            for S_hyp in grid_prices:
+                net_dd = 0.0
+                call_dd = 0.0
+                put_dd = 0.0
+                for (strike_btc, T, c_iv, p_iv, ib_c_oi, ib_p_oi, dr_c_oi, dr_p_oi) in repricing_rows:
+                    if strike_btc < lo_bound or strike_btc > hi_bound:
+                        continue
+                    # Call side
+                    if c_iv > 0 and (ib_c_oi > 0 or dr_c_oi > 0):
+                        delta = bs_delta(S_hyp, strike_btc, T, rfr, c_iv, 'call')
+                        if ib_c_oi > 0:
+                            dd = -delta * ib_c_oi * 100 * btc_per_share * S_hyp
+                            net_dd += dd
+                            call_dd += dd
+                        if dr_c_oi > 0:
+                            dd = -delta * dr_c_oi * 1 * S_hyp
+                            net_dd += dd
+                            call_dd += dd
+                    # Put side
+                    if p_iv > 0 and (ib_p_oi > 0 or dr_p_oi > 0):
+                        delta = bs_delta(S_hyp, strike_btc, T, rfr, p_iv, 'put')
+                        if ib_p_oi > 0:
+                            dd = -delta * ib_p_oi * 100 * btc_per_share * S_hyp
+                            net_dd += dd
+                            put_dd += dd
+                        if dr_p_oi > 0:
+                            dd = -delta * dr_p_oi * 1 * S_hyp
+                            net_dd += dd
+                            put_dd += dd
+                dealer_delta_profile.append({
+                    'price_btc': float(S_hyp),
+                    'price_ibit': float(S_hyp * btc_per_share),
+                    'net_dealer_delta': float(net_dd),
+                    'call_dealer_delta': float(call_dd),
+                    'put_dealer_delta': float(put_dd),
+                })
+
+            # Delta flip detection from profile
+            for i in range(len(dealer_delta_profile) - 1):
+                d1 = dealer_delta_profile[i]['net_dealer_delta']
+                d2 = dealer_delta_profile[i + 1]['net_dealer_delta']
+                p1_btc = dealer_delta_profile[i]['price_btc']
+                p2_btc = dealer_delta_profile[i + 1]['price_btc']
                 if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
                     if (d2 - d1) != 0:
-                        flip = s1 + (s2 - s1) * (-d1) / (d2 - d1)
+                        flip = p1_btc + (p2_btc - p1_btc) * (-d1) / (d2 - d1)
                         delta_flip_points.append({
                             'price_btc': round(float(flip)),
-                            'price_ibit': round(float(flip * first_blob.get('btc_per_share', 0.000568)), 2),
+                            'price_ibit': round(float(flip * btc_per_share), 2),
                         })
-            # Keep only the flip nearest to spot
             if delta_flip_points:
                 delta_flip_points.sort(key=lambda x: abs(x['price_btc'] - spot_btc))
                 delta_flip_points = delta_flip_points[:2]
-        except Exception as e:
-            log.warning(f"[expiry-data] delta_flip failed: {e}")
-
-    # Dealer delta profile from stored per-strike data
-    dealer_delta_profile = []
-    if not level_df.empty:
-        try:
-            sorted_df = level_df.sort_values('strike')
-            cum_dd = 0.0
-            for _, row in sorted_df.iterrows():
-                cum_dd += row['net_dealer_delta']
-                dealer_delta_profile.append({
-                    'price_btc': float(row['strike']),
-                    'price_ibit': float(row['strike'] * first_blob.get('btc_per_share', 0.000568)),
-                    'net_dealer_delta': float(cum_dd),
-                })
         except Exception as e:
             log.warning(f"[expiry-data] dealer_delta_profile failed: {e}")
 
