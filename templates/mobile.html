@@ -165,6 +165,18 @@ select,input,textarea{font-size:16px}
   <div class="hero-badges" id="hero-badges"></div>
 </div>
 
+<!-- PRICE CHART -->
+<div class="card" id="chart-card">
+  <div class="card-title green">Price Chart</div>
+  <div class="tf-btns" id="tf-btns">
+    <button class="tf-btn" data-tf="15m" onclick="switchTF('15m')">15m</button>
+    <button class="tf-btn active" data-tf="1h" onclick="switchTF('1h')">1h</button>
+    <button class="tf-btn" data-tf="4h" onclick="switchTF('4h')">4h</button>
+    <button class="tf-btn" data-tf="1d" onclick="switchTF('1d')">1d</button>
+  </div>
+  <div class="chart-wrap"><div id="tv-chart"></div></div>
+</div>
+
 <!-- KEY LEVELS -->
 <div class="card" id="levels-card">
   <div class="card-title blue">Key Levels</div>
@@ -190,18 +202,6 @@ select,input,textarea{font-size:16px}
 <div class="card" id="ai-card">
   <div class="card-title blue">AI Analysis</div>
   <div id="ai-body"><div class="ai-spinner"><div class="spin"></div>Waiting for analysis...</div></div>
-</div>
-
-<!-- PRICE CHART -->
-<div class="card" id="chart-card">
-  <div class="card-title green">Price Chart</div>
-  <div class="tf-btns" id="tf-btns">
-    <button class="tf-btn" data-tf="15m" onclick="switchTF('15m')">15m</button>
-    <button class="tf-btn active" data-tf="1h" onclick="switchTF('1h')">1h</button>
-    <button class="tf-btn" data-tf="4h" onclick="switchTF('4h')">4h</button>
-    <button class="tf-btn" data-tf="1d" onclick="switchTF('1d')">1d</button>
-  </div>
-  <div class="chart-wrap"><div id="tv-chart"></div></div>
 </div>
 
 </div><!-- .content -->
