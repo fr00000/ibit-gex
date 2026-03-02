@@ -179,6 +179,44 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
     return charm
 
 
+def compute_atm_iv(iv_entries, reference_price):
+    """Compute OI-weighted ATM IV from a list of IV entries.
+
+    Each entry: {'strike': float, 'iv': float, 'oi': int, 'opt_type': str, ...}
+    reference_price: spot or underlying price to define 'ATM' (within 2%).
+
+    Returns dict with atm_iv, call_iv, put_iv, num_entries, or None if insufficient data.
+    """
+    if not iv_entries:
+        return None
+
+    atm_entries = [e for e in iv_entries if abs(e['strike'] - reference_price) / reference_price < 0.02]
+    if not atm_entries:
+        sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - reference_price))
+        atm_entries = sorted_by_dist[:2]
+    if not atm_entries:
+        return None
+
+    total_oi = sum(e['oi'] for e in atm_entries)
+    if total_oi <= 0:
+        return None
+
+    atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+
+    atm_calls = [e for e in atm_entries if e['opt_type'] == 'call']
+    atm_puts = [e for e in atm_entries if e['opt_type'] == 'put']
+    call_oi_sum = sum(e['oi'] for e in atm_calls)
+    put_oi_sum = sum(e['oi'] for e in atm_puts)
+    call_iv = sum(e['iv'] * e['oi'] for e in atm_calls) / call_oi_sum if atm_calls and call_oi_sum > 0 else None
+    put_iv = sum(e['iv'] * e['oi'] for e in atm_puts) / put_oi_sum if atm_puts and put_oi_sum > 0 else None
+
+    return {
+        'atm_iv': round(atm_iv, 4),
+        'call_iv': round(call_iv, 4) if call_iv else None,
+        'put_iv': round(put_iv, 4) if put_iv else None,
+        'num_entries': len(atm_entries),
+    }
+
 
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
@@ -2925,33 +2963,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             continue
         dte_val = iv_entries[0]['dte']
 
-        # ATM options: within 2% of spot
-        atm_entries = [e for e in iv_entries if abs(e['strike'] - spot) / spot < 0.02]
-        if not atm_entries:
-            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - spot))
-            atm_entries = sorted_by_dist[:2]
-        if not atm_entries:
+        result = compute_atm_iv(iv_entries, spot)
+        if not result:
             continue
-
-        total_oi = sum(e['oi'] for e in atm_entries)
-        if total_oi <= 0:
-            continue
-        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
-
-        atm_calls = [e for e in atm_entries if e['opt_type'] == 'call']
-        atm_puts = [e for e in atm_entries if e['opt_type'] == 'put']
-        call_oi_sum = sum(e['oi'] for e in atm_calls)
-        put_oi_sum = sum(e['oi'] for e in atm_puts)
-        call_iv = sum(e['iv'] * e['oi'] for e in atm_calls) / call_oi_sum if atm_calls and call_oi_sum > 0 else None
-        put_iv = sum(e['iv'] * e['oi'] for e in atm_puts) / put_oi_sum if atm_puts and put_oi_sum > 0 else None
 
         iv_term_structure.append({
             'expiry': exp_str,
             'dte': dte_val,
-            'atm_iv': round(atm_iv, 4),
-            'call_iv': round(call_iv, 4) if call_iv else None,
-            'put_iv': round(put_iv, 4) if put_iv else None,
-            'num_atm_options': len(atm_entries),
+            'atm_iv': result['atm_iv'],
+            'call_iv': result['call_iv'],
+            'put_iv': result['put_iv'],
+            'num_atm_options': result['num_entries'],
             'source': 'ibit',
         })
 
@@ -3091,20 +3113,14 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             continue
         dte_val = iv_entries[0]['dte']
         underlying = iv_entries[0]['underlying']
-        atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
-        if not atm_entries:
-            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
-            atm_entries = sorted_by_dist[:2]
-        if not atm_entries:
+        result = compute_atm_iv(iv_entries, underlying)
+        if not result:
             continue
-        total_oi = sum(e['oi'] for e in atm_entries)
-        if total_oi <= 0:
-            continue
-        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+
         iv_term_structure.append({
             'expiry': exp_str,
             'dte': round(dte_val, 1),
-            'atm_iv': round(atm_iv, 4),
+            'atm_iv': result['atm_iv'],
             'source': 'deribit',
         })
 
@@ -4386,19 +4402,13 @@ def _refresh_deribit_only(ticker):
                     continue
                 dte_val = iv_entries[0]['dte']
                 underlying = iv_entries[0]['underlying']
-                atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
-                if not atm_entries:
-                    sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
-                    atm_entries = sorted_by_dist[:2]
-                if not atm_entries:
+                result = compute_atm_iv(iv_entries, underlying)
+                if not result:
                     continue
-                total_oi = sum(e['oi'] for e in atm_entries)
-                if total_oi <= 0:
-                    continue
-                atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+
                 deribit_iv_term.append({
                     'expiry': exp_str, 'dte': round(dte_val, 1),
-                    'atm_iv': round(atm_iv, 4), 'source': 'deribit',
+                    'atm_iv': result['atm_iv'], 'source': 'deribit',
                 })
 
             # Build lookup: BTC strike -> net_gex
