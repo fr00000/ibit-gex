@@ -244,6 +244,102 @@ def compute_deribit_iv_term(iv_data):
     return term
 
 
+def process_deribit_options(options, rfr, full_greeks=False):
+    """Process raw Deribit options into strike-level aggregations.
+
+    Args:
+        options: list of dicts from fetch_deribit_options()
+        rfr: risk-free rate
+        full_greeks: if True, compute delta/vanna/charm and per-expiry strike data
+                     (weekday path). If False, compute only GEX + OI (weekend overlay).
+
+    Returns:
+        strike_data: {strike_btc: {call_gex, put_gex, call_oi, put_oi, ...}}
+        iv_data: {exp_str: [{strike, iv, oi, opt_type, dte, underlying}, ...]}
+        total_oi_btc: sum of all OI in BTC contracts
+        expiry_strike_data: {exp_str: {strike_btc: {...}}} (empty dict when full_greeks=False)
+    """
+    strike_data = {}
+    iv_data = {}
+    expiry_strike_data = {}
+    total_oi_btc = 0
+
+    for opt in options:
+        strike_btc = opt['strike']
+        oi = opt['oi']
+        iv = opt['iv'] / 100.0
+        btc_s = opt['underlying_price']
+        T = max(opt['dte'] / 365.0, 0.5 / 365)
+        opt_type = opt['option_type']
+        sign = 1 if opt_type == 'call' else -1
+
+        gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
+        gex = sign * gamma * oi * btc_s ** 2 * 0.01
+        total_oi_btc += oi
+
+        # Initialize strike entry
+        if strike_btc not in strike_data:
+            fields = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
+            if full_greeks:
+                fields.update({
+                    'call_delta': 0, 'put_delta': 0,
+                    'call_vanna': 0, 'put_vanna': 0,
+                    'call_charm': 0, 'put_charm': 0,
+                })
+            strike_data[strike_btc] = fields
+
+        d_entry = strike_data[strike_btc]
+        d_entry[f'{opt_type}_oi'] += oi
+        d_entry[f'{opt_type}_gex'] += gex
+
+        if full_greeks:
+            delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
+            vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
+            charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
+            dealer_delta = -delta * oi * btc_s
+            dealer_vanna = -vanna * oi * btc_s * 0.01
+            dealer_charm = -charm * oi / 365.0 * btc_s
+            d_entry[f'{opt_type}_delta'] += dealer_delta
+            d_entry[f'{opt_type}_vanna'] += dealer_vanna
+            d_entry[f'{opt_type}_charm'] += dealer_charm
+
+            # Per-expiry strike data (for expiry cache)
+            exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+            if exp_str not in expiry_strike_data:
+                expiry_strike_data[exp_str] = {}
+            desd = expiry_strike_data[exp_str]
+            if strike_btc not in desd:
+                desd[strike_btc] = {
+                    'call_oi': 0, 'put_oi': 0,
+                    'call_gex': 0, 'put_gex': 0,
+                    'call_delta': 0, 'put_delta': 0,
+                    'call_vanna': 0, 'put_vanna': 0,
+                    'call_charm': 0, 'put_charm': 0,
+                    'call_iv_sum': 0, 'call_iv_oi': 0,
+                    'put_iv_sum': 0, 'put_iv_oi': 0,
+                    'dte': int(opt['dte']),
+                }
+            desd[strike_btc][f'{opt_type}_oi'] += oi
+            desd[strike_btc][f'{opt_type}_gex'] += gex
+            desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
+            desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
+            desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
+            desd[strike_btc][f'{opt_type}_iv_sum'] += iv * oi
+            desd[strike_btc][f'{opt_type}_iv_oi'] += oi
+
+        # Collect IV for term structure
+        exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+        if exp_str not in iv_data:
+            iv_data[exp_str] = []
+        iv_data[exp_str].append({
+            'strike': strike_btc, 'iv': iv,
+            'oi': oi, 'opt_type': opt_type,
+            'dte': opt['dte'], 'underlying': btc_s,
+        })
+
+    return strike_data, iv_data, total_oi_btc, expiry_strike_data
+
+
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
@@ -3053,8 +3149,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Deribit options integration
     deribit_available = False
     deribit_strike_data = {}
-    deribit_expiry_strike_data = {}  # exp_str -> {strike_btc -> {call_oi, ...}}
-    deribit_iv_data = {}   # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
+    deribit_expiry_strike_data = {}
+    deribit_iv_data = {}
     deribit_oi_btc = 0
     deribit_options = []
     deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
@@ -3063,73 +3159,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             deribit_options = fetch_deribit_options(min_dte, max_dte, currency=deribit_currency)
             if deribit_options:
                 deribit_available = True
-                for opt in deribit_options:
-                    strike_btc = opt['strike']
-                    oi = opt['oi']
-                    iv = opt['iv'] / 100.0  # Deribit gives IV as percentage
-                    btc_s = opt['underlying_price']
-                    T = max(opt['dte'] / 365.0, 0.5 / 365)
-                    opt_type = opt['option_type']
-                    sign = 1 if opt_type == 'call' else -1
-
-                    gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
-                    delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
-                    vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
-                    charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
-
-                    # Contract multiplier = 1 BTC (not 100 shares)
-                    gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
-                    dealer_delta = -delta * oi * 1 * btc_s  # dollar notional
-                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
-                    dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
-
-                    deribit_oi_btc += oi
-
-                    if strike_btc not in deribit_strike_data:
-                        deribit_strike_data[strike_btc] = {
-                            'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
-                            'call_delta': 0, 'put_delta': 0,
-                            'call_vanna': 0, 'put_vanna': 0,
-                            'call_charm': 0, 'put_charm': 0,
-                        }
-                    d_entry = deribit_strike_data[strike_btc]
-                    d_entry[f'{opt_type}_oi'] += oi
-                    d_entry[f'{opt_type}_gex'] += gex
-                    d_entry[f'{opt_type}_delta'] += dealer_delta
-                    d_entry[f'{opt_type}_vanna'] += dealer_vanna
-                    d_entry[f'{opt_type}_charm'] += dealer_charm
-
-                    deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
-                    if deribit_exp_str not in deribit_expiry_strike_data:
-                        deribit_expiry_strike_data[deribit_exp_str] = {}
-                    desd = deribit_expiry_strike_data[deribit_exp_str]
-                    if strike_btc not in desd:
-                        desd[strike_btc] = {
-                            'call_oi': 0, 'put_oi': 0,
-                            'call_gex': 0, 'put_gex': 0,
-                            'call_delta': 0, 'put_delta': 0,
-                            'call_vanna': 0, 'put_vanna': 0,
-                            'call_charm': 0, 'put_charm': 0,
-                            'call_iv_sum': 0, 'call_iv_oi': 0,
-                            'put_iv_sum': 0, 'put_iv_oi': 0,
-                            'dte': int(opt['dte']),
-                        }
-                    desd[strike_btc][f'{opt_type}_oi'] += oi
-                    desd[strike_btc][f'{opt_type}_gex'] += gex
-                    desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
-                    desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
-                    desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
-                    desd[strike_btc][f'{opt_type}_iv_sum'] += iv * oi
-                    desd[strike_btc][f'{opt_type}_iv_oi'] += oi
-
-                    # Collect IV for term structure
-                    if deribit_exp_str not in deribit_iv_data:
-                        deribit_iv_data[deribit_exp_str] = []
-                    deribit_iv_data[deribit_exp_str].append({
-                        'strike': strike_btc, 'iv': opt['iv'] / 100.0,
-                        'oi': oi, 'opt_type': opt_type,
-                        'dte': opt['dte'], 'underlying': btc_s,
-                    })
+                deribit_strike_data, deribit_iv_data, deribit_oi_btc, deribit_expiry_strike_data = process_deribit_options(
+                    deribit_options, rfr, full_greeks=True
+                )
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
 
@@ -4375,37 +4407,9 @@ def _refresh_deribit_only(ticker):
             if not deribit_options:
                 continue
 
-            # Process Deribit options (same math as fetch_and_analyze)
-            deribit_strike_data = {}
-            deribit_iv_data = {}  # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
-            deribit_oi_btc = 0
-            for opt in deribit_options:
-                strike_btc = opt['strike']
-                oi = opt['oi']
-                iv = opt['iv'] / 100.0
-                btc_s = opt['underlying_price']
-                T = max(opt['dte'] / 365.0, 0.5 / 365)
-                opt_type = opt['option_type']
-                sign = 1 if opt_type == 'call' else -1
-
-                gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
-                gex = sign * gamma * oi * btc_s ** 2 * 0.01
-                deribit_oi_btc += oi
-
-                if strike_btc not in deribit_strike_data:
-                    deribit_strike_data[strike_btc] = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
-                deribit_strike_data[strike_btc][f'{opt_type}_gex'] += gex
-                deribit_strike_data[strike_btc][f'{opt_type}_oi'] += oi
-
-                # Collect IV for term structure
-                deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
-                if deribit_exp_str not in deribit_iv_data:
-                    deribit_iv_data[deribit_exp_str] = []
-                deribit_iv_data[deribit_exp_str].append({
-                    'strike': strike_btc, 'iv': iv,
-                    'oi': oi, 'opt_type': opt_type,
-                    'dte': opt['dte'], 'underlying': btc_s,
-                })
+            deribit_strike_data, deribit_iv_data, deribit_oi_btc, _ = process_deribit_options(
+                deribit_options, rfr, full_greeks=False
+            )
 
             deribit_iv_term = compute_deribit_iv_term(deribit_iv_data)
 
