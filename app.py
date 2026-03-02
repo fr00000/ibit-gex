@@ -3460,6 +3460,20 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     except Exception as e:
         log.warning(f"[expiry-cache] Failed to store per-expiry data: {e}")
 
+    # Positioning depth metrics (dealer cushion, put density, call overwrite zone)
+    positioning_depth = {}
+    try:
+        levels_btc_for_depth = combined_levels_btc if combined_levels_btc else {
+            k: (v / ref_per_share if isinstance(v, (int, float)) and k not in ('regime', 'pcr') else v)
+            for k, v in levels.items()
+        }
+        positioning_depth = compute_positioning_depth(
+            gex_chart_data, dealer_delta_profile,
+            btc_spot or spot, levels_btc_for_depth
+        )
+    except Exception as e:
+        log.warning(f"[positioning-depth] Failed: {e}")
+
     return {
         'ticker': ticker_symbol,
         'asset_label': cfg['asset_label'] if cfg else ticker_symbol,
@@ -3481,6 +3495,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         'dealer_delta_profile': dealer_delta_profile,
         'dealer_delta_briefing': dealer_delta_briefing,
         'delta_flip_points': delta_flip_points,
+        'positioning_depth': positioning_depth,
         'history': history_data,
         'expirations': selected_exps,
         'expiry_meta': expiry_meta,
@@ -3825,6 +3840,127 @@ def generate_dealer_delta_briefing(scenarios, spot, levels, ref_per_share, is_cr
         'morning_take': morning_take,
         'key_level_deltas': key_level_deltas,
     }
+
+
+def compute_positioning_depth(gex_chart_data, dealer_delta_profile, spot_btc, levels_btc):
+    """Compute positioning depth metrics:
+    1. Dealer delta cushion: how much dealers must buy/sell at -5%, -8%, +5%, +8% from spot
+    2. Put density profile: near-spot (0-5% below) vs far (5-10% below) put OI distribution
+    3. Call overwrite zone: largest call OI concentration above spot
+
+    These quantify the mechanical floor/ceiling structure for the AI analysis."""
+
+    result = {}
+
+    # --- 1. Dealer delta cushion ---
+    if dealer_delta_profile and len(dealer_delta_profile) > 1:
+        # Find dealer delta at spot
+        spot_entry = min(dealer_delta_profile, key=lambda p: abs(p['price_btc'] - spot_btc))
+        dd_at_spot = spot_entry['net_dealer_delta']
+
+        cushion = {'at_spot': round(dd_at_spot)}
+        for pct in [-8, -5, 5, 8]:
+            target = spot_btc * (1 + pct / 100)
+            nearest = min(dealer_delta_profile, key=lambda p: abs(p['price_btc'] - target))
+            dd_at_target = nearest['net_dealer_delta']
+            swing = dd_at_target - dd_at_spot
+            cushion[f"{'down' if pct < 0 else 'up'}_{abs(pct)}pct"] = {
+                'price_btc': round(nearest['price_btc']),
+                'dealer_delta': round(dd_at_target),
+                'swing_from_spot': round(swing),
+            }
+        result['dealer_delta_cushion'] = cushion
+
+    # --- 2. Put density profile ---
+    if gex_chart_data and spot_btc:
+        near_put_oi = 0   # 0-5% below spot
+        far_put_oi = 0    # 5-10% below spot
+        deep_put_oi = 0   # 10%+ below spot
+        above_put_oi = 0  # above spot (ITM puts / synthetic shorts)
+
+        for entry in gex_chart_data:
+            btc = entry.get('btc', 0)
+            put_oi = entry.get('put_oi', 0)
+            if not btc or not put_oi:
+                continue
+            pct_below = (spot_btc - btc) / spot_btc * 100
+            if pct_below < 0:
+                above_put_oi += put_oi
+            elif pct_below <= 5:
+                near_put_oi += put_oi
+            elif pct_below <= 10:
+                far_put_oi += put_oi
+            else:
+                deep_put_oi += put_oi
+
+        total_put = near_put_oi + far_put_oi + deep_put_oi + above_put_oi
+        near_far_ratio = round(near_put_oi / far_put_oi, 2) if far_put_oi > 0 else None
+
+        # Interpretation: high ratio = support clustered near spot (absorbed on dips)
+        # low ratio = OI spread deep (acceleration risk, "cleaned up" near spot)
+        if near_far_ratio is not None:
+            if near_far_ratio > 2.0:
+                structure = 'concentrated_near'
+                description = 'Put OI concentrated near spot — dips likely absorbed by dealer hedging'
+            elif near_far_ratio < 0.5:
+                structure = 'cleaned_up'
+                description = 'Near-spot puts cleaned up — thin cushion, but a slide picks up large hedging flows deeper'
+            else:
+                structure = 'distributed'
+                description = 'Put OI spread across range — gradual dealer hedging on moves down'
+        else:
+            structure = 'minimal'
+            description = 'Minimal put OI below spot'
+
+        result['put_density'] = {
+            'near_0_5pct': near_put_oi,
+            'far_5_10pct': far_put_oi,
+            'deep_10pct_plus': deep_put_oi,
+            'above_spot': above_put_oi,
+            'total': total_put,
+            'near_far_ratio': near_far_ratio,
+            'structure': structure,
+            'description': description,
+        }
+
+    # --- 3. Call overwrite zone ---
+    if gex_chart_data and spot_btc:
+        # Find the strike with highest call OI above spot (likely overwrite zone)
+        above_spot = [e for e in gex_chart_data if e.get('btc', 0) > spot_btc and e.get('call_oi', 0) > 0]
+
+        if above_spot:
+            # Sort by call OI descending, take top 3
+            top_strikes = sorted(above_spot, key=lambda e: e.get('call_oi', 0), reverse=True)[:3]
+            total_call_above = sum(e.get('call_oi', 0) for e in above_spot)
+
+            # Check volume-to-OI ratio for top strike (low ratio = likely overwriting, not speculative)
+            top = top_strikes[0]
+            top_volume = top.get('call_volume', 0)
+            top_oi = top.get('call_oi', 0)
+            vol_oi_ratio = round(top_volume / top_oi, 2) if top_oi > 0 else None
+
+            # Concentration: what % of above-spot call OI is in top 3 strikes
+            top3_oi = sum(s.get('call_oi', 0) for s in top_strikes)
+            concentration = round(top3_oi / total_call_above * 100, 1) if total_call_above > 0 else 0
+
+            result['call_overwrite_zone'] = {
+                'top_strike_btc': round(top.get('btc', 0)),
+                'top_strike_oi': top_oi,
+                'top_strike_pct_above': round((top.get('btc', 0) - spot_btc) / spot_btc * 100, 1),
+                'top_strike_vol_oi_ratio': vol_oi_ratio,
+                'top3': [
+                    {
+                        'strike_btc': round(s.get('btc', 0)),
+                        'call_oi': s.get('call_oi', 0),
+                        'pct_above': round((s.get('btc', 0) - spot_btc) / spot_btc * 100, 1),
+                    }
+                    for s in top_strikes
+                ],
+                'top3_concentration_pct': concentration,
+                'total_call_oi_above': total_call_above,
+            }
+
+    return result
 
 
 def _level_greeks_note(ltype, regime, row, is_major):
@@ -5908,6 +6044,7 @@ def build_analysis_data(ticker='IBIT'):
                 name: round(delta) if delta is not None else None
                 for name, delta in (d.get('dealer_delta_briefing', {}).get('key_level_deltas', {}) or {}).items()
             } if d.get('dealer_delta_briefing') else None,
+            'positioning_depth': d.get('positioning_depth', {}),
             'data_freshness': d.get('data_freshness'),
         }
 
@@ -6217,6 +6354,22 @@ DEALER POSITIONING: Net delta, flip points, acceleration zones. Where are dealer
 FLOWS: Charm/vanna overnight direction and magnitude. Which venue dominates overnight flow? Is the flow structural or expiry-driven (will it vanish after the nearest expiry)?
 
 KEY RISK: The single most important thing that could change this picture — expiry clearing walls, regime flip approaching, venue divergence resolving, etc.
+
+POSITIONING DEPTH (positioning_depth, when present):
+Three metrics that quantify the mechanical floor/ceiling structure:
+
+1. dealer_delta_cushion: How much dealer hedging flow activates at -5%, -8%, +5%, +8% from spot. 'swing_from_spot' is the key number — it shows the CHANGE in dealer delta if price moves there. A +$1B swing at -8% means dealers must buy $1B notional on that drop — a quantified mechanical floor. Use this to assess whether downside is "cushioned" or "open air."
+
+2. put_density: Distribution of put OI in bands below spot.
+   - 'near_far_ratio' compares 0-5% below vs 5-10% below. High ratio (>2) = support concentrated near spot (dips absorbed). Low ratio (<0.5) = near-spot puts "cleaned up" (thin near cushion, but large hedging flows activate deeper).
+   - 'structure' summarizes: 'concentrated_near' (defensive), 'cleaned_up' (near support thin, deeper support exists), 'distributed' (gradual).
+   - 'above_spot' put OI = ITM puts or synthetic short positions. Large above-spot put OI is institutional hedging, not directional — don't interpret it as bearish.
+
+3. call_overwrite_zone: Largest call OI concentration above spot. Systematic call overwriting (yield generation) shows as high OI at round strikes with LOW volume-to-OI ratio (positions were opened in prior sessions, not today). This creates a mechanical ceiling — dealers who bought these calls hedge by selling on rallies toward the strike. But if spot breaks through, dealers must buy aggressively (gamma squeeze trigger).
+   - 'top_strike_vol_oi_ratio' < 0.1 = stale positions (likely overwriting). > 0.5 = active trading today (could be speculative).
+   - 'top3_concentration_pct' > 50% = call OI funneled into a few strikes (sharp lid). < 30% = distributed (gradual resistance).
+
+Use these to give a one-line positioning depth read per window, e.g.: "Downside cushioned: dealers buy $1.2B on an 8% drop, near-spot puts concentrated. Ceiling at $72K (76K call OI, overwrite zone) — squeeze trigger if broken."
 
 MACRO REGIME SCORE (when present):
 _macro_regime contains the swing-trade regime score from -100 (topping) to +100 (bottoming).
