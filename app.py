@@ -218,6 +218,32 @@ def compute_atm_iv(iv_entries, reference_price):
     }
 
 
+def compute_deribit_iv_term(iv_data):
+    """Compute Deribit ATM IV term structure from per-expiry IV data.
+
+    Args:
+        iv_data: {exp_str: [{strike, iv, oi, opt_type, dte, underlying}, ...]}
+
+    Returns list of {'expiry', 'dte', 'atm_iv', 'source': 'deribit'} dicts.
+    """
+    term = []
+    for exp_str, iv_entries in sorted(iv_data.items()):
+        if not iv_entries:
+            continue
+        dte_val = iv_entries[0]['dte']
+        underlying = iv_entries[0]['underlying']
+        result = compute_atm_iv(iv_entries, underlying)
+        if not result:
+            continue
+        term.append({
+            'expiry': exp_str,
+            'dte': round(dte_val, 1),
+            'atm_iv': result['atm_iv'],
+            'source': 'deribit',
+        })
+    return term
+
+
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
@@ -3108,21 +3134,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             log.warning(f"[deribit] Failed: {e}")
 
     # Compute Deribit ATM IV per expiry and merge into IBIT term structure
-    for exp_str, iv_entries in sorted(deribit_iv_data.items()):
-        if not iv_entries:
-            continue
-        dte_val = iv_entries[0]['dte']
-        underlying = iv_entries[0]['underlying']
-        result = compute_atm_iv(iv_entries, underlying)
-        if not result:
-            continue
-
-        iv_term_structure.append({
-            'expiry': exp_str,
-            'dte': round(dte_val, 1),
-            'atm_iv': result['atm_iv'],
-            'source': 'deribit',
-        })
+    iv_term_structure.extend(compute_deribit_iv_term(deribit_iv_data))
 
     # Build Deribit DataFrame
     deribit_rows = []
@@ -4395,21 +4407,7 @@ def _refresh_deribit_only(ticker):
                     'dte': opt['dte'], 'underlying': btc_s,
                 })
 
-            # Compute Deribit ATM IV per expiry and merge into cached term structure
-            deribit_iv_term = []
-            for exp_str, iv_entries in sorted(deribit_iv_data.items()):
-                if not iv_entries:
-                    continue
-                dte_val = iv_entries[0]['dte']
-                underlying = iv_entries[0]['underlying']
-                result = compute_atm_iv(iv_entries, underlying)
-                if not result:
-                    continue
-
-                deribit_iv_term.append({
-                    'expiry': exp_str, 'dte': round(dte_val, 1),
-                    'atm_iv': result['atm_iv'], 'source': 'deribit',
-                })
+            deribit_iv_term = compute_deribit_iv_term(deribit_iv_data)
 
             # Build lookup: BTC strike -> net_gex
             deribit_by_btc = {}
