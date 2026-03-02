@@ -4279,12 +4279,15 @@ def _refresh_deribit_only(ticker):
             # Add Deribit-only strikes not already in chart
             for btc_p, net_gex in deribit_by_btc.items():
                 if btc_p not in seen:
+                    d_data = deribit_strike_data.get(btc_p, deribit_strike_data.get(float(btc_p), {}))
                     gex_chart.append({
                         'strike': 0, 'btc': float(btc_p),
                         'net_gex': net_gex, 'ibit_gex': 0, 'deribit_gex': net_gex,
+                        'call_gex': d_data.get('call_gex', 0), 'put_gex': d_data.get('put_gex', 0),
                         'active_gex': net_gex,
                         'net_vanna': 0, 'net_charm': 0,
-                        'call_oi': 0, 'put_oi': 0, 'total_oi': 0,
+                        'call_oi': d_data.get('call_oi', 0), 'put_oi': d_data.get('put_oi', 0),
+                        'total_oi': d_data.get('call_oi', 0) + d_data.get('put_oi', 0),
                         'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
                         'expiry_breakdown': {},
                     })
@@ -4295,6 +4298,7 @@ def _refresh_deribit_only(ticker):
             for strike_btc, d in sorted(deribit_strike_data.items()):
                 deribit_rows.append({
                     'strike': strike_btc,
+                    'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
                     'net_gex': d['call_gex'] + d['put_gex'],
                     'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
                     'total_oi': d['call_oi'] + d['put_oi'],
@@ -4310,6 +4314,8 @@ def _refresh_deribit_only(ticker):
                 if entry.get('net_gex', 0) != 0:
                     combined_rows.append({
                         'strike': entry['btc'],
+                        'call_gex': entry.get('call_gex', 0),
+                        'put_gex': entry.get('put_gex', 0),
                         'net_gex': entry['net_gex'],
                         'call_oi': entry.get('call_oi', 0),
                         'put_oi': entry.get('put_oi', 0),
