@@ -45,6 +45,10 @@ def now_et():
     """Current time in Eastern, used for all timestamps and date keys."""
     return datetime.now(ET)
 
+def today_str_et():
+    """Today's date as YYYY-MM-DD string in Eastern Time."""
+    return now_et().strftime('%Y-%m-%d')
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -118,7 +122,7 @@ _rfr_cache = {'rate': None, 'date': None}
 
 def get_risk_free_rate():
     """Fetch 13-week T-bill rate (^IRX) from Yahoo Finance, cached daily."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     if _rfr_cache['rate'] is not None and _rfr_cache['date'] == today:
         return _rfr_cache['rate']
     try:
@@ -339,7 +343,7 @@ def get_db():
 
 def get_prev_strikes(conn, ticker):
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date FROM snapshots WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -355,7 +359,7 @@ def get_prev_strikes(conn, ticker):
 
 
 def save_snapshot(conn, ticker, spot, btc_price, levels, df):
-    date_str = now_et().strftime('%Y-%m-%d')
+    date_str = today_str_et()
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO snapshots
         (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
@@ -1555,7 +1559,7 @@ def compute_macro_regime(conn, ticker, days=30):
     c = conn.cursor()
     cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
     btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     # ── Signal 1: Regime Persistence & Transition (-12 to +12) ───────────
     regime_score = 0
@@ -2286,7 +2290,7 @@ def fetch_coinglass_data():
     if not api_key:
         return  # Graceful - Phase 2 signals just return 0
 
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     with _coinglass_lock:
         conn = get_db()
@@ -3343,7 +3347,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     try:
         conn_exp = get_db()
         c_exp = conn_exp.cursor()
-        today_str = now_et().strftime('%Y-%m-%d')
+        today_str = today_str_et()
 
         all_exp_dates = sorted(set(
             list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
@@ -4257,7 +4261,7 @@ def get_prev_cache(ticker, dte):
     """Return the second most recent cached data (yesterday's), or None."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, dte, today))
     row = c.fetchone()
@@ -4271,7 +4275,7 @@ def set_cached_data(ticker, dte, data):
     """Cache the full response JSON keyed to today's date."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('INSERT OR REPLACE INTO data_cache (date, ticker, dte, data_json) VALUES (?,?,?,?)',
               (today, ticker, dte, json.dumps(data, cls=NumpyEncoder)))
     conn.commit()
@@ -4281,7 +4285,7 @@ def set_cached_data(ticker, dte, data):
 def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
     """Return cached data if fresh, otherwise check Yahoo for new OI.
     force_refresh=True bypasses date check and OI comparison (used for Deribit refresh)."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     cache_date, cached = get_latest_cache(ticker, dte)
 
     # Already confirmed today's data (and min_dte matches) — unless force_refresh
@@ -4558,7 +4562,7 @@ def _bg_refresh():
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
-            today = now_et().strftime('%Y-%m-%d')
+            today = today_str_et()
             all_fresh = True
             stale_windows = []
             for label, min_d, max_d in REFRESH_DTES:
@@ -5488,7 +5492,7 @@ def get_cached_analysis(ticker):
     """Return cached analysis for today if it exists."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT analysis_json FROM analysis_cache WHERE date=? AND ticker=?',
               (today, ticker))
     row = c.fetchone()
@@ -5502,7 +5506,7 @@ def get_prev_analysis(ticker):
     """Return the most recent analysis before today, or None."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date, analysis_json FROM analysis_cache WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -5519,7 +5523,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
         analysis['_timestamp'] = now_et().strftime('%Y-%m-%d %H:%M')
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
               (today, ticker, json.dumps(analysis)))
     conn.commit()
@@ -5528,7 +5532,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
 
 def save_predictions(ticker, dtes, results, analysis_text=None):
     """Save structured predictions for each expiry date in each DTE window."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     conn = get_db()
     c = conn.cursor()
 
@@ -5642,7 +5646,7 @@ def save_predictions(ticker, dtes, results, analysis_text=None):
 def score_expired_predictions(conn):
     """Score predictions whose expiry date has passed."""
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     c.execute('''SELECT DISTINCT expiry_date, ticker FROM predictions
                  WHERE scored=0 AND expiry_date < ?''', (today,))
