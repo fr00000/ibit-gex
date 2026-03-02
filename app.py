@@ -2787,6 +2787,11 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         e for e in all_exps
         if cutoff_min <= datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff_max
     ]
+    # Drop today's expiry after 4 PM ET — Yahoo still reports OI but options have settled
+    now_eastern = now_et()
+    if now_eastern.hour >= 16:
+        today_str = now_eastern.strftime('%Y-%m-%d')
+        selected_exps = [e for e in selected_exps if e != today_str]
     if not selected_exps:
         # If no expirations in this window, find the nearest expiration after cutoff_min
         future_exps = [e for e in all_exps if datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) > cutoff_min]
@@ -5049,8 +5054,13 @@ def api_expiry_data():
             (snapshot_date, ticker)
         ).fetchall()
         conn.close()
+        now_eastern = now_et()
+        skip_today = now_eastern.hour >= 16
+        today_str = now_eastern.strftime('%Y-%m-%d')
         result = []
         for exp_date, dj in expiries:
+            if skip_today and exp_date == today_str:
+                continue
             d = json.loads(dj)
             result.append({
                 'expiry_date': exp_date,
@@ -5081,8 +5091,14 @@ def api_expiry_data():
 
     conn.close()
 
+    # Filter out today's expired expiry after 4 PM ET
+    now_eastern = now_et()
+    if now_eastern.hour >= 16:
+        today_str = now_eastern.strftime('%Y-%m-%d')
+        rows = [row for row in rows if json.loads(row[0]).get('expiry_date') != today_str]
+
     if not rows:
-        return Response(json.dumps({'error': 'No data found'}),
+        return Response(json.dumps({'error': 'All expiries in range have settled'}),
                         mimetype='application/json'), 404
 
     # Aggregate strikes across matching expiries, keyed by rounded BTC price
