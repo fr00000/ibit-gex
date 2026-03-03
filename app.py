@@ -36,10 +36,10 @@ from flask import Flask, render_template, Response, request
 import anthropic
 from dotenv import load_dotenv
 from gex import (
-    _bs_d1d2, bs_gamma, bs_delta, bs_vanna, bs_charm,
+    bs_gamma, bs_delta, bs_vanna, bs_charm,
     compute_atm_iv, compute_deribit_iv_term, process_deribit_options, build_deribit_df,
     _compute_levels_from_df, compute_flow_forecast, compute_dealer_delta_scenarios,
-    generate_dealer_delta_briefing, compute_positioning_depth, _level_greeks_note,
+    generate_dealer_delta_briefing, compute_positioning_depth,
     compute_significant_levels, compute_breakout,
     STRIKE_RANGE_PCT,
 )
