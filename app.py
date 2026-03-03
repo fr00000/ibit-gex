@@ -3804,11 +3804,10 @@ def api_outlook():
                 pw = lvl.get('put_wall')
                 gf = lvl.get('gamma_flip')
 
-                # Compute DTE range for x-axis positioning
-                first_exp = dt_cls.strptime(week_expiries[0], '%Y-%m-%d')
-                last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+                # Compute DTE range for x-axis positioning (span full week, not just expiries)
                 today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
-                min_dte = (first_exp - today_dt).days
+                min_dte = (mon - today_dt).days
+                last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
                 max_dte = (last_exp - today_dt).days
 
                 # Delta flip
