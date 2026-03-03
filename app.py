@@ -3748,56 +3748,99 @@ def api_outlook():
             snapshot_date = row[0] if row and row[0] else None
 
         if snapshot_date:
-            expiry_rows = c.execute(
-                'SELECT expiry_date, data_json FROM expiry_cache '
+            # Get all available expiry dates
+            expiry_dates = [r[0] for r in c.execute(
+                'SELECT DISTINCT expiry_date FROM expiry_cache '
                 'WHERE date=? AND ticker=? ORDER BY expiry_date',
                 (snapshot_date, ticker)
-            ).fetchall()
+            ).fetchall()]
 
+            # Filter expired
             now_eastern = now_et()
-            skip_today = now_eastern.hour >= 16
             today_str = now_eastern.strftime('%Y-%m-%d')
+            if now_eastern.hour >= 16:
+                expiry_dates = [d for d in expiry_dates if d > today_str]
+            else:
+                expiry_dates = [d for d in expiry_dates if d >= today_str]
 
-            for exp_date, dj in expiry_rows:
-                if skip_today and exp_date == today_str:
-                    continue
-                d = json.loads(dj)
-                dte = d.get('dte', 0)
-                if dte < 0 or dte > 60:
+            # Group expiries into Mon-Sun weekly buckets
+            from datetime import datetime as dt_cls
+            weekly_buckets = {}  # monday_str -> {monday, sunday, expiries}
+            for exp in expiry_dates:
+                exp_dt = dt_cls.strptime(exp, '%Y-%m-%d')
+                monday = exp_dt - timedelta(days=exp_dt.weekday())
+                key = monday.strftime('%Y-%m-%d')
+                if key not in weekly_buckets:
+                    weekly_buckets[key] = {
+                        'monday': monday, 'expiries': []
+                    }
+                weekly_buckets[key]['expiries'].append(exp)
+
+            # Aggregate each weekly bucket
+            for week_key in sorted(weekly_buckets.keys()):
+                bucket = weekly_buckets[week_key]
+                mon = bucket['monday']
+                week_expiries = bucket['expiries']
+
+                placeholders = ','.join(['?'] * len(week_expiries))
+                rows = c.execute(
+                    f'SELECT data_json FROM expiry_cache '
+                    f'WHERE date=? AND ticker=? AND expiry_date IN ({placeholders})',
+                    (snapshot_date, ticker, *week_expiries)
+                ).fetchall()
+
+                if not rows:
                     continue
 
-                lvl = d.get('levels_btc') or d.get('summary', {})
-                if not lvl:
+                agg = _aggregate_expiry_blobs(rows)
+                if not agg:
                     continue
 
                 if spot_btc is None:
-                    spot_btc = d.get('spot_btc') or d.get('btc_spot')
+                    spot_btc = agg['spot_btc']
 
-                cw = lvl.get('call_wall') or lvl.get('call_wall_btc')
-                pw = lvl.get('put_wall') or lvl.get('put_wall_btc')
-                gf = lvl.get('gamma_flip') or lvl.get('gamma_flip_btc')
-                regime = lvl.get('regime') or d.get('regime')
-                net_gex = lvl.get('net_gex_total', 0)
+                lvl = agg['levels_btc'] or {}
+                cw = lvl.get('call_wall')
+                pw = lvl.get('put_wall')
+                gf = lvl.get('gamma_flip')
 
-                flip_points = d.get('delta_flip_points', [])
+                # Compute DTE range for x-axis positioning
+                first_exp = dt_cls.strptime(week_expiries[0], '%Y-%m-%d')
+                last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+                today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0)
+                min_dte = (first_exp - today_dt).days
+                max_dte = (last_exp - today_dt).days
+
+                # Delta flip
                 delta_flip_btc = None
-                if flip_points and isinstance(flip_points, list) and len(flip_points) > 0:
-                    delta_flip_btc = flip_points[0].get('price_btc')
+                if agg['delta_flip_points']:
+                    delta_flip_btc = agg['delta_flip_points'][0].get('price_btc')
 
-                ff = d.get('flow_forecast', {})
+                # Charm direction from flow forecast
+                ff = agg.get('flow_forecast') or {}
                 charm = ff.get('charm', {})
 
+                # Dealer delta direction from profile
+                dd_dir = None
+                if agg['dealer_delta_profile'] and spot_btc:
+                    closest = min(agg['dealer_delta_profile'],
+                                  key=lambda x: abs(x['price_btc'] - spot_btc))
+                    dd_val = closest.get('net_dealer_delta', 0)
+                    dd_dir = 'short' if dd_val < 0 else 'long' if dd_val > 0 else None
+
+                # Label: "MM/DD-DD" format
+                last_exp_dt = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+                label = f"{mon.strftime('%m/%d')}-{last_exp_dt.strftime('%d')}"
+
                 windows.append({
-                    'label': exp_date[5:],  # 'MM-DD'
-                    'expiry': exp_date,
-                    'dte': round(dte),
-                    'min_dte': round(dte),
-                    'max_dte': round(dte),
+                    'label': label,
+                    'min_dte': max(round(min_dte), 0),
+                    'max_dte': max(round(max_dte), 0),
                     'call_wall': cw,
                     'put_wall': pw,
                     'gamma_flip': gf,
-                    'regime': regime,
-                    'net_gex': net_gex,
+                    'regime': agg['regime'],
+                    'net_gex': agg['net_gex_total'],
                     'em_upper': None,
                     'em_lower': None,
                     'venue_agree': False,
@@ -3805,7 +3848,7 @@ def api_outlook():
                     'ibit_pw': None,
                     'deribit_cw': None,
                     'deribit_pw': None,
-                    'dealer_delta_dir': None,
+                    'dealer_delta_dir': dd_dir,
                     'charm_dir': charm.get('direction'),
                     'delta_flip_btc': round(delta_flip_btc) if delta_flip_btc else None,
                 })
@@ -4179,6 +4222,189 @@ def api_flows():
     return Response(json.dumps(data), mimetype='application/json')
 
 
+def _aggregate_expiry_blobs(rows):
+    """Aggregate multiple expiry_cache rows into combined levels, flow, and delta profile.
+
+    Args:
+        rows: list of (data_json_str,) tuples from expiry_cache query
+
+    Returns:
+        dict with keys: spot_btc, levels_btc, regime, net_gex_total,
+        flow_forecast, delta_flip_points, dealer_delta_profile,
+        total_call_oi, total_put_oi, included_expiries, gex_chart.
+        Returns None if no valid data.
+    """
+    if not rows:
+        return None
+
+    strike_agg = {}
+    included_expiries = []
+    first_blob = json.loads(rows[0][0])
+    repricing_rows = []
+
+    for row in rows:
+        d = json.loads(row[0])
+        included_expiries.append(d['expiry_date'])
+        dte_val = d.get('dte', 1)
+        T_exp = max(dte_val / 365.0, 0.5 / 365)
+        for s in d['strikes']:
+            btc = round(s['btc'])
+            if btc not in strike_agg:
+                strike_agg[btc] = {
+                    'btc': s['btc'], 'strike': s['strike'],
+                    'call_oi': 0, 'put_oi': 0,
+                    'call_gex': 0, 'put_gex': 0,
+                    'net_gex': 0, 'ibit_gex': 0, 'deribit_gex': 0,
+                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+                    'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                }
+            a = strike_agg[btc]
+            a['call_oi'] += s['call_oi']
+            a['put_oi'] += s['put_oi']
+            a['net_gex'] += s['net_gex']
+            a['call_gex'] += s.get('call_gex', 0)
+            a['put_gex'] += s.get('put_gex', 0)
+            a['ibit_gex'] += s.get('ibit_gex', s['net_gex'])
+            a['deribit_gex'] += s.get('deribit_gex', 0)
+            a['net_dealer_delta'] += s['net_dealer_delta']
+            a['net_vanna'] += s['net_vanna']
+            a['net_charm'] += s['net_charm']
+            a['call_volume'] += s['call_volume']
+            a['put_volume'] += s['put_volume']
+            a['total_volume'] += s['call_volume'] + s['put_volume']
+
+            c_iv = s.get('call_iv', 0)
+            p_iv = s.get('put_iv', 0)
+            ibit_c_oi = s.get('ibit_call_oi', 0)
+            ibit_p_oi = s.get('ibit_put_oi', 0)
+            deri_c_oi = s.get('deribit_call_oi', 0)
+            deri_p_oi = s.get('deribit_put_oi', 0)
+            if ibit_c_oi == 0 and deri_c_oi == 0 and s.get('call_oi', 0) > 0:
+                ibit_c_oi = s['call_oi']
+            if ibit_p_oi == 0 and deri_p_oi == 0 and s.get('put_oi', 0) > 0:
+                ibit_p_oi = s['put_oi']
+            if c_iv > 0 or p_iv > 0:
+                repricing_rows.append((s['btc'], T_exp, c_iv, p_iv, ibit_c_oi, ibit_p_oi, deri_c_oi, deri_p_oi))
+
+    gex_chart = sorted(strike_agg.values(), key=lambda x: x['btc'])
+    spot_btc = first_blob.get('spot_btc', 0)
+
+    level_rows = [{
+        'strike': s['btc'], 'net_gex': s['net_gex'],
+        'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
+        'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
+        'total_oi': s['call_oi'] + s['put_oi'],
+        'net_dealer_delta': s['net_dealer_delta'],
+        'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
+        'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
+        'call_vol_gex': 0, 'put_vol_gex': 0,
+        'active_gex': s['net_gex'],
+    } for s in gex_chart]
+    level_df = pd.DataFrame(level_rows)
+    levels_btc = _compute_levels_from_df(level_df, spot_btc) if not level_df.empty else {}
+
+    net_gex = sum(s['net_gex'] for s in gex_chart)
+    total_call = sum(s['call_oi'] for s in gex_chart)
+    total_put = sum(s['put_oi'] for s in gex_chart)
+
+    flow_forecast = None
+    if not level_df.empty and levels_btc:
+        try:
+            flow_forecast = compute_flow_forecast(level_df, spot_btc, levels_btc, True)
+        except Exception:
+            pass
+
+    dealer_delta_profile = []
+    delta_flip_points = []
+    if repricing_rows and spot_btc > 0 and levels_btc:
+        try:
+            btc_per_share = first_blob.get('btc_per_share', 0.000568)
+            rfr = 0.05
+            cw = levels_btc.get('call_wall', spot_btc * 1.05)
+            pw = levels_btc.get('put_wall', spot_btc * 0.95)
+            grid_prices = set()
+            grid_prices.update([cw, pw, spot_btc])
+            gf = levels_btc.get('gamma_flip')
+            if gf:
+                grid_prices.add(gf)
+            step = spot_btc * 0.005
+            if step > 0:
+                p = pw
+                while p <= cw:
+                    grid_prices.add(p)
+                    p += step
+                p = pw * 0.98
+                while p <= cw * 1.02:
+                    grid_prices.add(p)
+                    p += step
+            lo_bound = spot_btc * 0.85
+            hi_bound = spot_btc * 1.15
+            grid_prices = sorted([p for p in grid_prices if lo_bound <= p <= hi_bound])
+            if len(grid_prices) > 80:
+                indices = np.linspace(0, len(grid_prices) - 1, 80, dtype=int)
+                grid_prices = [grid_prices[i] for i in indices]
+                if spot_btc not in grid_prices:
+                    grid_prices.append(spot_btc)
+                    grid_prices.sort()
+
+            for S_hyp in grid_prices:
+                net_dd = 0.0
+                call_dd = 0.0
+                put_dd = 0.0
+                for (strike_btc, T, c_iv, p_iv, ib_c_oi, ib_p_oi, dr_c_oi, dr_p_oi) in repricing_rows:
+                    if strike_btc < lo_bound or strike_btc > hi_bound:
+                        continue
+                    if c_iv > 0 and (ib_c_oi > 0 or dr_c_oi > 0):
+                        delta = bs_delta(S_hyp, strike_btc, T, rfr, c_iv, 'call')
+                        if ib_c_oi > 0:
+                            dd = -delta * ib_c_oi * 100 * btc_per_share * S_hyp
+                            net_dd += dd; call_dd += dd
+                        if dr_c_oi > 0:
+                            dd = -delta * dr_c_oi * 1 * S_hyp
+                            net_dd += dd; call_dd += dd
+                    if p_iv > 0 and (ib_p_oi > 0 or dr_p_oi > 0):
+                        delta = bs_delta(S_hyp, strike_btc, T, rfr, p_iv, 'put')
+                        if ib_p_oi > 0:
+                            dd = -delta * ib_p_oi * 100 * btc_per_share * S_hyp
+                            net_dd += dd; put_dd += dd
+                        if dr_p_oi > 0:
+                            dd = -delta * dr_p_oi * 1 * S_hyp
+                            net_dd += dd; put_dd += dd
+                dealer_delta_profile.append({
+                    'price_btc': float(S_hyp),
+                    'net_dealer_delta': float(net_dd),
+                })
+
+            for i in range(len(dealer_delta_profile) - 1):
+                d1 = dealer_delta_profile[i]['net_dealer_delta']
+                d2 = dealer_delta_profile[i + 1]['net_dealer_delta']
+                p1 = dealer_delta_profile[i]['price_btc']
+                p2 = dealer_delta_profile[i + 1]['price_btc']
+                if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
+                    if (d2 - d1) != 0:
+                        flip = p1 + (p2 - p1) * (-d1) / (d2 - d1)
+                        delta_flip_points.append({'price_btc': round(float(flip))})
+            if delta_flip_points:
+                delta_flip_points.sort(key=lambda x: abs(x['price_btc'] - spot_btc))
+                delta_flip_points = delta_flip_points[:2]
+        except Exception:
+            pass
+
+    return {
+        'spot_btc': spot_btc,
+        'levels_btc': levels_btc,
+        'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+        'net_gex_total': net_gex,
+        'total_call_oi': total_call,
+        'total_put_oi': total_put,
+        'flow_forecast': flow_forecast,
+        'delta_flip_points': delta_flip_points,
+        'dealer_delta_profile': dealer_delta_profile,
+        'included_expiries': sorted(included_expiries),
+        'gex_chart': gex_chart,
+    }
+
+
 @app.route('/api/expiry-data')
 def api_expiry_data():
     """Query per-expiry options data.
@@ -4270,209 +4496,52 @@ def api_expiry_data():
         return Response(json.dumps({'error': 'All expiries in range have settled'}),
                         mimetype='application/json'), 404
 
-    # Aggregate strikes across matching expiries, keyed by rounded BTC price
-    strike_agg = {}
-    included_expiries = []
+    agg = _aggregate_expiry_blobs(rows)
+    if not agg:
+        return Response(json.dumps({'error': 'No data to aggregate'}),
+                        mimetype='application/json'), 404
+
     first_blob = json.loads(rows[0][0])
-    repricing_rows = []  # (strike_btc, T, call_iv, put_iv, ibit_c_oi, ibit_p_oi, deri_c_oi, deri_p_oi)
 
-    for row in rows:
-        d = json.loads(row[0])
-        included_expiries.append(d['expiry_date'])
-        dte_val = d.get('dte', 1)
-        T_exp = max(dte_val / 365.0, 0.5 / 365)
-        for s in d['strikes']:
-            btc = round(s['btc'])
-            if btc not in strike_agg:
-                strike_agg[btc] = {
-                    'btc': s['btc'], 'strike': s['strike'],
-                    'call_oi': 0, 'put_oi': 0,
-                    'call_gex': 0, 'put_gex': 0,
-                    'net_gex': 0, 'ibit_gex': 0, 'deribit_gex': 0,
-                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
-                    'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
-                }
-            a = strike_agg[btc]
-            a['call_oi'] += s['call_oi']
-            a['put_oi'] += s['put_oi']
-            a['net_gex'] += s['net_gex']
-            a['call_gex'] += s.get('call_gex', 0)
-            a['put_gex'] += s.get('put_gex', 0)
-            a['ibit_gex'] += s.get('ibit_gex', s['net_gex'])
-            a['deribit_gex'] += s.get('deribit_gex', 0)
-            a['net_dealer_delta'] += s['net_dealer_delta']
-            a['net_vanna'] += s['net_vanna']
-            a['net_charm'] += s['net_charm']
-            a['call_volume'] += s['call_volume']
-            a['put_volume'] += s['put_volume']
-            a['total_volume'] += s['call_volume'] + s['put_volume']
-
-            # Collect per-strike data for BS repricing
-            c_iv = s.get('call_iv', 0)
-            p_iv = s.get('put_iv', 0)
-            ibit_c_oi = s.get('ibit_call_oi', 0)
-            ibit_p_oi = s.get('ibit_put_oi', 0)
-            deri_c_oi = s.get('deribit_call_oi', 0)
-            deri_p_oi = s.get('deribit_put_oi', 0)
-            # Old cache fallback: if no venue separation, treat all OI as IBIT
-            if ibit_c_oi == 0 and deri_c_oi == 0 and s.get('call_oi', 0) > 0:
-                ibit_c_oi = s['call_oi']
-            if ibit_p_oi == 0 and deri_p_oi == 0 and s.get('put_oi', 0) > 0:
-                ibit_p_oi = s['put_oi']
-            if c_iv > 0 or p_iv > 0:
-                repricing_rows.append((s['btc'], T_exp, c_iv, p_iv, ibit_c_oi, ibit_p_oi, deri_c_oi, deri_p_oi))
-
-    gex_chart = sorted(strike_agg.values(), key=lambda x: x['btc'])
-
-    # Compute aggregated levels
-    spot_btc = first_blob.get('spot_btc', 0)
-    level_rows = [{
-        'strike': s['btc'], 'net_gex': s['net_gex'],
-        'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
-        'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
-        'total_oi': s['call_oi'] + s['put_oi'],
-        'net_dealer_delta': s['net_dealer_delta'],
-        'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
-        'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
-        'call_vol_gex': 0, 'put_vol_gex': 0,
-        'active_gex': s['net_gex'],
-    } for s in gex_chart]
-    level_df = pd.DataFrame(level_rows)
-    levels_btc = _compute_levels_from_df(level_df, spot_btc) if not level_df.empty else {}
-
-    net_gex = sum(s['net_gex'] for s in gex_chart)
-    total_call = sum(s['call_oi'] for s in gex_chart)
-    total_put = sum(s['put_oi'] for s in gex_chart)
-
-    # Flow forecast (charm/vanna overnight rebalancing)
-    flow_forecast = None
-    if not level_df.empty and levels_btc:
-        try:
-            flow_forecast = compute_flow_forecast(level_df, spot_btc, levels_btc, True)
-        except Exception as e:
-            log.warning(f"[expiry-data] flow_forecast failed: {e}")
-
-    # Significant levels
+    # Significant levels (not in shared helper — only needed here)
     sig_levels = []
-    if not level_df.empty and levels_btc:
+    if agg['levels_btc']:
         try:
-            sig_levels = compute_significant_levels(level_df, spot_btc, levels_btc, {}, True, 1.0)
+            level_rows = [{
+                'strike': s['btc'], 'net_gex': s['net_gex'],
+                'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
+                'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
+                'total_oi': s['call_oi'] + s['put_oi'],
+                'net_dealer_delta': s['net_dealer_delta'],
+                'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
+                'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
+                'call_vol_gex': 0, 'put_vol_gex': 0,
+                'active_gex': s['net_gex'],
+            } for s in agg['gex_chart']]
+            level_df = pd.DataFrame(level_rows)
+            if not level_df.empty:
+                sig_levels = compute_significant_levels(level_df, agg['spot_btc'], agg['levels_btc'], {}, True, 1.0)
         except Exception as e:
             log.warning(f"[expiry-data] significant_levels failed: {e}")
 
-    # Dealer delta profile via BS re-pricing (same approach as compute_dealer_delta_scenarios)
-    dealer_delta_profile = []
-    delta_flip_points = []
-    if repricing_rows and spot_btc > 0 and levels_btc:
-        try:
-            btc_per_share = first_blob.get('btc_per_share', 0.000568)
-            rfr = 0.05
-
-            # Build price grid in BTC terms
-            cw = levels_btc.get('call_wall', spot_btc * 1.05)
-            pw = levels_btc.get('put_wall', spot_btc * 0.95)
-            grid_prices = set()
-            grid_prices.update([cw, pw, spot_btc])
-            gf = levels_btc.get('gamma_flip')
-            if gf:
-                grid_prices.add(gf)
-
-            step = spot_btc * 0.005
-            if step > 0:
-                p = pw
-                while p <= cw:
-                    grid_prices.add(p)
-                    p += step
-                p = pw * 0.98
-                while p <= cw * 1.02:
-                    grid_prices.add(p)
-                    p += step
-
-            lo_bound = spot_btc * 0.85
-            hi_bound = spot_btc * 1.15
-            grid_prices = sorted([p for p in grid_prices if lo_bound <= p <= hi_bound])
-            if len(grid_prices) > 80:
-                indices = np.linspace(0, len(grid_prices) - 1, 80, dtype=int)
-                grid_prices = [grid_prices[i] for i in indices]
-                if spot_btc not in grid_prices:
-                    grid_prices.append(spot_btc)
-                    grid_prices.sort()
-
-            # Re-price dealer delta at each grid point
-            for S_hyp in grid_prices:
-                net_dd = 0.0
-                call_dd = 0.0
-                put_dd = 0.0
-                for (strike_btc, T, c_iv, p_iv, ib_c_oi, ib_p_oi, dr_c_oi, dr_p_oi) in repricing_rows:
-                    if strike_btc < lo_bound or strike_btc > hi_bound:
-                        continue
-                    # Call side
-                    if c_iv > 0 and (ib_c_oi > 0 or dr_c_oi > 0):
-                        delta = bs_delta(S_hyp, strike_btc, T, rfr, c_iv, 'call')
-                        if ib_c_oi > 0:
-                            dd = -delta * ib_c_oi * 100 * btc_per_share * S_hyp
-                            net_dd += dd
-                            call_dd += dd
-                        if dr_c_oi > 0:
-                            dd = -delta * dr_c_oi * 1 * S_hyp
-                            net_dd += dd
-                            call_dd += dd
-                    # Put side
-                    if p_iv > 0 and (ib_p_oi > 0 or dr_p_oi > 0):
-                        delta = bs_delta(S_hyp, strike_btc, T, rfr, p_iv, 'put')
-                        if ib_p_oi > 0:
-                            dd = -delta * ib_p_oi * 100 * btc_per_share * S_hyp
-                            net_dd += dd
-                            put_dd += dd
-                        if dr_p_oi > 0:
-                            dd = -delta * dr_p_oi * 1 * S_hyp
-                            net_dd += dd
-                            put_dd += dd
-                dealer_delta_profile.append({
-                    'price_btc': float(S_hyp),
-                    'price_ibit': float(S_hyp * btc_per_share),
-                    'net_dealer_delta': float(net_dd),
-                    'call_dealer_delta': float(call_dd),
-                    'put_dealer_delta': float(put_dd),
-                })
-
-            # Delta flip detection from profile
-            for i in range(len(dealer_delta_profile) - 1):
-                d1 = dealer_delta_profile[i]['net_dealer_delta']
-                d2 = dealer_delta_profile[i + 1]['net_dealer_delta']
-                p1_btc = dealer_delta_profile[i]['price_btc']
-                p2_btc = dealer_delta_profile[i + 1]['price_btc']
-                if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
-                    if (d2 - d1) != 0:
-                        flip = p1_btc + (p2_btc - p1_btc) * (-d1) / (d2 - d1)
-                        delta_flip_points.append({
-                            'price_btc': round(float(flip)),
-                            'price_ibit': round(float(flip * btc_per_share), 2),
-                        })
-            if delta_flip_points:
-                delta_flip_points.sort(key=lambda x: abs(x['price_btc'] - spot_btc))
-                delta_flip_points = delta_flip_points[:2]
-        except Exception as e:
-            log.warning(f"[expiry-data] dealer_delta_profile failed: {e}")
-
     result = {
         'date': snapshot_date,
-        'spot_btc': spot_btc,
+        'spot_btc': agg['spot_btc'],
         'spot': first_blob.get('spot'),
         'btc_per_share': first_blob.get('btc_per_share'),
-        'included_expiries': sorted(included_expiries),
-        'gex_chart': gex_chart,
-        'levels_btc': levels_btc,
-        'net_gex_total': net_gex,
-        'total_call_oi': total_call,
-        'total_put_oi': total_put,
-        'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
-        'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
-        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in gex_chart),
-        'flow_forecast': flow_forecast,
+        'included_expiries': agg['included_expiries'],
+        'gex_chart': agg['gex_chart'],
+        'levels_btc': agg['levels_btc'],
+        'net_gex_total': agg['net_gex_total'],
+        'total_call_oi': agg['total_call_oi'],
+        'total_put_oi': agg['total_put_oi'],
+        'pcr': round(agg['total_put_oi'] / agg['total_call_oi'], 3) if agg['total_call_oi'] > 0 else 0,
+        'regime': agg['regime'],
+        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in agg['gex_chart']),
+        'flow_forecast': agg['flow_forecast'],
         'significant_levels': sig_levels,
-        'delta_flip_points': delta_flip_points,
-        'dealer_delta_profile': dealer_delta_profile,
+        'delta_flip_points': agg['delta_flip_points'],
+        'dealer_delta_profile': agg['dealer_delta_profile'],
     }
 
     return Response(json.dumps(result, default=str), mimetype='application/json')

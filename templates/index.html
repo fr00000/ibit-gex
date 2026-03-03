@@ -1922,20 +1922,11 @@ function renderOutlook(data){
       beforeDatasetsDraw(chart){
         const{ctx:c,chartArea:{top,bottom},scales:{x:xScale}}=chart;
         const stripHeight=4;
-        const isWeekly=mode==='weekly';
         wins.forEach((w,i)=>{
-          let x1,x2;
-          if(isWeekly){
-            const xMid=xScale.getPixelForValue(w.dte);
-            const halfW=Math.max((xScale.getPixelForValue(w.dte+1)-xScale.getPixelForValue(w.dte-1))/2*0.4,3);
-            x1=xMid-halfW;
-            x2=xMid+halfW;
-          }else{
-            x1=xScale.getPixelForValue(w.min_dte);
-            x2=xScale.getPixelForValue(w.max_dte);
-          }
+          const x1=xScale.getPixelForValue(w.min_dte);
+          const x2=xScale.getPixelForValue(w.max_dte);
           c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.7)':'rgba(0,220,130,0.7)';
-          c.fillRect(x1,top,x2-x1,stripHeight);
+          c.fillRect(x1,top,Math.max(x2-x1,3),stripHeight);
         });
       }
     }]
