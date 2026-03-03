@@ -406,7 +406,12 @@ if(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && window.location.path
     </div>
   </div>
   <div class="outlook-row" id="outlook-sec">
-    <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span></div>
+    <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span>
+      <span style="margin-left:auto;display:flex;gap:2px;align-items:center">
+        <button class="cell-tab active" data-outlook="dte" onclick="setOutlookMode('dte')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:var(--t2);cursor:pointer;line-height:1.4">DTE</button>
+        <button class="cell-tab" data-outlook="weekly" onclick="setOutlookMode('weekly')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--t3);cursor:pointer;line-height:1.4">Weekly</button>
+      </span>
+    </div>
     <canvas id="outlook-chart"></canvas>
     <div class="outlook-legend">
       <span><span style="color:rgba(255,64,96,0.9)">━</span> Call wall</span>
@@ -1763,9 +1768,20 @@ async function saveAnalysis(){
 }
 
 // Outlook funnel
+let outlookMode='dte';
+function setOutlookMode(mode){
+  outlookMode=mode;
+  document.querySelectorAll('[data-outlook]').forEach(b=>{
+    const active=b.dataset.outlook===mode;
+    b.classList.toggle('active',active);
+    b.style.background=active?'var(--bg2)':'var(--bg)';
+    b.style.color=active?'var(--t2)':'var(--t3)';
+  });
+  loadOutlook();
+}
 async function loadOutlook(){
   try{
-    const r=await fetch(`/api/outlook?ticker=${currentTicker}${dateParam()}`);
+    const r=await fetch(`/api/outlook?ticker=${currentTicker}&mode=${outlookMode}${dateParam()}`);
     const d=await r.json();
     if(d.error||!d.windows||!d.windows.length){document.getElementById('outlook-chart').style.visibility='hidden';return}
     document.getElementById('outlook-chart').style.visibility='visible';
@@ -1778,6 +1794,7 @@ function renderOutlook(data){
   if(!ctx)return;
   const wins=data.windows;
   const spot=data.spot;
+  const mode=data.mode||'dte';
   if(!wins.length||!spot)return;
 
   if(outlookChart){outlookChart.destroy();outlookChart=null}
@@ -1873,8 +1890,8 @@ function renderOutlook(data){
       scales:{
         x:{
           type:'linear',
-          min:0,
-          max:46,
+          min:mode==='weekly'?Math.max(0,Math.min(...xPositions)-1):0,
+          max:mode==='weekly'?Math.max(...xPositions)+1:46,
           grid:{color:'rgba(28,34,48,0.3)',lineWidth:0.5},
           ticks:{
             font:{family:'IBM Plex Mono',size:9},
@@ -1885,6 +1902,7 @@ function renderOutlook(data){
             },
             autoSkip:false,
             stepSize:1,
+            maxRotation:mode==='weekly'?45:0,
           },
           afterBuildTicks:function(axis){
             axis.ticks=xPositions.map(x=>({value:x}));
@@ -1908,7 +1926,7 @@ function renderOutlook(data){
           const x1=xScale.getPixelForValue(w.min_dte);
           const x2=xScale.getPixelForValue(w.max_dte);
           c.fillStyle=w.regime==='negative_gamma'?'rgba(255,64,96,0.7)':'rgba(0,220,130,0.7)';
-          c.fillRect(x1,top,x2-x1,stripHeight);
+          c.fillRect(x1,top,Math.max(x2-x1,3),stripHeight);
         });
       }
     }]
