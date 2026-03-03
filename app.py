@@ -3730,11 +3730,93 @@ def api_outlook():
     """Return key levels from all DTE windows for the outlook funnel chart."""
     ticker = request.args.get('ticker', 'IBIT').upper()
     snapshot_date = request.args.get('date')
+    mode = request.args.get('mode', 'dte')  # 'dte' (default) or 'weekly'
     if ticker not in TICKER_CONFIG:
         return Response(json.dumps({'error': f'Unknown ticker: {ticker}'}), mimetype='application/json'), 400
 
     windows = []
     spot_btc = None
+
+    if mode == 'weekly':
+        conn = get_db()
+        c = conn.cursor()
+
+        if not snapshot_date:
+            row = c.execute(
+                'SELECT MAX(date) FROM expiry_cache WHERE ticker=?', (ticker,)
+            ).fetchone()
+            snapshot_date = row[0] if row and row[0] else None
+
+        if snapshot_date:
+            expiry_rows = c.execute(
+                'SELECT expiry_date, data_json FROM expiry_cache '
+                'WHERE date=? AND ticker=? ORDER BY expiry_date',
+                (snapshot_date, ticker)
+            ).fetchall()
+
+            now_eastern = now_et()
+            skip_today = now_eastern.hour >= 16
+            today_str = now_eastern.strftime('%Y-%m-%d')
+
+            for exp_date, dj in expiry_rows:
+                if skip_today and exp_date == today_str:
+                    continue
+                d = json.loads(dj)
+                dte = d.get('dte', 0)
+                if dte < 0 or dte > 60:
+                    continue
+
+                lvl = d.get('levels_btc') or d.get('summary', {})
+                if not lvl:
+                    continue
+
+                if spot_btc is None:
+                    spot_btc = d.get('spot_btc') or d.get('btc_spot')
+
+                cw = lvl.get('call_wall')
+                pw = lvl.get('put_wall')
+                gf = lvl.get('gamma_flip')
+                regime = lvl.get('regime') or d.get('regime')
+                net_gex = lvl.get('net_gex_total', 0)
+
+                flip_points = d.get('delta_flip_points', [])
+                delta_flip_btc = None
+                if flip_points and isinstance(flip_points, list) and len(flip_points) > 0:
+                    delta_flip_btc = flip_points[0].get('price_btc')
+
+                ff = d.get('flow_forecast', {})
+                charm = ff.get('charm', {})
+
+                windows.append({
+                    'label': exp_date[5:],  # 'MM-DD'
+                    'expiry': exp_date,
+                    'dte': round(dte),
+                    'min_dte': round(dte),
+                    'max_dte': round(dte),
+                    'call_wall': cw,
+                    'put_wall': pw,
+                    'gamma_flip': gf,
+                    'regime': regime,
+                    'net_gex': net_gex,
+                    'em_upper': None,
+                    'em_lower': None,
+                    'venue_agree': False,
+                    'ibit_cw': None,
+                    'ibit_pw': None,
+                    'deribit_cw': None,
+                    'deribit_pw': None,
+                    'dealer_delta_dir': None,
+                    'charm_dir': charm.get('direction'),
+                    'delta_flip_btc': round(delta_flip_btc) if delta_flip_btc else None,
+                })
+
+        conn.close()
+
+        return Response(json.dumps({
+            'spot': spot_btc,
+            'mode': 'weekly',
+            'windows': windows,
+        }, cls=NumpyEncoder), mimetype='application/json')
 
     for dte_key, min_d, max_d in DTE_WINDOWS:
         _, cached = get_latest_cache(ticker, dte_key, target_date=snapshot_date)
@@ -3812,6 +3894,7 @@ def api_outlook():
 
     return Response(json.dumps({
         'spot': spot_btc,
+        'mode': 'dte',
         'windows': windows,
     }, cls=NumpyEncoder), mimetype='application/json')
 
