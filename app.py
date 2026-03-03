@@ -3807,7 +3807,7 @@ def api_outlook():
                 # Compute DTE range for x-axis positioning
                 first_exp = dt_cls.strptime(week_expiries[0], '%Y-%m-%d')
                 last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
-                today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0)
+                today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
                 min_dte = (first_exp - today_dt).days
                 max_dte = (last_exp - today_dt).days
 
