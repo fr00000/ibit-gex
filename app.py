@@ -3773,9 +3773,9 @@ def api_outlook():
                 if spot_btc is None:
                     spot_btc = d.get('spot_btc') or d.get('btc_spot')
 
-                cw = lvl.get('call_wall')
-                pw = lvl.get('put_wall')
-                gf = lvl.get('gamma_flip')
+                cw = lvl.get('call_wall') or lvl.get('call_wall_btc')
+                pw = lvl.get('put_wall') or lvl.get('put_wall_btc')
+                gf = lvl.get('gamma_flip') or lvl.get('gamma_flip_btc')
                 regime = lvl.get('regime') or d.get('regime')
                 net_gex = lvl.get('net_gex_total', 0)
 
