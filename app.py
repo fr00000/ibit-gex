@@ -45,6 +45,10 @@ def now_et():
     """Current time in Eastern, used for all timestamps and date keys."""
     return datetime.now(ET)
 
+def today_str_et():
+    """Today's date as YYYY-MM-DD string in Eastern Time."""
+    return now_et().strftime('%Y-%m-%d')
+
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -118,7 +122,7 @@ _rfr_cache = {'rate': None, 'date': None}
 
 def get_risk_free_rate():
     """Fetch 13-week T-bill rate (^IRX) from Yahoo Finance, cached daily."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     if _rfr_cache['rate'] is not None and _rfr_cache['date'] == today:
         return _rfr_cache['rate']
     try:
@@ -174,6 +178,200 @@ def bs_charm(S, K, T, r, sigma, option_type='call'):
         charm += r * np.exp(-r * T) * norm.cdf(-d2)
     return charm
 
+
+def compute_atm_iv(iv_entries, reference_price):
+    """Compute OI-weighted ATM IV from a list of IV entries.
+
+    Each entry: {'strike': float, 'iv': float, 'oi': int, 'opt_type': str, ...}
+    reference_price: spot or underlying price to define 'ATM' (within 2%).
+
+    Returns dict with atm_iv, call_iv, put_iv, num_entries, or None if insufficient data.
+    """
+    if not iv_entries:
+        return None
+
+    atm_entries = [e for e in iv_entries if abs(e['strike'] - reference_price) / reference_price < 0.02]
+    if not atm_entries:
+        sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - reference_price))
+        atm_entries = sorted_by_dist[:2]
+    if not atm_entries:
+        return None
+
+    total_oi = sum(e['oi'] for e in atm_entries)
+    if total_oi <= 0:
+        return None
+
+    atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
+
+    atm_calls = [e for e in atm_entries if e['opt_type'] == 'call']
+    atm_puts = [e for e in atm_entries if e['opt_type'] == 'put']
+    call_oi_sum = sum(e['oi'] for e in atm_calls)
+    put_oi_sum = sum(e['oi'] for e in atm_puts)
+    call_iv = sum(e['iv'] * e['oi'] for e in atm_calls) / call_oi_sum if atm_calls and call_oi_sum > 0 else None
+    put_iv = sum(e['iv'] * e['oi'] for e in atm_puts) / put_oi_sum if atm_puts and put_oi_sum > 0 else None
+
+    return {
+        'atm_iv': round(atm_iv, 4),
+        'call_iv': round(call_iv, 4) if call_iv else None,
+        'put_iv': round(put_iv, 4) if put_iv else None,
+        'num_entries': len(atm_entries),
+    }
+
+
+def compute_deribit_iv_term(iv_data):
+    """Compute Deribit ATM IV term structure from per-expiry IV data.
+
+    Args:
+        iv_data: {exp_str: [{strike, iv, oi, opt_type, dte, underlying}, ...]}
+
+    Returns list of {'expiry', 'dte', 'atm_iv', 'source': 'deribit'} dicts.
+    """
+    term = []
+    for exp_str, iv_entries in sorted(iv_data.items()):
+        if not iv_entries:
+            continue
+        dte_val = iv_entries[0]['dte']
+        underlying = iv_entries[0]['underlying']
+        result = compute_atm_iv(iv_entries, underlying)
+        if not result:
+            continue
+        term.append({
+            'expiry': exp_str,
+            'dte': round(dte_val, 1),
+            'atm_iv': result['atm_iv'],
+            'source': 'deribit',
+        })
+    return term
+
+
+def process_deribit_options(options, rfr, full_greeks=False):
+    """Process raw Deribit options into strike-level aggregations.
+
+    Args:
+        options: list of dicts from fetch_deribit_options()
+        rfr: risk-free rate
+        full_greeks: if True, compute delta/vanna/charm and per-expiry strike data
+                     (weekday path). If False, compute only GEX + OI (weekend overlay).
+
+    Returns:
+        strike_data: {strike_btc: {call_gex, put_gex, call_oi, put_oi, ...}}
+        iv_data: {exp_str: [{strike, iv, oi, opt_type, dte, underlying}, ...]}
+        total_oi_btc: sum of all OI in BTC contracts
+        expiry_strike_data: {exp_str: {strike_btc: {...}}} (empty dict when full_greeks=False)
+    """
+    strike_data = {}
+    iv_data = {}
+    expiry_strike_data = {}
+    total_oi_btc = 0
+
+    for opt in options:
+        strike_btc = opt['strike']
+        oi = opt['oi']
+        iv = opt['iv'] / 100.0
+        btc_s = opt['underlying_price']
+        T = max(opt['dte'] / 365.0, 0.5 / 365)
+        opt_type = opt['option_type']
+        sign = 1 if opt_type == 'call' else -1
+
+        gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
+        gex = sign * gamma * oi * btc_s ** 2 * 0.01
+        total_oi_btc += oi
+
+        # Initialize strike entry
+        if strike_btc not in strike_data:
+            fields = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
+            if full_greeks:
+                fields.update({
+                    'call_delta': 0, 'put_delta': 0,
+                    'call_vanna': 0, 'put_vanna': 0,
+                    'call_charm': 0, 'put_charm': 0,
+                })
+            strike_data[strike_btc] = fields
+
+        d_entry = strike_data[strike_btc]
+        d_entry[f'{opt_type}_oi'] += oi
+        d_entry[f'{opt_type}_gex'] += gex
+
+        if full_greeks:
+            delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
+            vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
+            charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
+            dealer_delta = -delta * oi * btc_s
+            dealer_vanna = -vanna * oi * btc_s * 0.01
+            dealer_charm = -charm * oi / 365.0 * btc_s
+            d_entry[f'{opt_type}_delta'] += dealer_delta
+            d_entry[f'{opt_type}_vanna'] += dealer_vanna
+            d_entry[f'{opt_type}_charm'] += dealer_charm
+
+            # Per-expiry strike data (for expiry cache)
+            exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+            if exp_str not in expiry_strike_data:
+                expiry_strike_data[exp_str] = {}
+            desd = expiry_strike_data[exp_str]
+            if strike_btc not in desd:
+                desd[strike_btc] = {
+                    'call_oi': 0, 'put_oi': 0,
+                    'call_gex': 0, 'put_gex': 0,
+                    'call_delta': 0, 'put_delta': 0,
+                    'call_vanna': 0, 'put_vanna': 0,
+                    'call_charm': 0, 'put_charm': 0,
+                    'call_iv_sum': 0, 'call_iv_oi': 0,
+                    'put_iv_sum': 0, 'put_iv_oi': 0,
+                    'dte': int(opt['dte']),
+                }
+            desd[strike_btc][f'{opt_type}_oi'] += oi
+            desd[strike_btc][f'{opt_type}_gex'] += gex
+            desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
+            desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
+            desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
+            desd[strike_btc][f'{opt_type}_iv_sum'] += iv * oi
+            desd[strike_btc][f'{opt_type}_iv_oi'] += oi
+
+        # Collect IV for term structure
+        exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
+        if exp_str not in iv_data:
+            iv_data[exp_str] = []
+        iv_data[exp_str].append({
+            'strike': strike_btc, 'iv': iv,
+            'oi': oi, 'opt_type': opt_type,
+            'dte': opt['dte'], 'underlying': btc_s,
+        })
+
+    return strike_data, iv_data, total_oi_btc, expiry_strike_data
+
+
+def build_deribit_df(strike_data, full_greeks=False):
+    """Build a pandas DataFrame from Deribit strike_data dict.
+
+    When full_greeks=True, includes delta/vanna/charm and extra columns.
+    When False, fills required columns with zeros for _compute_levels_from_df."""
+    rows = []
+    for strike_btc, d in sorted(strike_data.items()):
+        row = {
+            'strike': strike_btc,
+            'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
+            'net_gex': d['call_gex'] + d['put_gex'],
+            'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
+            'total_oi': d['call_oi'] + d['put_oi'],
+            'active_gex': d['call_gex'] + d['put_gex'],
+        }
+        if full_greeks:
+            row.update({
+                'btc_price': strike_btc,
+                'net_dealer_delta': d['call_delta'] + d['put_delta'],
+                'net_vanna': d['call_vanna'] + d['put_vanna'],
+                'net_charm': d['call_charm'] + d['put_charm'],
+                'call_vanna': d['call_vanna'], 'put_vanna': d['put_vanna'],
+                'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
+                'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                'expiry_gex': {},
+            })
+        else:
+            row.update({
+                'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+            })
+        rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ── DATABASE ────────────────────────────────────────────────────────────────
@@ -339,7 +537,7 @@ def get_db():
 
 def get_prev_strikes(conn, ticker):
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date FROM snapshots WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -355,7 +553,7 @@ def get_prev_strikes(conn, ticker):
 
 
 def save_snapshot(conn, ticker, spot, btc_price, levels, df):
-    date_str = now_et().strftime('%Y-%m-%d')
+    date_str = today_str_et()
     c = conn.cursor()
     c.execute('''INSERT OR REPLACE INTO snapshots
         (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
@@ -1555,7 +1753,7 @@ def compute_macro_regime(conn, ticker, days=30):
     c = conn.cursor()
     cfg = TICKER_CONFIG.get(ticker, TICKER_CONFIG['IBIT'])
     btc_per_share = cfg.get('per_share') or cfg.get('per_share_default', 0.000568)
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     # ── Signal 1: Regime Persistence & Transition (-12 to +12) ───────────
     regime_score = 0
@@ -2286,7 +2484,7 @@ def fetch_coinglass_data():
     if not api_key:
         return  # Graceful - Phase 2 signals just return 0
 
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     with _coinglass_lock:
         conn = get_db()
@@ -2921,33 +3119,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             continue
         dte_val = iv_entries[0]['dte']
 
-        # ATM options: within 2% of spot
-        atm_entries = [e for e in iv_entries if abs(e['strike'] - spot) / spot < 0.02]
-        if not atm_entries:
-            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - spot))
-            atm_entries = sorted_by_dist[:2]
-        if not atm_entries:
+        result = compute_atm_iv(iv_entries, spot)
+        if not result:
             continue
-
-        total_oi = sum(e['oi'] for e in atm_entries)
-        if total_oi <= 0:
-            continue
-        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
-
-        atm_calls = [e for e in atm_entries if e['opt_type'] == 'call']
-        atm_puts = [e for e in atm_entries if e['opt_type'] == 'put']
-        call_oi_sum = sum(e['oi'] for e in atm_calls)
-        put_oi_sum = sum(e['oi'] for e in atm_puts)
-        call_iv = sum(e['iv'] * e['oi'] for e in atm_calls) / call_oi_sum if atm_calls and call_oi_sum > 0 else None
-        put_iv = sum(e['iv'] * e['oi'] for e in atm_puts) / put_oi_sum if atm_puts and put_oi_sum > 0 else None
 
         iv_term_structure.append({
             'expiry': exp_str,
             'dte': dte_val,
-            'atm_iv': round(atm_iv, 4),
-            'call_iv': round(call_iv, 4) if call_iv else None,
-            'put_iv': round(put_iv, 4) if put_iv else None,
-            'num_atm_options': len(atm_entries),
+            'atm_iv': result['atm_iv'],
+            'call_iv': result['call_iv'],
+            'put_iv': result['put_iv'],
+            'num_atm_options': result['num_entries'],
             'source': 'ibit',
         })
 
@@ -3001,8 +3183,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     # Deribit options integration
     deribit_available = False
     deribit_strike_data = {}
-    deribit_expiry_strike_data = {}  # exp_str -> {strike_btc -> {call_oi, ...}}
-    deribit_iv_data = {}   # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
+    deribit_expiry_strike_data = {}
+    deribit_iv_data = {}
     deribit_oi_btc = 0
     deribit_options = []
     deribit_currency = TICKER_CONFIG.get(ticker_symbol, {}).get('deribit_currency')
@@ -3011,119 +3193,17 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             deribit_options = fetch_deribit_options(min_dte, max_dte, currency=deribit_currency)
             if deribit_options:
                 deribit_available = True
-                for opt in deribit_options:
-                    strike_btc = opt['strike']
-                    oi = opt['oi']
-                    iv = opt['iv'] / 100.0  # Deribit gives IV as percentage
-                    btc_s = opt['underlying_price']
-                    T = max(opt['dte'] / 365.0, 0.5 / 365)
-                    opt_type = opt['option_type']
-                    sign = 1 if opt_type == 'call' else -1
-
-                    gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
-                    delta = bs_delta(btc_s, strike_btc, T, rfr, iv, opt_type)
-                    vanna = bs_vanna(btc_s, strike_btc, T, rfr, iv)
-                    charm = bs_charm(btc_s, strike_btc, T, rfr, iv, opt_type)
-
-                    # Contract multiplier = 1 BTC (not 100 shares)
-                    gex = sign * gamma * oi * 1 * btc_s ** 2 * 0.01
-                    dealer_delta = -delta * oi * 1 * btc_s  # dollar notional
-                    dealer_vanna = -vanna * oi * 1 * btc_s * 0.01  # dollar notional (vanna * n * S * 0.01)
-                    dealer_charm = -charm * oi * 1 / 365.0 * btc_s  # dollar notional
-
-                    deribit_oi_btc += oi
-
-                    if strike_btc not in deribit_strike_data:
-                        deribit_strike_data[strike_btc] = {
-                            'call_oi': 0, 'put_oi': 0, 'call_gex': 0, 'put_gex': 0,
-                            'call_delta': 0, 'put_delta': 0,
-                            'call_vanna': 0, 'put_vanna': 0,
-                            'call_charm': 0, 'put_charm': 0,
-                        }
-                    d_entry = deribit_strike_data[strike_btc]
-                    d_entry[f'{opt_type}_oi'] += oi
-                    d_entry[f'{opt_type}_gex'] += gex
-                    d_entry[f'{opt_type}_delta'] += dealer_delta
-                    d_entry[f'{opt_type}_vanna'] += dealer_vanna
-                    d_entry[f'{opt_type}_charm'] += dealer_charm
-
-                    deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
-                    if deribit_exp_str not in deribit_expiry_strike_data:
-                        deribit_expiry_strike_data[deribit_exp_str] = {}
-                    desd = deribit_expiry_strike_data[deribit_exp_str]
-                    if strike_btc not in desd:
-                        desd[strike_btc] = {
-                            'call_oi': 0, 'put_oi': 0,
-                            'call_gex': 0, 'put_gex': 0,
-                            'call_delta': 0, 'put_delta': 0,
-                            'call_vanna': 0, 'put_vanna': 0,
-                            'call_charm': 0, 'put_charm': 0,
-                            'call_iv_sum': 0, 'call_iv_oi': 0,
-                            'put_iv_sum': 0, 'put_iv_oi': 0,
-                            'dte': int(opt['dte']),
-                        }
-                    desd[strike_btc][f'{opt_type}_oi'] += oi
-                    desd[strike_btc][f'{opt_type}_gex'] += gex
-                    desd[strike_btc][f'{opt_type}_delta'] += dealer_delta
-                    desd[strike_btc][f'{opt_type}_vanna'] += dealer_vanna
-                    desd[strike_btc][f'{opt_type}_charm'] += dealer_charm
-                    desd[strike_btc][f'{opt_type}_iv_sum'] += iv * oi
-                    desd[strike_btc][f'{opt_type}_iv_oi'] += oi
-
-                    # Collect IV for term structure
-                    if deribit_exp_str not in deribit_iv_data:
-                        deribit_iv_data[deribit_exp_str] = []
-                    deribit_iv_data[deribit_exp_str].append({
-                        'strike': strike_btc, 'iv': opt['iv'] / 100.0,
-                        'oi': oi, 'opt_type': opt_type,
-                        'dte': opt['dte'], 'underlying': btc_s,
-                    })
+                deribit_strike_data, deribit_iv_data, deribit_oi_btc, deribit_expiry_strike_data = process_deribit_options(
+                    deribit_options, rfr, full_greeks=True
+                )
         except Exception as e:
             log.warning(f"[deribit] Failed: {e}")
 
     # Compute Deribit ATM IV per expiry and merge into IBIT term structure
-    for exp_str, iv_entries in sorted(deribit_iv_data.items()):
-        if not iv_entries:
-            continue
-        dte_val = iv_entries[0]['dte']
-        underlying = iv_entries[0]['underlying']
-        atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
-        if not atm_entries:
-            sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
-            atm_entries = sorted_by_dist[:2]
-        if not atm_entries:
-            continue
-        total_oi = sum(e['oi'] for e in atm_entries)
-        if total_oi <= 0:
-            continue
-        atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
-        iv_term_structure.append({
-            'expiry': exp_str,
-            'dte': round(dte_val, 1),
-            'atm_iv': round(atm_iv, 4),
-            'source': 'deribit',
-        })
+    iv_term_structure.extend(compute_deribit_iv_term(deribit_iv_data))
 
     # Build Deribit DataFrame
-    deribit_rows = []
-    for strike_btc, d_entry in sorted(deribit_strike_data.items()):
-        deribit_rows.append({
-            'strike': strike_btc,
-            'btc_price': strike_btc,
-            'call_oi': d_entry['call_oi'], 'put_oi': d_entry['put_oi'],
-            'total_oi': d_entry['call_oi'] + d_entry['put_oi'],
-            'call_gex': d_entry['call_gex'], 'put_gex': d_entry['put_gex'],
-            'net_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'net_dealer_delta': d_entry['call_delta'] + d_entry['put_delta'],
-            'net_vanna': d_entry['call_vanna'] + d_entry['put_vanna'],
-            'net_charm': d_entry['call_charm'] + d_entry['put_charm'],
-            'call_vanna': d_entry['call_vanna'], 'put_vanna': d_entry['put_vanna'],
-            'call_charm': d_entry['call_charm'], 'put_charm': d_entry['put_charm'],
-            'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
-            'active_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'expiry_gex': {},
-        })
-    deribit_df = pd.DataFrame(deribit_rows) if deribit_rows else pd.DataFrame()
+    deribit_df = build_deribit_df(deribit_strike_data, full_greeks=True)
 
     # Build combined DataFrame (BTC-price-keyed)
     ibit_btc_df = df.copy()
@@ -3343,7 +3423,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     try:
         conn_exp = get_db()
         c_exp = conn_exp.cursor()
-        today_str = now_et().strftime('%Y-%m-%d')
+        today_str = today_str_et()
 
         all_exp_dates = sorted(set(
             list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
@@ -4257,7 +4337,7 @@ def get_prev_cache(ticker, dte):
     """Return the second most recent cached data (yesterday's), or None."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, dte, today))
     row = c.fetchone()
@@ -4271,7 +4351,7 @@ def set_cached_data(ticker, dte, data):
     """Cache the full response JSON keyed to today's date."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('INSERT OR REPLACE INTO data_cache (date, ticker, dte, data_json) VALUES (?,?,?,?)',
               (today, ticker, dte, json.dumps(data, cls=NumpyEncoder)))
     conn.commit()
@@ -4281,7 +4361,7 @@ def set_cached_data(ticker, dte, data):
 def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
     """Return cached data if fresh, otherwise check Yahoo for new OI.
     force_refresh=True bypasses date check and OI comparison (used for Deribit refresh)."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     cache_date, cached = get_latest_cache(ticker, dte)
 
     # Already confirmed today's data (and min_dte matches) — unless force_refresh
@@ -4343,59 +4423,11 @@ def _refresh_deribit_only(ticker):
             if not deribit_options:
                 continue
 
-            # Process Deribit options (same math as fetch_and_analyze)
-            deribit_strike_data = {}
-            deribit_iv_data = {}  # exp_str -> list of {strike, iv, oi, opt_type, dte, underlying}
-            deribit_oi_btc = 0
-            for opt in deribit_options:
-                strike_btc = opt['strike']
-                oi = opt['oi']
-                iv = opt['iv'] / 100.0
-                btc_s = opt['underlying_price']
-                T = max(opt['dte'] / 365.0, 0.5 / 365)
-                opt_type = opt['option_type']
-                sign = 1 if opt_type == 'call' else -1
+            deribit_strike_data, deribit_iv_data, deribit_oi_btc, _ = process_deribit_options(
+                deribit_options, rfr, full_greeks=False
+            )
 
-                gamma = bs_gamma(btc_s, strike_btc, T, rfr, iv)
-                gex = sign * gamma * oi * btc_s ** 2 * 0.01
-                deribit_oi_btc += oi
-
-                if strike_btc not in deribit_strike_data:
-                    deribit_strike_data[strike_btc] = {'call_gex': 0, 'put_gex': 0, 'call_oi': 0, 'put_oi': 0}
-                deribit_strike_data[strike_btc][f'{opt_type}_gex'] += gex
-                deribit_strike_data[strike_btc][f'{opt_type}_oi'] += oi
-
-                # Collect IV for term structure
-                deribit_exp_str = opt['expiry_date'].strftime('%Y-%m-%d')
-                if deribit_exp_str not in deribit_iv_data:
-                    deribit_iv_data[deribit_exp_str] = []
-                deribit_iv_data[deribit_exp_str].append({
-                    'strike': strike_btc, 'iv': iv,
-                    'oi': oi, 'opt_type': opt_type,
-                    'dte': opt['dte'], 'underlying': btc_s,
-                })
-
-            # Compute Deribit ATM IV per expiry and merge into cached term structure
-            deribit_iv_term = []
-            for exp_str, iv_entries in sorted(deribit_iv_data.items()):
-                if not iv_entries:
-                    continue
-                dte_val = iv_entries[0]['dte']
-                underlying = iv_entries[0]['underlying']
-                atm_entries = [e for e in iv_entries if abs(e['strike'] - underlying) / underlying < 0.02]
-                if not atm_entries:
-                    sorted_by_dist = sorted(iv_entries, key=lambda e: abs(e['strike'] - underlying))
-                    atm_entries = sorted_by_dist[:2]
-                if not atm_entries:
-                    continue
-                total_oi = sum(e['oi'] for e in atm_entries)
-                if total_oi <= 0:
-                    continue
-                atm_iv = sum(e['iv'] * e['oi'] for e in atm_entries) / total_oi
-                deribit_iv_term.append({
-                    'expiry': exp_str, 'dte': round(dte_val, 1),
-                    'atm_iv': round(atm_iv, 4), 'source': 'deribit',
-                })
+            deribit_iv_term = compute_deribit_iv_term(deribit_iv_data)
 
             # Build lookup: BTC strike -> net_gex
             deribit_by_btc = {}
@@ -4435,18 +4467,7 @@ def _refresh_deribit_only(ticker):
             gex_chart.sort(key=lambda x: x.get('btc', 0))
 
             # Build simple Deribit-only df for level computation
-            deribit_rows = []
-            for strike_btc, d in sorted(deribit_strike_data.items()):
-                deribit_rows.append({
-                    'strike': strike_btc,
-                    'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
-                    'net_gex': d['call_gex'] + d['put_gex'],
-                    'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
-                    'total_oi': d['call_oi'] + d['put_oi'],
-                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
-                    'active_gex': d['call_gex'] + d['put_gex'],
-                })
-            deribit_df = pd.DataFrame(deribit_rows)
+            deribit_df = build_deribit_df(deribit_strike_data, full_greeks=False)
             deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if not deribit_df.empty else None
 
             # Rebuild combined levels from patched gex_chart
@@ -4558,7 +4579,7 @@ def _bg_refresh():
 
         # GEX refresh logic for all tickers
         for tk, cfg in TICKER_CONFIG.items():
-            today = now_et().strftime('%Y-%m-%d')
+            today = today_str_et()
             all_fresh = True
             stale_windows = []
             for label, min_d, max_d in REFRESH_DTES:
@@ -5488,7 +5509,7 @@ def get_cached_analysis(ticker):
     """Return cached analysis for today if it exists."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT analysis_json FROM analysis_cache WHERE date=? AND ticker=?',
               (today, ticker))
     row = c.fetchone()
@@ -5502,7 +5523,7 @@ def get_prev_analysis(ticker):
     """Return the most recent analysis before today, or None."""
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('SELECT date, analysis_json FROM analysis_cache WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
               (ticker, today))
     row = c.fetchone()
@@ -5519,7 +5540,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
         analysis['_timestamp'] = now_et().strftime('%Y-%m-%d %H:%M')
     conn = get_db()
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     c.execute('INSERT OR REPLACE INTO analysis_cache (date, ticker, analysis_json) VALUES (?,?,?)',
               (today, ticker, json.dumps(analysis)))
     conn.commit()
@@ -5528,7 +5549,7 @@ def set_cached_analysis(ticker, analysis, btc_price=None):
 
 def save_predictions(ticker, dtes, results, analysis_text=None):
     """Save structured predictions for each expiry date in each DTE window."""
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
     conn = get_db()
     c = conn.cursor()
 
@@ -5642,7 +5663,7 @@ def save_predictions(ticker, dtes, results, analysis_text=None):
 def score_expired_predictions(conn):
     """Score predictions whose expiry date has passed."""
     c = conn.cursor()
-    today = now_et().strftime('%Y-%m-%d')
+    today = today_str_et()
 
     c.execute('''SELECT DISTINCT expiry_date, ticker FROM predictions
                  WHERE scored=0 AND expiry_date < ?''', (today,))
