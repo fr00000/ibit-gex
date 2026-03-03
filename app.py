@@ -340,6 +340,40 @@ def process_deribit_options(options, rfr, full_greeks=False):
     return strike_data, iv_data, total_oi_btc, expiry_strike_data
 
 
+def build_deribit_df(strike_data, full_greeks=False):
+    """Build a pandas DataFrame from Deribit strike_data dict.
+
+    When full_greeks=True, includes delta/vanna/charm and extra columns.
+    When False, fills required columns with zeros for _compute_levels_from_df."""
+    rows = []
+    for strike_btc, d in sorted(strike_data.items()):
+        row = {
+            'strike': strike_btc,
+            'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
+            'net_gex': d['call_gex'] + d['put_gex'],
+            'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
+            'total_oi': d['call_oi'] + d['put_oi'],
+            'active_gex': d['call_gex'] + d['put_gex'],
+        }
+        if full_greeks:
+            row.update({
+                'btc_price': strike_btc,
+                'net_dealer_delta': d['call_delta'] + d['put_delta'],
+                'net_vanna': d['call_vanna'] + d['put_vanna'],
+                'net_charm': d['call_charm'] + d['put_charm'],
+                'call_vanna': d['call_vanna'], 'put_vanna': d['put_vanna'],
+                'call_charm': d['call_charm'], 'put_charm': d['put_charm'],
+                'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
+                'expiry_gex': {},
+            })
+        else:
+            row.update({
+                'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+            })
+        rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 # ── DATABASE ────────────────────────────────────────────────────────────────
 def init_db():
     """Create tables once at startup."""
@@ -3169,25 +3203,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     iv_term_structure.extend(compute_deribit_iv_term(deribit_iv_data))
 
     # Build Deribit DataFrame
-    deribit_rows = []
-    for strike_btc, d_entry in sorted(deribit_strike_data.items()):
-        deribit_rows.append({
-            'strike': strike_btc,
-            'btc_price': strike_btc,
-            'call_oi': d_entry['call_oi'], 'put_oi': d_entry['put_oi'],
-            'total_oi': d_entry['call_oi'] + d_entry['put_oi'],
-            'call_gex': d_entry['call_gex'], 'put_gex': d_entry['put_gex'],
-            'net_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'net_dealer_delta': d_entry['call_delta'] + d_entry['put_delta'],
-            'net_vanna': d_entry['call_vanna'] + d_entry['put_vanna'],
-            'net_charm': d_entry['call_charm'] + d_entry['put_charm'],
-            'call_vanna': d_entry['call_vanna'], 'put_vanna': d_entry['put_vanna'],
-            'call_charm': d_entry['call_charm'], 'put_charm': d_entry['put_charm'],
-            'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
-            'active_gex': d_entry['call_gex'] + d_entry['put_gex'],
-            'expiry_gex': {},
-        })
-    deribit_df = pd.DataFrame(deribit_rows) if deribit_rows else pd.DataFrame()
+    deribit_df = build_deribit_df(deribit_strike_data, full_greeks=True)
 
     # Build combined DataFrame (BTC-price-keyed)
     ibit_btc_df = df.copy()
@@ -4451,18 +4467,7 @@ def _refresh_deribit_only(ticker):
             gex_chart.sort(key=lambda x: x.get('btc', 0))
 
             # Build simple Deribit-only df for level computation
-            deribit_rows = []
-            for strike_btc, d in sorted(deribit_strike_data.items()):
-                deribit_rows.append({
-                    'strike': strike_btc,
-                    'call_gex': d['call_gex'], 'put_gex': d['put_gex'],
-                    'net_gex': d['call_gex'] + d['put_gex'],
-                    'call_oi': d['call_oi'], 'put_oi': d['put_oi'],
-                    'total_oi': d['call_oi'] + d['put_oi'],
-                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
-                    'active_gex': d['call_gex'] + d['put_gex'],
-                })
-            deribit_df = pd.DataFrame(deribit_rows)
+            deribit_df = build_deribit_df(deribit_strike_data, full_greeks=False)
             deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if not deribit_df.empty else None
 
             # Rebuild combined levels from patched gex_chart
