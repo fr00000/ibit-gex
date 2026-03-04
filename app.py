@@ -4471,11 +4471,28 @@ def api_expiry_data():
 
     # --- List mode: return available expiries ---
     if not expiry and not from_date:
-        expiries = c.execute(
-            'SELECT expiry_date, data_json FROM expiry_cache '
-            'WHERE date=? AND ticker=? ORDER BY expiry_date',
-            (snapshot_date, ticker)
-        ).fetchall()
+        if request.args.get('date'):
+            # Explicit date requested — use that snapshot's data as-is
+            expiries = c.execute(
+                'SELECT expiry_date, data_json FROM expiry_cache '
+                'WHERE date=? AND ticker=? ORDER BY expiry_date',
+                (snapshot_date, ticker)
+            ).fetchall()
+        else:
+            # No explicit date — use latest data per expiry (handles partial-day writes)
+            expiries = c.execute('''
+                SELECT e.expiry_date, e.data_json
+                FROM expiry_cache e
+                INNER JOIN (
+                    SELECT expiry_date, MAX(date) as latest_date
+                    FROM expiry_cache WHERE ticker=?
+                    GROUP BY expiry_date
+                ) latest ON e.expiry_date = latest.expiry_date
+                       AND e.date = latest.latest_date
+                WHERE e.ticker=?
+                ORDER BY e.expiry_date
+            ''', (ticker, ticker)).fetchall()
+
         conn.close()
         now_eastern = now_et()
         skip_today = now_eastern.hour >= 16
@@ -4499,18 +4516,46 @@ def api_expiry_data():
                         mimetype='application/json')
 
     # --- Single expiry or range mode ---
-    if expiry:
-        rows = c.execute(
-            'SELECT data_json FROM expiry_cache '
-            'WHERE date=? AND ticker=? AND expiry_date=?',
-            (snapshot_date, ticker, expiry)
-        ).fetchall()
+    if request.args.get('date'):
+        # Explicit date — use that snapshot
+        if expiry:
+            rows = c.execute(
+                'SELECT data_json FROM expiry_cache '
+                'WHERE date=? AND ticker=? AND expiry_date=?',
+                (snapshot_date, ticker, expiry)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                'SELECT data_json FROM expiry_cache '
+                'WHERE date=? AND ticker=? AND expiry_date>=? AND expiry_date<=?',
+                (snapshot_date, ticker, from_date, to_date)
+            ).fetchall()
     else:
-        rows = c.execute(
-            'SELECT data_json FROM expiry_cache '
-            'WHERE date=? AND ticker=? AND expiry_date>=? AND expiry_date<=?',
-            (snapshot_date, ticker, from_date, to_date)
-        ).fetchall()
+        # No explicit date — use latest per expiry
+        if expiry:
+            row = c.execute(
+                'SELECT data_json FROM expiry_cache '
+                'WHERE ticker=? AND expiry_date=? ORDER BY date DESC LIMIT 1',
+                (ticker, expiry)
+            ).fetchone()
+            rows = [row] if row else []
+        else:
+            # Range: get latest row for each expiry in range
+            target_expiries = c.execute('''
+                SELECT expiry_date, MAX(date) as latest_date
+                FROM expiry_cache
+                WHERE ticker=? AND expiry_date>=? AND expiry_date<=?
+                GROUP BY expiry_date
+            ''', (ticker, from_date, to_date)).fetchall()
+            rows = []
+            for exp_date, latest_date in target_expiries:
+                row = c.execute(
+                    'SELECT data_json FROM expiry_cache '
+                    'WHERE date=? AND ticker=? AND expiry_date=?',
+                    (latest_date, ticker, exp_date)
+                ).fetchone()
+                if row:
+                    rows.append(row)
 
     conn.close()
 
