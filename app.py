@@ -3179,8 +3179,6 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
             )
         conn_exp.commit()
         conn_exp.close()
-        # Invalidate weekly outlook cache for this ticker since expiry data changed
-        _weekly_outlook_cache.pop(ticker_symbol, None)
     except Exception as e:
         log.warning(f"[expiry-cache] Failed to store per-expiry data: {e}")
 
@@ -3530,6 +3528,12 @@ def _bg_refresh():
                             w = futures[fut]
                             log.error(f"[bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
 
+                # Pre-compute weekly outlook with fresh expiry data
+                try:
+                    _compute_weekly_outlook(tk)
+                except Exception as e:
+                    log.warning(f"[bg-refresh] {tk} weekly outlook compute error: {e}")
+
             if all_fresh:
                 # Re-run AI analysis only if ref asset moved >2% since last analysis
                 # (Primary analysis is triggered post-close at 4:20 PM ET)
@@ -3582,6 +3586,11 @@ def _bg_refresh():
                                         w = futures[fut]
                                         log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
                             log.info(f"[bg-refresh] {tk} Deribit full refresh complete")
+                            # Re-compute weekly outlook with fresh Deribit data
+                            try:
+                                _compute_weekly_outlook(tk)
+                            except Exception as e:
+                                log.warning(f"[bg-refresh] {tk} weekly outlook recompute error: {e}")
                         else:
                             # Weekend: IBIT stale, only update Deribit fields in cached blobs
                             log.info(f"[bg-refresh] {tk} Deribit stale, weekend overlay...")
@@ -3614,6 +3623,12 @@ def _bg_refresh():
                             except Exception as e:
                                 w = futures[fut]
                                 log.error(f"[bg-refresh] {tk} post-close DTE {w[1]}-{w[2]} error: {e}")
+
+                    # Pre-compute weekly outlook with fresh post-close data
+                    try:
+                        _compute_weekly_outlook(tk)
+                    except Exception as e:
+                        log.warning(f"[bg-refresh] {tk} weekly outlook post-close error: {e}")
 
                     # Run analysis with fresh data
                     try:
@@ -3728,6 +3743,127 @@ def api_snapshot_dates():
     return Response(json.dumps({'dates': [r[0] for r in rows]}), mimetype='application/json')
 
 
+def _compute_weekly_outlook(ticker):
+    """Pre-compute weekly outlook and store in _weekly_outlook_cache."""
+    from datetime import datetime as dt_cls
+    conn = get_db()
+    c = conn.cursor()
+
+    row = c.execute(
+        'SELECT MAX(date) FROM expiry_cache WHERE ticker=?', (ticker,)
+    ).fetchone()
+    snapshot_date = row[0] if row and row[0] else None
+
+    if not snapshot_date:
+        conn.close()
+        return
+
+    expiry_dates = [r[0] for r in c.execute(
+        'SELECT DISTINCT expiry_date FROM expiry_cache '
+        'WHERE date=? AND ticker=? ORDER BY expiry_date',
+        (snapshot_date, ticker)
+    ).fetchall()]
+
+    now_eastern = now_et()
+    today_str = now_eastern.strftime('%Y-%m-%d')
+    if now_eastern.hour >= 16:
+        expiry_dates = [d for d in expiry_dates if d > today_str]
+    else:
+        expiry_dates = [d for d in expiry_dates if d >= today_str]
+
+    weekly_buckets = {}
+    for exp in expiry_dates:
+        exp_dt = dt_cls.strptime(exp, '%Y-%m-%d')
+        monday = exp_dt - timedelta(days=exp_dt.weekday())
+        key = monday.strftime('%Y-%m-%d')
+        if key not in weekly_buckets:
+            weekly_buckets[key] = {'monday': monday, 'expiries': []}
+        weekly_buckets[key]['expiries'].append(exp)
+
+    windows = []
+    spot_btc = None
+
+    for week_key in sorted(weekly_buckets.keys()):
+        bucket = weekly_buckets[week_key]
+        mon = bucket['monday']
+        week_expiries = bucket['expiries']
+
+        placeholders = ','.join(['?'] * len(week_expiries))
+        rows = c.execute(
+            f'SELECT data_json FROM expiry_cache '
+            f'WHERE date=? AND ticker=? AND expiry_date IN ({placeholders})',
+            (snapshot_date, ticker, *week_expiries)
+        ).fetchall()
+
+        if not rows:
+            continue
+
+        agg = _aggregate_expiry_blobs(rows)
+        if not agg:
+            continue
+
+        if spot_btc is None:
+            spot_btc = agg['spot_btc']
+
+        lvl = agg['levels_btc'] or {}
+        cw = lvl.get('call_wall')
+        pw = lvl.get('put_wall')
+        gf = lvl.get('gamma_flip')
+
+        today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+        min_dte = (mon - today_dt).days
+        last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+        max_dte = (last_exp - today_dt).days
+
+        delta_flip_btc = None
+        if agg['delta_flip_points']:
+            delta_flip_btc = agg['delta_flip_points'][0].get('price_btc')
+
+        ff = agg.get('flow_forecast') or {}
+        charm = ff.get('charm', {})
+
+        dd_dir = None
+        if agg['dealer_delta_profile'] and spot_btc:
+            closest = min(agg['dealer_delta_profile'],
+                          key=lambda x: abs(x['price_btc'] - spot_btc))
+            dd_val = closest.get('net_dealer_delta', 0)
+            dd_dir = 'short' if dd_val < 0 else 'long' if dd_val > 0 else None
+
+        last_exp_dt = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+        label = f"{mon.strftime('%m/%d')}-{last_exp_dt.strftime('%d')}"
+
+        windows.append({
+            'label': label,
+            'min_dte': max(round(min_dte), 0),
+            'max_dte': max(round(max_dte), 0),
+            'call_wall': cw,
+            'put_wall': pw,
+            'gamma_flip': gf,
+            'regime': agg['regime'],
+            'net_gex': agg['net_gex_total'],
+            'em_upper': None,
+            'em_lower': None,
+            'venue_agree': False,
+            'ibit_cw': None,
+            'ibit_pw': None,
+            'deribit_cw': None,
+            'deribit_pw': None,
+            'dealer_delta_dir': dd_dir,
+            'charm_dir': charm.get('direction'),
+            'delta_flip_btc': round(delta_flip_btc) if delta_flip_btc else None,
+        })
+
+    conn.close()
+
+    result = {
+        'spot': spot_btc,
+        'mode': 'weekly',
+        'windows': windows,
+    }
+    _weekly_outlook_cache[ticker] = {'date': snapshot_date, 'result': result}
+    log.info(f"[weekly-outlook] Computed {ticker}: {len(windows)} weekly windows")
+
+
 @app.route('/api/outlook')
 def api_outlook():
     """Return key levels from all DTE windows for the outlook funnel chart."""
@@ -3741,133 +3877,12 @@ def api_outlook():
     spot_btc = None
 
     if mode == 'weekly':
-        conn = get_db()
-        c = conn.cursor()
-
-        if not snapshot_date:
-            row = c.execute(
-                'SELECT MAX(date) FROM expiry_cache WHERE ticker=?', (ticker,)
-            ).fetchone()
-            snapshot_date = row[0] if row and row[0] else None
-
-        if not snapshot_date:
-            conn.close()
-            return Response(json.dumps({'spot': None, 'mode': 'weekly', 'windows': []}),
-                            mimetype='application/json')
-
-        # Check cache
         cached_weekly = _weekly_outlook_cache.get(ticker)
-        if cached_weekly and cached_weekly['date'] == snapshot_date:
-            conn.close()
+        if cached_weekly:
             return Response(json.dumps(cached_weekly['result'], cls=NumpyEncoder),
                             mimetype='application/json')
-
-        # Cache miss — compute from scratch
-        expiry_dates = [r[0] for r in c.execute(
-            'SELECT DISTINCT expiry_date FROM expiry_cache '
-            'WHERE date=? AND ticker=? ORDER BY expiry_date',
-            (snapshot_date, ticker)
-        ).fetchall()]
-
-        now_eastern = now_et()
-        today_str = now_eastern.strftime('%Y-%m-%d')
-        if now_eastern.hour >= 16:
-            expiry_dates = [d for d in expiry_dates if d > today_str]
-        else:
-            expiry_dates = [d for d in expiry_dates if d >= today_str]
-
-        from datetime import datetime as dt_cls
-        weekly_buckets = {}
-        for exp in expiry_dates:
-            exp_dt = dt_cls.strptime(exp, '%Y-%m-%d')
-            monday = exp_dt - timedelta(days=exp_dt.weekday())
-            key = monday.strftime('%Y-%m-%d')
-            if key not in weekly_buckets:
-                weekly_buckets[key] = {'monday': monday, 'expiries': []}
-            weekly_buckets[key]['expiries'].append(exp)
-
-        for week_key in sorted(weekly_buckets.keys()):
-            bucket = weekly_buckets[week_key]
-            mon = bucket['monday']
-            week_expiries = bucket['expiries']
-
-            placeholders = ','.join(['?'] * len(week_expiries))
-            rows = c.execute(
-                f'SELECT data_json FROM expiry_cache '
-                f'WHERE date=? AND ticker=? AND expiry_date IN ({placeholders})',
-                (snapshot_date, ticker, *week_expiries)
-            ).fetchall()
-
-            if not rows:
-                continue
-
-            agg = _aggregate_expiry_blobs(rows)
-            if not agg:
-                continue
-
-            if spot_btc is None:
-                spot_btc = agg['spot_btc']
-
-            lvl = agg['levels_btc'] or {}
-            cw = lvl.get('call_wall')
-            pw = lvl.get('put_wall')
-            gf = lvl.get('gamma_flip')
-
-            today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
-            min_dte = (mon - today_dt).days
-            last_exp = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
-            max_dte = (last_exp - today_dt).days
-
-            delta_flip_btc = None
-            if agg['delta_flip_points']:
-                delta_flip_btc = agg['delta_flip_points'][0].get('price_btc')
-
-            ff = agg.get('flow_forecast') or {}
-            charm = ff.get('charm', {})
-
-            dd_dir = None
-            if agg['dealer_delta_profile'] and spot_btc:
-                closest = min(agg['dealer_delta_profile'],
-                              key=lambda x: abs(x['price_btc'] - spot_btc))
-                dd_val = closest.get('net_dealer_delta', 0)
-                dd_dir = 'short' if dd_val < 0 else 'long' if dd_val > 0 else None
-
-            last_exp_dt = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
-            label = f"{mon.strftime('%m/%d')}-{last_exp_dt.strftime('%d')}"
-
-            windows.append({
-                'label': label,
-                'min_dte': max(round(min_dte), 0),
-                'max_dte': max(round(max_dte), 0),
-                'call_wall': cw,
-                'put_wall': pw,
-                'gamma_flip': gf,
-                'regime': agg['regime'],
-                'net_gex': agg['net_gex_total'],
-                'em_upper': None,
-                'em_lower': None,
-                'venue_agree': False,
-                'ibit_cw': None,
-                'ibit_pw': None,
-                'deribit_cw': None,
-                'deribit_pw': None,
-                'dealer_delta_dir': dd_dir,
-                'charm_dir': charm.get('direction'),
-                'delta_flip_btc': round(delta_flip_btc) if delta_flip_btc else None,
-            })
-
-        conn.close()
-
-        result = {
-            'spot': spot_btc,
-            'mode': 'weekly',
-            'windows': windows,
-        }
-
-        # Store in cache
-        _weekly_outlook_cache[ticker] = {'date': snapshot_date, 'result': result}
-
-        return Response(json.dumps(result, cls=NumpyEncoder), mimetype='application/json')
+        return Response(json.dumps({'spot': None, 'mode': 'weekly', 'windows': []}),
+                        mimetype='application/json')
 
     for dte_key, min_d, max_d in DTE_WINDOWS:
         _, cached = get_latest_cache(ticker, dte_key, target_date=snapshot_date)
