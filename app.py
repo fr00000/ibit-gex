@@ -4471,6 +4471,10 @@ def api_expiry_data():
 
     # --- List mode: return available expiries ---
     if not expiry and not from_date:
+        now_eastern = now_et()
+        today_str = now_eastern.strftime('%Y-%m-%d')
+        skip_today = now_eastern.hour >= 16
+
         if request.args.get('date'):
             # Explicit date requested — use that snapshot's data as-is
             expiries = c.execute(
@@ -4485,18 +4489,15 @@ def api_expiry_data():
                 FROM expiry_cache e
                 INNER JOIN (
                     SELECT expiry_date, MAX(date) as latest_date
-                    FROM expiry_cache WHERE ticker=?
+                    FROM expiry_cache WHERE ticker=? AND expiry_date>=?
                     GROUP BY expiry_date
                 ) latest ON e.expiry_date = latest.expiry_date
                        AND e.date = latest.latest_date
                 WHERE e.ticker=?
                 ORDER BY e.expiry_date
-            ''', (ticker, ticker)).fetchall()
+            ''', (ticker, today_str, ticker)).fetchall()
 
         conn.close()
-        now_eastern = now_et()
-        skip_today = now_eastern.hour >= 16
-        today_str = now_eastern.strftime('%Y-%m-%d')
         result = []
         for exp_date, dj in expiries:
             if skip_today and exp_date == today_str:
