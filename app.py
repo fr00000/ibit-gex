@@ -3749,20 +3749,20 @@ def _compute_weekly_outlook(ticker):
     conn = get_db()
     c = conn.cursor()
 
-    row = c.execute(
-        'SELECT MAX(date) FROM expiry_cache WHERE ticker=?', (ticker,)
-    ).fetchone()
-    snapshot_date = row[0] if row and row[0] else None
+    # Get the most recent snapshot date per expiry (same pattern as DTE's get_latest_cache)
+    latest_per_expiry = c.execute('''
+        SELECT expiry_date, MAX(date) as latest_date
+        FROM expiry_cache WHERE ticker=?
+        GROUP BY expiry_date
+        ORDER BY expiry_date
+    ''', (ticker,)).fetchall()
 
-    if not snapshot_date:
+    if not latest_per_expiry:
         conn.close()
         return
 
-    expiry_dates = [r[0] for r in c.execute(
-        'SELECT DISTINCT expiry_date FROM expiry_cache '
-        'WHERE date=? AND ticker=? ORDER BY expiry_date',
-        (snapshot_date, ticker)
-    ).fetchall()]
+    expiry_dates = [r[0] for r in latest_per_expiry]
+    expiry_snapshot = {r[0]: r[1] for r in latest_per_expiry}
 
     now_eastern = now_et()
     today_str = now_eastern.strftime('%Y-%m-%d')
@@ -3788,12 +3788,17 @@ def _compute_weekly_outlook(ticker):
         mon = bucket['monday']
         week_expiries = bucket['expiries']
 
-        placeholders = ','.join(['?'] * len(week_expiries))
-        rows = c.execute(
-            f'SELECT data_json FROM expiry_cache '
-            f'WHERE date=? AND ticker=? AND expiry_date IN ({placeholders})',
-            (snapshot_date, ticker, *week_expiries)
-        ).fetchall()
+        # Query the most recent row for each expiry in this bucket
+        rows = []
+        for exp in week_expiries:
+            snap = expiry_snapshot[exp]
+            row = c.execute(
+                'SELECT data_json FROM expiry_cache '
+                'WHERE date=? AND ticker=? AND expiry_date=?',
+                (snap, ticker, exp)
+            ).fetchone()
+            if row:
+                rows.append(row)
 
         if not rows:
             continue
