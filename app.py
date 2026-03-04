@@ -107,6 +107,7 @@ DTE_WINDOWS = [
     (30, 15, 30),  # Monthly cycle positioning
     (45, 31, 45),  # Structural / quarterly
 ]
+WEEKLY_OUTLOOK_DTE = 999  # sentinel DTE key for weekly outlook in data_cache
 
 TICKER_CONFIG = {
     'IBIT': {
@@ -2117,7 +2118,6 @@ _deribit_caches = {
     'ETH': {'data': None, 'time': 0},
 }
 _deribit_lock = threading.Lock()
-_weekly_outlook_cache = {}  # {ticker: {'date': snapshot_date, 'result': response_dict}}
 DERIBIT_BASE_URL = 'https://www.deribit.com/api/v2/public/get_book_summary_by_currency?kind=option&currency='
 DERIBIT_CACHE_SECONDS = 900
 
@@ -3744,7 +3744,7 @@ def api_snapshot_dates():
 
 
 def _compute_weekly_outlook(ticker):
-    """Pre-compute weekly outlook and store in _weekly_outlook_cache."""
+    """Pre-compute weekly outlook and store in data_cache via set_cached_data."""
     from datetime import datetime as dt_cls
     conn = get_db()
     c = conn.cursor()
@@ -3860,7 +3860,7 @@ def _compute_weekly_outlook(ticker):
         'mode': 'weekly',
         'windows': windows,
     }
-    _weekly_outlook_cache[ticker] = {'date': snapshot_date, 'result': result}
+    set_cached_data(ticker, WEEKLY_OUTLOOK_DTE, result)
     log.info(f"[weekly-outlook] Computed {ticker}: {len(windows)} weekly windows")
 
 
@@ -3877,9 +3877,9 @@ def api_outlook():
     spot_btc = None
 
     if mode == 'weekly':
-        cached_weekly = _weekly_outlook_cache.get(ticker)
-        if cached_weekly:
-            return Response(json.dumps(cached_weekly['result'], cls=NumpyEncoder),
+        _, cached = get_latest_cache(ticker, WEEKLY_OUTLOOK_DTE, target_date=snapshot_date)
+        if cached:
+            return Response(json.dumps(cached, cls=NumpyEncoder),
                             mimetype='application/json')
         return Response(json.dumps({'spot': None, 'mode': 'weekly', 'windows': []}),
                         mimetype='application/json')
