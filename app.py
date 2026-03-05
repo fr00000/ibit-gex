@@ -5778,7 +5778,6 @@ def build_analysis_data(ticker='IBIT'):
     if not cfg:
         raise ValueError(f'Unknown ticker: {ticker}')
 
-    dtes = DTE_WINDOWS  # list of (label, min_dte, max_dte)
     results = {}
 
     # Fetch live ref asset price so the AI sees current price, not stale cache
@@ -5788,24 +5787,75 @@ def build_analysis_data(ticker='IBIT'):
     except Exception:
         pass
 
-    def fetch_dte(window):
-        label, min_d, max_d = window
-        # Prefer expiry-first aggregation, fall back to legacy cache
-        data = aggregate_dte_window(ticker, min_d, max_d)
-        if data is None:
-            data = fetch_with_cache(ticker, max_d, min_d)
-        return label, data
-
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(fetch_dte, w): w for w in dtes}
-        for fut in as_completed(futures):
-            label, data = fut.result()
-            results[label] = data
-
-    # Compute history trends (ticker-level, shared across all DTEs)
-    first_label = dtes[0][0]
+    # --- Weekly expiry bucketing (same pattern as _compute_weekly_outlook) ---
+    from datetime import datetime as dt_cls
     conn = get_db()
-    history_trends = summarize_history_trends(conn, ticker, results[first_label]['btc_per_share'], results[first_label]['levels'])
+    c = conn.cursor()
+    latest_per_expiry = c.execute('''
+        SELECT expiry_date, MAX(date) as latest_date
+        FROM expiry_cache WHERE ticker=?
+        GROUP BY expiry_date
+        ORDER BY expiry_date
+    ''', (ticker,)).fetchall()
+
+    now_eastern = now_et()
+    today_s = now_eastern.strftime('%Y-%m-%d')
+    if now_eastern.hour >= 16:
+        valid_expiries = [(r[0], r[1]) for r in latest_per_expiry if r[0] > today_s]
+    else:
+        valid_expiries = [(r[0], r[1]) for r in latest_per_expiry if r[0] >= today_s]
+
+    weekly_buckets = {}
+    expiry_snapshot = {}
+    for exp, snap in valid_expiries:
+        expiry_snapshot[exp] = snap
+        exp_dt = dt_cls.strptime(exp, '%Y-%m-%d')
+        monday = exp_dt - timedelta(days=exp_dt.weekday())
+        key = monday.strftime('%Y-%m-%d')
+        if key not in weekly_buckets:
+            weekly_buckets[key] = {'monday': monday, 'expiries': []}
+        weekly_buckets[key]['expiries'].append(exp)
+
+    # Build range_keys list: ordered weekly bucket labels + metadata
+    range_keys = []  # list of (label, expiry_list, min_dte, max_dte)
+    today_dt = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+
+    for week_key in sorted(weekly_buckets.keys()):
+        bucket = weekly_buckets[week_key]
+        mon = bucket['monday']
+        week_expiries = bucket['expiries']
+
+        rows = []
+        for exp in week_expiries:
+            snap = expiry_snapshot[exp]
+            row = c.execute(
+                'SELECT data_json FROM expiry_cache WHERE date=? AND ticker=? AND expiry_date=?',
+                (snap, ticker, exp)
+            ).fetchone()
+            if row:
+                rows.append(row)
+
+        if not rows:
+            continue
+
+        agg = _aggregate_expiry_blobs(rows, ticker=ticker)
+        if not agg:
+            continue
+
+        last_exp_dt = dt_cls.strptime(week_expiries[-1], '%Y-%m-%d')
+        label = f"{mon.strftime('%m/%d')}-{last_exp_dt.strftime('%d')}"
+        min_dte = max((mon - today_dt).days, 0)
+        max_dte = max((last_exp_dt - today_dt).days, 0)
+
+        results[label] = agg
+        range_keys.append((label, week_expiries, min_dte, max_dte))
+
+    # Compute history trends (ticker-level, shared across all ranges)
+    first_key = range_keys[0][0] if range_keys else None
+    if first_key and first_key in results:
+        history_trends = summarize_history_trends(conn, ticker, results[first_key]['btc_per_share'], results[first_key]['levels'])
+    else:
+        history_trends = {}
     structure_trends = summarize_structure_trends(conn, ticker, days=7)
     conn.close()
 
@@ -5833,7 +5883,7 @@ def build_analysis_data(ticker='IBIT'):
     except Exception as e:
         log.warning(f"[analysis] Macro regime computation failed: {e}")
 
-    for label, min_d, max_d in dtes:
+    for label, expiry_list, min_d, max_d in range_keys:
         d = results[label]
         bps = d['btc_per_share']
         ibit_lvl = d['levels']  # IBIT-only levels (in IBIT strike space)
@@ -5841,7 +5891,7 @@ def build_analysis_data(ticker='IBIT'):
         combined_lvl = d.get('combined_levels_btc') or {}  # combined levels (in BTC space)
         deribit_lvl = d.get('deribit_levels_btc') or {}  # Deribit-only levels (in BTC space)
         current_btc = live_ref_price if live_ref_price else d['btc_spot']
-        key = f"{min_d}-{max_d}d"
+        key = label
 
         # Use combined levels as primary when Deribit is available
         if deribit_avail and combined_lvl:
@@ -5880,6 +5930,7 @@ def build_analysis_data(ticker='IBIT'):
             source_label = 'IBIT only (~52% of BTC options OI)'
 
         summaries[key] = {
+            'expiries': expiry_list,
             'spot_btc': round(current_btc),
             'spot_ibit': d['spot'],
             'btc_per_share': bps,
@@ -5946,7 +5997,7 @@ def build_analysis_data(ticker='IBIT'):
             'data_freshness': d.get('data_freshness'),
         }
 
-        # IV term structure for this DTE window
+        # IV term structure for this expiry range
         iv_ts = d.get('iv_term_structure', [])
         if iv_ts:
             summaries[key]['iv_term_structure'] = [
@@ -6010,7 +6061,9 @@ def build_analysis_data(ticker='IBIT'):
             summaries[key]['gex_distribution'] = []
 
         # Add day-over-day level changes if previous data exists
-        prev_date, prev_data = get_prev_cache(ticker, max_d)
+        # Map weekly bucket max_dte to closest DTE_WINDOWS entry for prev lookup
+        closest_dte = min(DTE_WINDOWS, key=lambda w: abs(w[2] - max_d))[2]
+        prev_date, prev_data = get_prev_cache(ticker, closest_dte)
         if prev_data:
             prev_lvl = prev_data['levels']
             prev_bps = prev_data.get('btc_per_share', bps)
@@ -6096,7 +6149,7 @@ def build_analysis_data(ticker='IBIT'):
 
 
 def run_analysis(ticker='IBIT', save=True):
-    """Run AI analysis across all DTEs. Returns analysis dict or raises."""
+    """Run AI analysis across weekly expiry ranges. Returns analysis dict or raises."""
     cfg = TICKER_CONFIG.get(ticker)
     if not cfg:
         raise ValueError(f'Unknown ticker: {ticker}')
@@ -6106,10 +6159,12 @@ def run_analysis(ticker='IBIT', save=True):
 
     summaries = build_analysis_data(ticker)
     live_ref_price = summaries.pop('_live_ref_price', None)
+    # Extract range keys (non-underscore keys) for dynamic prompt
+    range_keys = [k for k in summaries if not k.startswith('_')]
     prompt_data = json.dumps(summaries, cls=NumpyEncoder, indent=1)
 
     asset = cfg['asset_label']
-    system_prompt = f"""You are a GEX (Gamma Exposure) trading analyst for {cfg['name']} ({asset} ETF). You analyze options flow data across multiple DTE timeframes to provide actionable trading insights.
+    system_prompt = f"""You are a GEX (Gamma Exposure) trading analyst for {cfg['name']} ({asset} ETF). You analyze options flow data across weekly expiry ranges to provide actionable trading insights.
 
 IMPORTANT: {cfg['name']} is a {asset} ETF proxy. The data contains both {cfg['name']} share prices and {asset}-equivalent prices (in levels_btc). ALWAYS use {asset} prices in your analysis (e.g. "$65,200" not "$37.0"). Use the levels_btc fields for all price references. You can convert any {cfg['name']} price to {asset} by dividing by btc_per_share.
 
@@ -6148,7 +6203,7 @@ venue_breakdown (when present) shows per-venue positioning. Use it to identify d
 Only call out divergences when they're material (different wall locations or different gamma regimes). Don't list venue breakdowns mechanically — synthesize them into a trading-relevant insight.
 
 GEX DISTRIBUTION:
-gex_distribution shows the top 20 strikes by GEX magnitude for each window, sorted by BTC price. Use this to assess whether support/resistance is concentrated at a single strike (sharp wall) or spread across a zone (gradient). A put wall backed by one large strike is easier to break than negative GEX spread across 5 strikes. Pay attention to the ibit_gex vs deribit_gex split — if one venue dominates at a level, it's less robust than both venues contributing.
+gex_distribution shows the top 20 strikes by GEX magnitude for each range, sorted by BTC price. Use this to assess whether support/resistance is concentrated at a single strike (sharp wall) or spread across a zone (gradient). A put wall backed by one large strike is easier to break than negative GEX spread across 5 strikes. Pay attention to the ibit_gex vs deribit_gex split — if one venue dominates at a level, it's less robust than both venues contributing.
 
 DATA FRESHNESS:
 data_freshness shows how stale each venue's data is. IBIT options data updates once per day at US market close (4:15 PM ET) — age_hours tells you how many hours since that last close. Deribit data is near real-time (cached up to 60 minutes) — age_minutes tells you minutes since last fetch. If IBIT age_hours > 16 (e.g., weekend or overnight), note that IBIT levels may be stale while Deribit reflects current positioning. If in_market_hours is true, IBIT data is from the current or most recent session and is fresh. On weekends, IBIT data can be 40+ hours old — Deribit levels become more reliable for current positioning.
@@ -6156,17 +6211,17 @@ data_freshness shows how stale each venue's data is. IBIT options data updates o
 venue_breakdown also includes per-venue vanna and charm totals. If overnight charm flow is dominated by one venue, note it — e.g., "Deribit charm is 3x IBIT charm, suggesting crypto-native MMs will drive overnight rebalancing" or "IBIT charm dominates, overnight flow will come through ETF share market."
 
 IV TERM STRUCTURE (when present):
-iv_term_structure shows ATM implied volatility for each expiry within the DTE window, from both IBIT and Deribit sources. Entries are sorted by DTE (shortest first).
+iv_term_structure shows ATM implied volatility for each expiry within the range, from both IBIT and Deribit sources. Entries are sorted by DTE (shortest first).
 
 Use this to assess:
-- FEAR GAUGE: If the nearest expiry's ATM IV is significantly higher than longer-dated expiries within the same window, there's elevated near-term hedging demand. This often coincides with put buying and precedes volatile moves.
+- FEAR GAUGE: If the nearest expiry's ATM IV is significantly higher than longer-dated expiries within the same range, there's elevated near-term hedging demand. This often coincides with put buying and precedes volatile moves.
 - CROSS-VENUE IV: When both IBIT and Deribit have entries for similar expiries, compare them. Deribit IV typically leads — crypto-native traders reprice risk faster than ETF market makers. If Deribit IV is significantly higher than IBIT IV for the same expiry, the options market is pricing risk that hasn't fully filtered into the ETF yet.
 - VOL REGIME CONTEXT: High ATM IV (>60%) means the market expects large moves — GEX walls may be tested. Low ATM IV (<30%) means the market is complacent — a vol spike could trigger vanna-driven rebalancing.
 - SKEW: When call_iv and put_iv are both present, compare them. Put IV > call IV = downside fear premium (normal). Call IV > put IV = upside demand (unusual, often precedes squeezes).
 
 When discussing vanna scenarios, reference the IV level directly: "ATM IV at 65% — a 5-point vol crush would trigger $X of vanna buying" is more precise than discussing vanna in a vacuum.
 
-Do NOT compare IV term structure across different DTE windows mechanically (0-3d IV vs 31-45d IV) — each window captures different expiries. The macro signal iv_term_structure already handles the cross-term comparison.
+Do NOT compare IV term structure across different expiry ranges mechanically — each range captures different expiries. The macro signal iv_term_structure already handles the cross-term comparison.
 
 DETECTED PATTERNS (when present):
 detected_patterns contains rule-based pre-screened structural patterns with concrete thresholds. These are NOT predictions — they're mechanical conditions that are currently true. Use them as starting points for your analysis:
@@ -6191,7 +6246,7 @@ Note: significant_levels and breakout are derived from IBIT options data only. f
 
 GEX (net_gex_total) is raw Black-Scholes gamma exposure — no additional time weighting is applied because BS gamma already incorporates natural time sensitivity via 1/(S*sigma*sqrt(T)). Near-term options naturally have higher gamma, so their GEX contribution is already appropriately scaled. All levels (call_wall, put_wall, gamma_flip, regime) derive from this raw GEX. The per-expiry breakdown shows each expiration's GEX contribution separately, and can be filtered via the expiry_filter parameter. The level_trajectory field shows whether key levels are STRENGTHENING (>10% increase), WEAKENING (>10% decrease), or STABLE vs the previous session. It also identifies the dominant_expiry driving each level — if a wall is dominated by a near-term expiry, it may evaporate quickly after that expiration.
 
-Historical Trends (_history_trends): A compressed summary of the last 30 daily snapshots, shared across all timeframes. This is NOT per-DTE — it reflects the ticker's overall positioning evolution.
+Historical Trends (_history_trends): A compressed summary of the last 30 daily snapshots, shared across all expiry ranges. This is NOT per-range — it reflects the ticker's overall positioning evolution.
 - regime_streak: How many days the current gamma regime has held. A streak of 3+ days means the regime is established, not transitional. A streak of 1 means it just flipped — watch for reversion.
 - level_migration: Direction and magnitude of key level movements over 3d and 5d windows. Rising walls with a long streak = strong directional positioning. Stable walls held at a specific price = anchored range. Use consecutive_direction to gauge conviction.
 - gex_trend: Whether overall gamma exposure is building (market adding options, levels strengthening) or decaying (positions unwinding, levels weakening).
@@ -6210,7 +6265,7 @@ When is_persistent is true, trust the regime label and trade it with conviction.
 Use history_trends to contextualize today's snapshot. A call wall at $107K means different things if it's been there for 7 days (strong, tested resistance) vs if it jumped there overnight (new, untested). Always mention regime streak length and level migration direction in your analysis.
 
 STRUCTURE TRENDS (_structure_trends, when present):
-_structure_trends shows how levels in each DTE window have migrated over the past week.
+_structure_trends shows how levels in each historical DTE window have migrated over the past week. These use backward-looking DTE windows (0-3, 4-7, 8-14, 15-30, 31-45) for historical continuity, not the weekly expiry ranges in the main data.
 For each window, call_wall/put_wall/gamma_flip show first value, last value, and direction (rising/falling/stable). regime_changes counts how many times the regime flipped.
 
 Use this to identify:
@@ -6219,7 +6274,7 @@ Use this to identify:
 - Cross-window convergence: When convergence shows "converging" for a wall, all timeframes are agreeing — high conviction. "Diverging" means timeframes disagree — lower conviction on that level.
 - Regime creep: If regime_changes > 0 in mid-term windows (8-14d), the gamma regime is unstable and the current regime label is less trustworthy.
 
-Don't mechanically list per-window changes — synthesize them into a structural narrative. "Floors are rising across all timeframes" or "near-term ceiling is compressing while structural ceiling holds."
+Don't mechanically list per-window changes — synthesize them into a structural narrative. (Note: _structure_trends uses historical DTE windows, not the weekly ranges.) "Floors are rising across all timeframes" or "near-term ceiling is compressing while structural ceiling holds."
 
 Dealer Delta Scenario Analysis (dealer_delta_briefing): Pre-computed dealer hedging pressure at hypothetical price levels across the key level grid. 'current_delta' shows dealer positioning at spot. 'flip_summary' identifies where dealer pressure reverses direction. 'acceleration_zone' shows where dealers are most reactive to price moves. Negative dealer delta = dealers must BUY to hedge = supportive (acts as a bid). Positive dealer delta = dealers must SELL = resistive (acts as an offer). Use this to identify price levels where dealer hedging creates natural support or resistance, independent of the GEX profile.
 
@@ -6267,7 +6322,7 @@ Three metrics that quantify the mechanical floor/ceiling structure:
    - 'top_strike_vol_oi_ratio' < 0.1 = stale positions (likely overwriting). > 0.5 = active trading today (could be speculative).
    - 'top3_concentration_pct' > 50% = call OI funneled into a few strikes (sharp lid). < 30% = distributed (gradual resistance).
 
-Use these to give a one-line positioning depth read per window, e.g.: "Downside cushioned: dealers buy $1.2B on an 8% drop, near-spot puts concentrated. Ceiling at $72K (76K call OI, overwrite zone) — squeeze trigger if broken."
+Use these to give a one-line positioning depth read per range, e.g.: "Downside cushioned: dealers buy $1.2B on an 8% drop, near-spot puts concentrated. Ceiling at $72K (76K call OI, overwrite zone) — squeeze trigger if broken."
 
 MACRO REGIME SCORE (when present):
 _macro_regime contains the swing-trade regime score from -100 (topping) to +100 (bottoming).
@@ -6308,21 +6363,21 @@ Do NOT provide trade recommendations based on macro score. Describe the macro ba
 
 For the "all" key: provide a CROSS-TIMEFRAME POSITIONING MAP.
 
-REGIME ALIGNMENT: List all 5 gamma flip points relative to spot. Are they clustered (strong consensus on regime) or scattered (transition zone)? Where does spot sit relative to each flip? Identify the most consequential flip — the one where crossing it changes the most windows.
+REGIME ALIGNMENT: List all gamma flip points across ranges relative to spot. Are they clustered (strong consensus on regime) or scattered (transition zone)? Where does spot sit relative to each flip? Identify the most consequential flip — the one where crossing it changes the most ranges.
 
-DELTA FLIP LADDER: All delta flip points ordered by distance from spot. Which is nearest? Which windows have NO flip point (structural selling at all prices)? Total dollar magnitude of dealer selling pressure across all windows.
+DELTA FLIP LADDER: All delta flip points ordered by distance from spot. Which is nearest? Which ranges have NO flip point (structural selling at all prices)? Total dollar magnitude of dealer selling pressure across all ranges.
 
-CONVERGENCE ZONES: Where do multiple windows agree on levels? A strike that's a put wall in 0-3d AND 8-14d AND shows Deribit agreement is higher conviction than a single-window level. A call wall that's also a delta flip point in another window is a key inflection.
+CONVERGENCE ZONES: Where do multiple ranges agree on levels? A strike that's a put wall in one range AND appears in another range AND shows Deribit agreement is higher conviction than a single-range level. A call wall that's also a delta flip point in another range is a key inflection.
 
-DISTRIBUTION SHAPE: Synthesize the per-window gex_distribution into an overall picture. Is the negative GEX below spot distributed (gradient) or concentrated (cliff)? Is the positive GEX above spot thick (multiple stabilizing strikes) or thin (one wall then nothing)?
+DISTRIBUTION SHAPE: Synthesize the per-range gex_distribution into an overall picture. Is the negative GEX below spot distributed (gradient) or concentrated (cliff)? Is the positive GEX above spot thick (multiple stabilizing strikes) or thin (one wall then nothing)?
 
-POST-EXPIRY SHIFT: What happens when the nearest expiry clears? Which levels disappear, which persist, and what does the range look like once near-term gamma expires? Identify specifically which longer-dated window's levels take over.
+POST-EXPIRY SHIFT: What happens when the nearest expiry clears? Which levels disappear, which persist, and what does the range look like once near-term gamma expires? Identify specifically which longer-dated range's levels take over.
 
-VENUE PICTURE: Where do IBIT and Deribit agree vs diverge? Which venue dominates which timeframe? Are there levels where one venue has massive gamma that the other doesn't see?
+VENUE PICTURE: Where do IBIT and Deribit agree vs diverge? Which venue dominates which range? Are there levels where one venue has massive gamma that the other doesn't see?
 
 STRUCTURAL BACKDROP: Macro regime score, ETF flow trend, funding rate, aggregate OI flush status. Is the structural backdrop confirming or contradicting the tactical positioning?
 
-VOL SURFACE: If iv_term_structure data is present across multiple windows, describe the vol landscape. Are near-term expiries pricing higher IV than structural (backwardation), or is the curve in normal contango? Is one venue consistently pricing higher vol? If the macro iv_term_structure signal is non-zero, integrate its finding — e.g., "Backwardation confirmed: 0-3d ATM IV 68% vs 31-45d at 52%. Near-term hedging demand elevated, consistent with the negative funding and long liquidation signals."
+VOL SURFACE: If iv_term_structure data is present across multiple ranges, describe the vol landscape. Are near-term expiries pricing higher IV than structural (backwardation), or is the curve in normal contango? Is one venue consistently pricing higher vol? If the macro iv_term_structure signal is non-zero, integrate its finding — e.g., "Backwardation confirmed: near-term ATM IV 68% vs furthest range at 52%. Near-term hedging demand elevated, consistent with the negative funding and long liquidation signals."
 
 Do NOT include: trade plans, setups, entry/exit levels, stop losses, invalidation levels, scenario trees, directional recommendations, or language like "lever long/short," "fade rallies," "buy dips," "scalp," or "with confidence."
 
@@ -6341,7 +6396,7 @@ FABRICATED NUMBERS: Never assign numerical confidence percentages to regime call
 
 OI CHANGES vs EXPIRY MECHANICS: When OI drops coincide with recent expirations, explicitly note this: "OI dropped 95% — primarily from Feb 14 expiry rolling off, not active position unwinding." OI changes are only a positioning signal when they occur BETWEEN expirations, not across them. Check the dominant_expiry field to identify expiry-driven OI decay.
 
-VANNA/VOL-CRUSH: Don't aggregate vanna or vol-crush notional across DTE windows — each window's vol sensitivity is independent. A vol crush in 31-45d options doesn't affect your 0-3d range trade. When discussing vol scenarios, specify which window and whether it's relevant to the trade timeframe. The 0-3d analysis should reference 0-3d vol sensitivity, not a sum across all windows.
+VANNA/VOL-CRUSH: Don't aggregate vanna or vol-crush notional across expiry ranges — each range's vol sensitivity is independent. A vol crush in far-dated options doesn't affect your near-term range trade. When discussing vol scenarios, specify which range and whether it's relevant to the trade timeframe. The nearest range's analysis should reference its own vol sensitivity, not a sum across all ranges.
 
 LARGE NUMBERS: When dealer delta or flow numbers exceed $500M, contextualize them. $2.14B dealer long across 31-45d is distributed across ~15 days of expiries — the per-day flow impact is ~$140M, not $2.14B. Compare to BTC daily volume (~$30-40B) when useful. Frame magnitudes relative to the relevant timeframe.
 
@@ -6349,16 +6404,11 @@ POSITIONING PRECISION: The analysis must reference exact structural levels (gamm
 
 NEGATIVE GEX LANGUAGE: Never describe negative gamma zones as "support," "floor," "absorption," "cushion," "buffer," or any language implying price stabilization. Negative GEX amplifies moves — it's acceleration, not support. If you find yourself writing "the put wall provides support," rewrite it: "the put wall marks the deepest negative GEX concentration — maximum amplification if breached." The ONLY mechanical support comes from positive GEX (dealers buying dips) or dealer delta being net short (forced buying). Check dealer_delta_briefing at the put wall — if dealers are net LONG there, they're selling into the decline, making the put wall an acceleration trigger, not a floor.
 
-DTE windows are NON-OVERLAPPING. Each timeframe shows distinct option positioning:
-- 0-3d: Immediate expirations. Highest gamma, strongest near-term hedging pressure. These are today's actionable levels.
-- 4-7d: Next week's expirations. Where the next wave of gamma concentration is forming.
-- 8-14d: Two-week positioning. Emerging walls that will become dominant after near-term expiries clear.
-- 15-30d: Monthly cycle. Institutional positioning around monthly options expiration.
-- 31-45d: Structural. Quarterly and longer-dated positioning that forms the backdrop.
+Data is grouped by WEEKLY EXPIRY RANGES (e.g., "03/09-13" covers expiries in the week of Mar 9-13). Each range contains the aggregated positioning for all expiries within that calendar week. Near-term ranges have the highest gamma and strongest hedging pressure. Further-out ranges show structural positioning that will become dominant after near-term expiries clear.
 
-When comparing across windows: if 0-3d and 4-7d call walls are at the same strike, that level has multi-week support and is high conviction. If they differ, the near-term wall will expire and levels will shift — flag this as a potential level migration.
+When comparing across ranges: if two ranges share the same call wall strike, that level has multi-week support and is high conviction. If they differ, the near-term wall will expire and levels will shift — flag this as a potential level migration.
 
-IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "31-45d", "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
+IMPORTANT: Return ONLY valid JSON with keys {', '.join(f'"{k}"' for k in range_keys)}, "all". Each value should be a string containing your analysis with newlines for formatting. Do not wrap in markdown code blocks."""
 
     user_content = f"Analyze the following {cfg['name']} GEX data across all timeframes:\n\n{prompt_data}"
 
@@ -6389,9 +6439,10 @@ IMPORTANT: Return ONLY valid JSON with keys "0-3d", "4-7d", "8-14d", "15-30d", "
     # Attach BTC price and timestamp metadata
     btc_price = live_ref_price
     if not btc_price:
-        for label, _, _ in dtes:
-            if label in results and results[label].get('btc_spot'):
-                btc_price = results[label]['btc_spot']
+        for k in range_keys:
+            val = summaries.get(k)
+            if val and val.get('spot_btc'):
+                btc_price = val['spot_btc']
                 break
     if btc_price is not None:
         analysis['_btc_price'] = btc_price

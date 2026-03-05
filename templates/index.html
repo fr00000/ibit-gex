@@ -408,8 +408,8 @@ if(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && window.location.path
   <div class="outlook-row" id="outlook-sec">
     <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span>
       <span style="margin-left:auto;display:flex;gap:2px;align-items:center">
-        <button class="cell-tab active" data-outlook="dte" onclick="setOutlookMode('dte')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:var(--t2);cursor:pointer;line-height:1.4">DTE</button>
-        <button class="cell-tab" data-outlook="weekly" onclick="setOutlookMode('weekly')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--t3);cursor:pointer;line-height:1.4">Weekly</button>
+        <button class="cell-tab" data-outlook="dte" onclick="setOutlookMode('dte')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--t3);cursor:pointer;line-height:1.4">DTE</button>
+        <button class="cell-tab active" data-outlook="weekly" onclick="setOutlookMode('weekly')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:var(--t2);cursor:pointer;line-height:1.4">Weekly</button>
       </span>
     </div>
     <canvas id="outlook-chart"></canvas>
@@ -1548,9 +1548,6 @@ async function loadData(){
 
     if(isExpiryMode){
       // --- EXPIRY MODE ---
-      // Render dealer delta if profile available from enriched expiry data
-      try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
-
       // Hide GEX per-expiry filter (redundant in expiry mode)
       const expFilter=document.getElementById('expiry-filter');
       if(expFilter)expFilter.style.display='none';
@@ -1567,34 +1564,31 @@ async function loadData(){
         setStructView('walls');
       }
 
-      // Skip AI analysis panel (API cost per run)
-      const aiPanel=document.getElementById('ai-panel');
-      if(aiPanel)aiPanel.innerHTML='<div class="sec" style="color:var(--t3);font-size:10px;padding:12px">AI analysis not available in expiry view</div>';
-
     }else{
-      // --- DTE WINDOW MODE (existing behavior) ---
+      // --- DTE WINDOW MODE ---
       document.querySelectorAll('.cell-structure .cell-tab').forEach(t=>{
         t.style.opacity='';
         t.style.pointerEvents='';
       });
       const expFilter=document.getElementById('expiry-filter');
       if(expFilter)expFilter.style.display='';
+    }
 
-      try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
-      try{renderAiPanel()}catch(e){console.warn('AI:',e)}
-      loadOutlook();
-      loadStructure();
-      loadRangeCone();
-      loadMacro();
+    // Shared across both modes
+    try{renderDealerDelta(data)}catch(e){console.warn('DealerDelta:',e)}
+    try{renderAiPanel()}catch(e){console.warn('AI:',e)}
+    loadOutlook();
+    loadStructure();
+    loadRangeCone();
+    loadMacro();
 
-      // In snapshot mode, override macro freshness with snapshot's venue timestamps
-      if(snapshotDate&&data.data_freshness){
-        const frEl=document.getElementById('macro-freshness');
-        const p=[];
-        if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
-        if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
-        if(p.length)frEl.textContent=p.join('  \u00b7  ');
-      }
+    // In snapshot mode, override macro freshness with snapshot's venue timestamps
+    if(snapshotDate&&data.data_freshness){
+      const frEl=document.getElementById('macro-freshness');
+      const p=[];
+      if(data.data_freshness.ibit&&data.data_freshness.ibit.as_of)p.push('IBIT '+data.data_freshness.ibit.as_of);
+      if(data.data_freshness.deribit&&data.data_freshness.deribit.as_of)p.push('DERIBIT '+data.data_freshness.deribit.as_of);
+      if(p.length)frEl.textContent=p.join('  \u00b7  ');
     }
 
   }catch(e){
@@ -1604,10 +1598,38 @@ async function loadData(){
   document.getElementById('loading').classList.add('hidden');
 }
 
+function _matchAiKey(){
+  // Map the current dte-select value to a weekly range key in aiData
+  if(!aiData)return null;
+  const sel=document.getElementById('dte-select').value;
+  const rangeKeys=Object.keys(aiData).filter(k=>!k.startsWith('_')&&k!=='all');
+  // Weekly range selector: "range:2026-03-09:2026-03-11" → extract from-date month/day → match key prefix
+  if(sel.startsWith('range:')){
+    const parts=sel.split(':');
+    if(parts.length>=2){
+      const d=new Date(parts[1]+'T00:00:00');
+      const prefix=String(d.getMonth()+1).padStart(2,'0')+'/'+String(d.getDate()).padStart(2,'0');
+      const found=rangeKeys.find(k=>k.startsWith(prefix));
+      if(found)return found;
+    }
+  }
+  // Single expiry: "exp:2026-03-20" → find Monday of that week → match key
+  if(sel.startsWith('exp:')){
+    const d=new Date(sel.slice(4)+'T00:00:00');
+    const day=d.getDay();
+    const mon=new Date(d);mon.setDate(d.getDate()-((day+6)%7));
+    const prefix=String(mon.getMonth()+1).padStart(2,'0')+'/'+String(mon.getDate()).padStart(2,'0');
+    const found=rangeKeys.find(k=>k.startsWith(prefix));
+    if(found)return found;
+  }
+  // DTE window fallback or anything else: return first range key
+  return rangeKeys[0]||null;
+}
+
 function renderAiPanel(){
   const panel=document.getElementById('ai-panel');
   if(!panel)return;
-  const aiDte=document.getElementById('dte-select').value+'d';
+  const aiDte=_matchAiKey();
   let h=`<div class="ai-hdr"><div class="sec-title" style="margin-bottom:0"><span class="dot" style="background:var(--blue)"></span>AI Analysis${aiUnsaved?'<span class="ai-unsaved">UNSAVED</span>':''}</div>`;
   h+=`<div style="display:flex;gap:4px">`;
   if(adminKey){
@@ -1637,7 +1659,7 @@ function renderAiPanel(){
 function openAiModal(){
   const modal=document.getElementById('ai-modal');
   if(!modal||!aiData)return;
-  const aiDte=document.getElementById('dte-select').value+'d';
+  const aiDte=_matchAiKey();
   const dteTxt=aiData[aiDte];
   const allTxt=aiData['all'];
   let h='<div class="ai-modal"><div class="ai-modal-header">';
@@ -1774,7 +1796,7 @@ async function saveAnalysis(){
 }
 
 // Outlook funnel
-let outlookMode='dte';
+let outlookMode='weekly';
 function setOutlookMode(mode){
   outlookMode=mode;
   document.querySelectorAll('[data-outlook]').forEach(b=>{
