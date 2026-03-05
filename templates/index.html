@@ -1419,6 +1419,11 @@ async function loadData(){
       data.levels=data.levels||data.levels_btc||{};
       data.combined_levels_btc=data.combined_levels_btc||data.levels_btc||{};
       if(!data.levels.regime)data.levels.regime=data.regime||'positive_gamma';
+      // Defensive fallbacks for fields renderSidebar accesses directly
+      data.significant_levels=data.significant_levels||[];
+      data.breakout=data.breakout||null;
+      data.dealer_delta_profile=data.dealer_delta_profile||[];
+      data.expirations=data.expirations||data.included_expiries||[];
     }
 
     window._lastData=data;
