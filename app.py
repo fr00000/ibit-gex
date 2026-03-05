@@ -4256,17 +4256,22 @@ def api_flows():
     return Response(json.dumps(data), mimetype='application/json')
 
 
-def _aggregate_expiry_blobs(rows):
-    """Aggregate multiple expiry_cache rows into combined levels, flow, and delta profile.
+def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
+                            etf_flows=None, prev_strikes=None, history=None,
+                            iv_term_structure=None):
+    """Aggregate multiple expiry_cache rows into full response matching /api/data shape.
 
     Args:
         rows: list of (data_json_str,) tuples from expiry_cache query
+        ticker: ticker symbol (enables data_freshness)
+        min_dte/max_dte: DTE range (informational)
+        etf_flows: ETF flow data (enables sig_levels etf context)
+        prev_strikes: previous day strikes (enables breakout, oi_changes)
+        history: snapshot history rows
+        iv_term_structure: IV term structure array
 
     Returns:
-        dict with keys: spot_btc, levels_btc, regime, net_gex_total,
-        flow_forecast, delta_flip_points, dealer_delta_profile,
-        total_call_oi, total_put_oi, included_expiries, gex_chart.
-        Returns None if no valid data.
+        Full response dict matching /api/data shape. Returns None if no valid data.
     """
     if not rows:
         return None
@@ -4424,18 +4429,203 @@ def _aggregate_expiry_blobs(rows):
         except Exception:
             pass
 
+    # ── Enrichment: build full response matching /api/data shape ──
+
+    regime = 'negative_gamma' if net_gex < 0 else 'positive_gamma'
+    btc_per_share = first_blob.get('btc_per_share', 0.000568)
+    spot_share = first_blob.get('spot', spot_btc * btc_per_share if spot_btc else 0)
+    is_crypto = True
+
+    # combined_levels_btc — same as levels_btc with float conversion
+    combined_levels_btc = {
+        k: float(v) if isinstance(v, (int, float, np.floating)) else v
+        for k, v in levels_btc.items()
+    } if levels_btc else None
+
+    # deribit_levels_btc — filter gex_chart for deribit-only strikes
+    deribit_strikes = [s for s in gex_chart if s.get('deribit_gex', 0) != 0]
+    deribit_levels_btc = None
+    deribit_net_gex = 0.0
+    deribit_oi_btc = 0.0
+    if deribit_strikes:
+        deri_rows = [{
+            'strike': s['btc'], 'net_gex': s.get('deribit_gex', 0),
+            'call_gex': 0, 'put_gex': 0,
+            'call_oi': s.get('call_oi', 0), 'put_oi': s.get('put_oi', 0),
+            'total_oi': s.get('call_oi', 0) + s.get('put_oi', 0),
+            'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+            'call_volume': 0, 'put_volume': 0,
+            'call_vol_gex': 0, 'put_vol_gex': 0, 'active_gex': s.get('deribit_gex', 0),
+        } for s in deribit_strikes]
+        deri_df = pd.DataFrame(deri_rows)
+        if not deri_df.empty:
+            deribit_levels_btc = _compute_levels_from_df(deri_df, spot_btc)
+            if deribit_levels_btc:
+                deribit_levels_btc = {
+                    k: float(v) if isinstance(v, (int, float, np.floating)) else v
+                    for k, v in deribit_levels_btc.items()
+                }
+        deribit_net_gex = sum(s.get('deribit_gex', 0) for s in gex_chart)
+        deribit_oi_btc = sum(s.get('call_oi', 0) + s.get('put_oi', 0) for s in deribit_strikes)
+
+    deribit_available = len(deribit_strikes) > 0
+
+    # levels_share — levels_btc converted to share prices
+    levels_share = {
+        k: float(v * btc_per_share) if isinstance(v, (int, float, np.floating)) else v
+        for k, v in levels_btc.items()
+    } if levels_btc else {}
+
+    # Expected move from repricing_rows (ATM straddle approximation)
+    expected_move = None
+    if repricing_rows and spot_btc > 0:
+        # Find near-ATM IV for expected move estimate
+        atm_rows = [(btc, T, c_iv, p_iv) for (btc, T, c_iv, p_iv, *_) in repricing_rows
+                     if abs(btc - spot_btc) / spot_btc < 0.02 and (c_iv > 0 or p_iv > 0)]
+        if atm_rows:
+            # Use shortest-DTE ATM for expected move
+            atm_rows.sort(key=lambda x: x[1])
+            _, T_em, c_iv_em, p_iv_em = atm_rows[0]
+            avg_iv = (c_iv_em + p_iv_em) / 2 if (c_iv_em > 0 and p_iv_em > 0) else max(c_iv_em, p_iv_em)
+            # Normalize Deribit-style IV (percentage) to decimal
+            if avg_iv > 5:
+                avg_iv = avg_iv / 100.0
+            straddle_btc = spot_btc * avg_iv * (T_em ** 0.5)
+            straddle_share = straddle_btc * btc_per_share
+            dte_em = max(int(T_em * 365), 1)
+            expected_move = {
+                'straddle': float(straddle_share),
+                'pct': float((straddle_btc / spot_btc) * 100),
+                'upper': float(spot_share + straddle_share),
+                'lower': float(spot_share - straddle_share),
+                'upper_btc': float(spot_btc + straddle_btc),
+                'lower_btc': float(spot_btc - straddle_btc),
+                'expiration': included_expiries[0] if included_expiries else None,
+                'dte': dte_em,
+            }
+
+    # Significant levels
+    sig_levels = []
+    if not level_df.empty and levels_btc:
+        try:
+            sig_levels = compute_significant_levels(
+                level_df, spot_btc, levels_btc,
+                prev_strikes or {}, is_crypto, 1.0, etf_flows
+            )
+        except Exception as e:
+            log.warning(f"[expiry-agg] significant_levels failed: {e}")
+
+    # Positioning depth
+    positioning_depth = {}
+    if gex_chart and dealer_delta_profile and spot_btc > 0 and levels_btc:
+        try:
+            positioning_depth = compute_positioning_depth(
+                gex_chart, dealer_delta_profile, spot_btc, levels_btc
+            )
+        except Exception as e:
+            log.warning(f"[expiry-agg] positioning_depth failed: {e}")
+
+    # Dealer delta briefing
+    dealer_delta_briefing = None
+    if dealer_delta_profile and levels_btc and spot_btc > 0:
+        try:
+            scenario_result = {
+                'profile': dealer_delta_profile,
+                'flip_points': delta_flip_points,
+            }
+            dealer_delta_briefing = generate_dealer_delta_briefing(
+                scenario_result, spot_btc, levels_btc, 1.0, is_crypto
+            )
+        except Exception as e:
+            log.warning(f"[expiry-agg] dealer_delta_briefing failed: {e}")
+
+    # Breakout (gated on prev_strikes)
+    breakout = None
+    if prev_strikes and not level_df.empty and levels_btc:
+        try:
+            breakout = compute_breakout(
+                level_df, spot_btc, levels_btc, expected_move,
+                prev_strikes, 1.0,
+                etf_flows=etf_flows, flow_forecast=flow_forecast,
+                deribit_levels_btc=deribit_levels_btc,
+                btc_per_share=1.0, btc_spot=spot_btc
+            )
+        except Exception as e:
+            log.warning(f"[expiry-agg] breakout failed: {e}")
+
+    # OI changes (gated on prev_strikes)
+    oi_changes = None
+    if prev_strikes:
+        total_oi_prev = sum(s['total_oi'] for s in prev_strikes.values())
+        total_oi_now = int(sum(s['call_oi'] + s['put_oi'] for s in gex_chart))
+        call_oi_prev = sum(s['call_oi'] for s in prev_strikes.values())
+        put_oi_prev = sum(s['put_oi'] for s in prev_strikes.values())
+        oi_changes = {
+            'total_delta': total_oi_now - total_oi_prev,
+            'total_pct': ((total_oi_now - total_oi_prev) / max(total_oi_prev, 1)) * 100,
+            'call_delta': int(total_call) - call_oi_prev,
+            'put_delta': int(total_put) - put_oi_prev,
+        }
+
+    # Data freshness (gated on ticker)
+    data_freshness = None
+    if ticker:
+        cfg = TICKER_CONFIG.get(ticker)
+        deribit_currency = cfg['deribit_currency'] if cfg else 'BTC'
+        data_freshness = {
+            'ibit': _compute_ibit_freshness(),
+            'deribit': _compute_deribit_freshness(deribit_currency) if deribit_available else {'age_minutes': None, 'as_of': None},
+        }
+
+    # Expiry metadata
+    expiry_meta = []
+    for exp_str in sorted(included_expiries):
+        try:
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dte_days = max((exp_date - datetime.now(timezone.utc)).days, 0)
+            expiry_meta.append({'exp': exp_str, 'dte': dte_days})
+        except Exception:
+            pass
+
+    pcr = round(total_put / total_call, 3) if total_call > 0 else 0
+
     return {
-        'spot_btc': spot_btc,
+        'ticker': ticker or first_blob.get('ticker', 'IBIT'),
+        'spot': float(spot_share),
+        'btc_spot': float(spot_btc),
+        'btc_per_share': float(btc_per_share),
+        'is_btc': is_crypto,
+        'timestamp': now_et().strftime('%Y-%m-%d %H:%M'),
+        'dte_window': {'min': min_dte or 0, 'max': max_dte or 90},
+        'levels': levels_share,
         'levels_btc': levels_btc,
-        'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+        'expected_move': expected_move,
+        'gex_chart': gex_chart,
+        'significant_levels': sig_levels,
+        'breakout': breakout,
+        'etf_flows': etf_flows,
+        'oi_changes': oi_changes,
+        'flow_forecast': flow_forecast,
+        'dealer_delta_profile': dealer_delta_profile,
+        'dealer_delta_briefing': dealer_delta_briefing,
+        'delta_flip_points': delta_flip_points,
+        'positioning_depth': positioning_depth,
+        'history': history,
+        'expirations': sorted(included_expiries),
+        'expiry_meta': expiry_meta,
+        'deribit_available': deribit_available,
+        'deribit_oi_btc': float(deribit_oi_btc),
+        'deribit_net_gex': float(deribit_net_gex),
+        'combined_levels_btc': combined_levels_btc,
+        'deribit_levels_btc': deribit_levels_btc,
+        'iv_term_structure': iv_term_structure,
+        'data_freshness': data_freshness,
+        'regime': regime,
         'net_gex_total': net_gex,
         'total_call_oi': total_call,
         'total_put_oi': total_put,
-        'flow_forecast': flow_forecast,
-        'delta_flip_points': delta_flip_points,
-        'dealer_delta_profile': dealer_delta_profile,
+        'pcr': pcr,
         'included_expiries': sorted(included_expiries),
-        'gex_chart': gex_chart,
     }
 
 
@@ -4576,55 +4766,24 @@ def api_expiry_data():
         return Response(json.dumps({'error': 'All expiries in range have settled'}),
                         mimetype='application/json'), 404
 
-    agg = _aggregate_expiry_blobs(rows)
+    # Fetch enrichment data for full response
+    conn2 = get_db()
+    _, prev_strikes = get_prev_strikes(conn2, ticker)
+    history_data = get_history(conn2, ticker, 10)
+    conn2.close()
+    etf_flows_data = fetch_farside_flows() if ticker == 'IBIT' else None
+
+    agg = _aggregate_expiry_blobs(
+        rows, ticker=ticker, min_dte=0, max_dte=90,
+        etf_flows=etf_flows_data, prev_strikes=prev_strikes,
+        history=history_data,
+    )
     if not agg:
         return Response(json.dumps({'error': 'No data to aggregate'}),
                         mimetype='application/json'), 404
 
-    first_blob = json.loads(rows[0][0])
-
-    # Significant levels (not in shared helper — only needed here)
-    sig_levels = []
-    if agg['levels_btc']:
-        try:
-            level_rows = [{
-                'strike': s['btc'], 'net_gex': s['net_gex'],
-                'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
-                'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
-                'total_oi': s['call_oi'] + s['put_oi'],
-                'net_dealer_delta': s['net_dealer_delta'],
-                'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
-                'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
-                'call_vol_gex': 0, 'put_vol_gex': 0,
-                'active_gex': s['net_gex'],
-            } for s in agg['gex_chart']]
-            level_df = pd.DataFrame(level_rows)
-            if not level_df.empty:
-                sig_levels = compute_significant_levels(level_df, agg['spot_btc'], agg['levels_btc'], {}, True, 1.0)
-        except Exception as e:
-            log.warning(f"[expiry-data] significant_levels failed: {e}")
-
-    result = {
-        'date': snapshot_date,
-        'spot_btc': agg['spot_btc'],
-        'spot': first_blob.get('spot'),
-        'btc_per_share': first_blob.get('btc_per_share'),
-        'included_expiries': agg['included_expiries'],
-        'gex_chart': agg['gex_chart'],
-        'levels_btc': agg['levels_btc'],
-        'net_gex_total': agg['net_gex_total'],
-        'total_call_oi': agg['total_call_oi'],
-        'total_put_oi': agg['total_put_oi'],
-        'pcr': round(agg['total_put_oi'] / agg['total_call_oi'], 3) if agg['total_call_oi'] > 0 else 0,
-        'regime': agg['regime'],
-        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in agg['gex_chart']),
-        'flow_forecast': agg['flow_forecast'],
-        'significant_levels': sig_levels,
-        'delta_flip_points': agg['delta_flip_points'],
-        'dealer_delta_profile': agg['dealer_delta_profile'],
-    }
-
-    return Response(json.dumps(result, default=str), mimetype='application/json')
+    agg['date'] = snapshot_date
+    return Response(json.dumps(agg, cls=NumpyEncoder), mimetype='application/json')
 
 
 @app.route('/api/data')
