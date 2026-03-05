@@ -1813,9 +1813,9 @@ function renderOutlook(data){
   const putWallPts=wins.map((w,i)=>point(i,w.put_wall)).filter(Boolean);
   const gammaFlipPts=wins.map((w,i)=>point(i,w.gamma_flip)).filter(Boolean);
   const deltaFlipPts=wins.map((w,i)=>w.delta_flip_btc?{x:xPositions[i],y:w.delta_flip_btc}:null).filter(Boolean);
-  const oiPts=wins.map((w,i)=>({x:xPositions[i],y:w.total_oi||0}));
-  const maxOi=Math.max(...oiPts.map(p=>p.y),1);
-  const oiColors=wins.map(w=>w.regime==='negative_gamma'?'rgba(255,64,96,0.12)':'rgba(0,220,130,0.12)');
+  const callOiPts=wins.map((w,i)=>({x:xPositions[i],y:w.call_oi||0}));
+  const putOiPts=wins.map((w,i)=>({x:xPositions[i],y:w.put_oi||0}));
+  const maxOi=Math.max(...wins.map(w=>(w.total_oi||0)),1);
   const venueAgreeCW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.call_wall}:null).filter(Boolean);
   const venueAgreePW=wins.map((w,i)=>w.venue_agree?{x:xPositions[i],y:w.put_wall}:null).filter(Boolean);
 
@@ -1832,7 +1832,8 @@ function renderOutlook(data){
     type:'line',
     data:{
       datasets:[
-        {label:'OI',data:oiPts,type:'bar',yAxisID:'yOi',backgroundColor:oiColors,borderWidth:0,barPercentage:0.7,order:20},
+        {label:'Call OI',data:callOiPts,type:'bar',yAxisID:'yOi',backgroundColor:'rgba(0,220,130,0.15)',borderWidth:0,barPercentage:0.7,stack:'oi',order:20},
+        {label:'Put OI',data:putOiPts,type:'bar',yAxisID:'yOi',backgroundColor:'rgba(255,64,96,0.15)',borderWidth:0,barPercentage:0.7,stack:'oi',order:20},
         {label:'EM Upper',data:emUpperPts,borderColor:'rgba(168,139,250,0.3)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0.3,order:10},
         {label:'EM Lower',data:emLowerPts,borderColor:'rgba(168,139,250,0.3)',borderWidth:1,borderDash:[3,4],pointRadius:0,fill:false,tension:0.3,order:10},
         {label:'Call Wall',data:callWallPts,borderColor:'rgba(255,64,96,0.85)',borderWidth:2.5,pointRadius:4,pointBackgroundColor:'rgba(255,64,96,1)',fill:false,tension:0.2,order:2},
@@ -1869,7 +1870,8 @@ function renderOutlook(data){
               const idx=xPositions.indexOf(xVal);
               const w=idx>=0?wins[idx]:null;
               const ds=item.dataset.label;
-              if(ds==='OI'){const v=item.parsed.y;return v>0?`OI: ${(v/1000).toFixed(0)}K contracts`:'';}
+              if(ds==='Call OI'){const v=item.parsed.y;return v>0?`Call OI: ${(v/1000).toFixed(0)}K`:'';}
+              if(ds==='Put OI'){const v=item.parsed.y;return v>0?`Put OI: ${(v/1000).toFixed(0)}K`:'';}
               if(ds==='EM Upper'||ds==='EM Lower')return '';
               if(ds==='Call Wall')return `Call Wall: ${fB(item.parsed.y)} (${w?.regime==='negative_gamma'?'NEG \u03b3':'POS \u03b3'})`;
               if(ds==='Put Wall')return `Put Wall: ${fB(item.parsed.y)}`;
@@ -1928,6 +1930,7 @@ function renderOutlook(data){
           min:0,
           max:maxOi*3,
           grid:{display:false},
+          stacked:true,
         }
       }
     },
