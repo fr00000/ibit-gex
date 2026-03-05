@@ -3438,8 +3438,13 @@ def _refresh_deribit_only(ticker):
                 new_d_put = d_strike.get('put_gex', 0) if isinstance(d_strike, dict) else 0
                 entry['deribit_call_gex'] = new_d_call
                 entry['deribit_put_gex'] = new_d_put
-                entry['call_gex'] = entry.get('ibit_call_gex', 0) + new_d_call
-                entry['put_gex'] = entry.get('ibit_put_gex', 0) + new_d_put
+                if 'ibit_call_gex' in entry:
+                    entry['call_gex'] = entry['ibit_call_gex'] + new_d_call
+                    entry['put_gex'] = entry['ibit_put_gex'] + new_d_put
+                else:
+                    ibit_net = entry.get('ibit_gex', 0)
+                    entry['call_gex'] = max(ibit_net, 0) + new_d_call
+                    entry['put_gex'] = min(ibit_net, 0) + new_d_put
 
             # Add Deribit-only strikes not already in chart
             for btc_p, net_gex in deribit_by_btc.items():
@@ -4146,13 +4151,13 @@ def api_structure():
         bps = btc_p / spot_ibit if spot_ibit else 1
         data[date] = {'spot': btc_p, 'windows': {
             '0-3': {
-                'call_wall': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
-                'put_wall': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
-                'gamma_flip': gf_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'call_wall': cw_ibit / spot_ibit * btc_p if spot_ibit and cw_ibit else None,
+                'put_wall': pw_ibit / spot_ibit * btc_p if spot_ibit and pw_ibit else None,
+                'gamma_flip': gf_ibit / spot_ibit * btc_p if spot_ibit and gf_ibit else None,
                 'regime': regime, 'venue_agree': False,
                 'deribit_cw': None, 'deribit_pw': None,
-                'ibit_cw': cw_ibit / spot_ibit * btc_p if spot_ibit else None,
-                'ibit_pw': pw_ibit / spot_ibit * btc_p if spot_ibit else None,
+                'ibit_cw': cw_ibit / spot_ibit * btc_p if spot_ibit and cw_ibit else None,
+                'ibit_pw': pw_ibit / spot_ibit * btc_p if spot_ibit and pw_ibit else None,
             }
         }}
 
