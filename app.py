@@ -239,6 +239,7 @@ def init_db():
                     FROM strike_history''')
             c.execute('DROP TABLE strike_history')
             c.execute('ALTER TABLE strike_history_new RENAME TO strike_history')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_strike_history_dte ON strike_history(date, ticker, dte)')
         except Exception as e:
             log.warning(f'[init_db] strike_history dte migration error: {e}')
     # Migrate: add total_btc_etf_flow column to etf_flows
@@ -3032,6 +3033,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
         i_gex = float(ibit_row['net_gex']) if ibit_row is not None else 0
         d_gex = float(deribit_row['net_gex']) if deribit_row is not None else 0
+        i_call_gex = float(ibit_row['call_gex']) if ibit_row is not None else 0
+        i_put_gex = float(ibit_row['put_gex']) if ibit_row is not None else 0
+        d_call_gex = float(deribit_row['call_gex']) if deribit_row is not None else 0
+        d_put_gex = float(deribit_row['put_gex']) if deribit_row is not None else 0
 
         # Per-expiry breakdown from IBIT
         expiry_breakdown = {}
@@ -3047,9 +3052,15 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
         entry = {
             'strike': float(ibit_row['strike']) if ibit_row is not None else 0,
             'btc': float(btc_p),
+            'call_gex': i_call_gex + d_call_gex,
+            'put_gex': i_put_gex + d_put_gex,
             'net_gex': i_gex + d_gex,
             'ibit_gex': i_gex,
+            'ibit_call_gex': i_call_gex,
+            'ibit_put_gex': i_put_gex,
             'deribit_gex': d_gex,
+            'deribit_call_gex': d_call_gex,
+            'deribit_put_gex': d_put_gex,
         }
 
         if ibit_row is not None:
@@ -3421,6 +3432,14 @@ def _refresh_deribit_only(ticker):
                 new_d_gex = deribit_by_btc.get(btc_p, 0)
                 entry['deribit_gex'] = new_d_gex
                 entry['net_gex'] = entry.get('ibit_gex', 0) + new_d_gex
+                # Reconstruct per-side GEX from stored IBIT + fresh Deribit
+                d_strike = deribit_strike_data.get(btc_p, deribit_strike_data.get(float(btc_p), {}))
+                new_d_call = d_strike.get('call_gex', 0) if isinstance(d_strike, dict) else 0
+                new_d_put = d_strike.get('put_gex', 0) if isinstance(d_strike, dict) else 0
+                entry['deribit_call_gex'] = new_d_call
+                entry['deribit_put_gex'] = new_d_put
+                entry['call_gex'] = entry.get('ibit_call_gex', 0) + new_d_call
+                entry['put_gex'] = entry.get('ibit_put_gex', 0) + new_d_put
 
             # Add Deribit-only strikes not already in chart
             for btc_p, net_gex in deribit_by_btc.items():
@@ -3430,6 +3449,8 @@ def _refresh_deribit_only(ticker):
                         'strike': 0, 'btc': float(btc_p),
                         'net_gex': net_gex, 'ibit_gex': 0, 'deribit_gex': net_gex,
                         'call_gex': d_data.get('call_gex', 0), 'put_gex': d_data.get('put_gex', 0),
+                        'ibit_call_gex': 0, 'ibit_put_gex': 0,
+                        'deribit_call_gex': d_data.get('call_gex', 0), 'deribit_put_gex': d_data.get('put_gex', 0),
                         'active_gex': net_gex,
                         'net_vanna': 0, 'net_charm': 0,
                         'call_oi': d_data.get('call_oi', 0), 'put_oi': d_data.get('put_oi', 0),
@@ -3443,17 +3464,16 @@ def _refresh_deribit_only(ticker):
             deribit_df = build_deribit_df(deribit_strike_data, full_greeks=False)
             deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if not deribit_df.empty else None
 
-            # Rebuild combined levels from patched gex_chart
-            # Use net_gex split for call/put walls — ensures call_wall (max call_gex)
-            # and put_wall (min put_gex) are consistent with updated net_gex values.
+            # Rebuild combined levels from patched gex_chart using real per-side GEX.
+            # Falls back to net_gex split for blobs cached before per-side fields were added.
             combined_rows = []
             for entry in gex_chart:
                 if entry.get('net_gex', 0) != 0:
                     ng = entry['net_gex']
                     combined_rows.append({
                         'strike': entry['btc'],
-                        'call_gex': max(ng, 0),
-                        'put_gex': min(ng, 0),
+                        'call_gex': entry.get('call_gex', max(ng, 0)),
+                        'put_gex': entry.get('put_gex', min(ng, 0)),
                         'net_gex': entry['net_gex'],
                         'call_oi': entry.get('call_oi', 0),
                         'put_oi': entry.get('put_oi', 0),
@@ -4159,7 +4179,8 @@ def api_structure():
         else:
             cw = lvl.get('call_wall', 0) / bps if bps else None
             pw = lvl.get('put_wall', 0) / bps if bps else None
-            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            gf_raw = lvl.get('gamma_flip')
+            gf = gf_raw / bps if (bps and gf_raw is not None) else None
             regime = lvl.get('regime')
 
         ibit_cw = lvl.get('call_wall', 0) / bps if bps else None
@@ -4501,8 +4522,8 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
         deri_rows = [{
             'strike': s['btc'], 'net_gex': s.get('deribit_gex', 0),
             'call_gex': s.get('deribit_call_gex', 0), 'put_gex': s.get('deribit_put_gex', 0),
-            'call_oi': s.get('call_oi', 0), 'put_oi': s.get('put_oi', 0),
-            'total_oi': s.get('call_oi', 0) + s.get('put_oi', 0),
+            'call_oi': s.get('deribit_call_oi', 0), 'put_oi': s.get('deribit_put_oi', 0),
+            'total_oi': s.get('deribit_call_oi', 0) + s.get('deribit_put_oi', 0),
             'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
             'call_volume': 0, 'put_volume': 0,
             'call_vol_gex': 0, 'put_vol_gex': 0, 'active_gex': s.get('deribit_gex', 0),
@@ -4970,7 +4991,8 @@ def save_predictions(ticker, dtes, results, analysis_text=None):
         else:
             cw_btc = lvl.get('call_wall', 0) / bps if bps else None
             pw_btc = lvl.get('put_wall', 0) / bps if bps else None
-            gf_btc = lvl.get('gamma_flip', 0) / bps if bps else None
+            gf_raw_btc = lvl.get('gamma_flip')
+            gf_btc = gf_raw_btc / bps if (bps and gf_raw_btc is not None) else None
             mp_btc = lvl.get('max_pain', 0) / bps if bps else None
             regime = lvl.get('regime')
             net_gex = lvl.get('net_gex_total', 0)
@@ -5363,7 +5385,7 @@ def build_analysis_data(ticker='IBIT'):
             primary_lvl_btc = {
                 'call_wall': round(combined_lvl.get('call_wall', 0)),
                 'put_wall': round(combined_lvl.get('put_wall', 0)),
-                'gamma_flip': round(combined_lvl.get('gamma_flip', 0)),
+                'gamma_flip': round(combined_lvl['gamma_flip']) if combined_lvl.get('gamma_flip') is not None else None,
                 'max_pain': round(combined_lvl.get('max_pain', 0)),
                 'resistance': [round(s) for s in combined_lvl.get('resistance', [])],
                 'support': [round(s) for s in combined_lvl.get('support', [])],
@@ -5380,7 +5402,7 @@ def build_analysis_data(ticker='IBIT'):
             primary_lvl_btc = {
                 'call_wall': round(ibit_lvl['call_wall'] / bps),
                 'put_wall': round(ibit_lvl['put_wall'] / bps),
-                'gamma_flip': round(ibit_lvl['gamma_flip'] / bps),
+                'gamma_flip': round(ibit_lvl['gamma_flip'] / bps) if ibit_lvl.get('gamma_flip') is not None else None,
                 'max_pain': round(ibit_lvl['max_pain'] / bps),
                 'resistance': [round(s / bps) for s in ibit_lvl.get('resistance', [])],
                 'support': [round(s / bps) for s in ibit_lvl.get('support', [])],
@@ -5484,7 +5506,7 @@ def build_analysis_data(ticker='IBIT'):
                     'net_gex': ibit_lvl.get('net_gex_total', 0),
                     'call_wall_btc': round(ibit_lvl['call_wall'] / bps),
                     'put_wall_btc': round(ibit_lvl['put_wall'] / bps),
-                    'gamma_flip_btc': round(ibit_lvl['gamma_flip'] / bps),
+                    'gamma_flip_btc': round(ibit_lvl['gamma_flip'] / bps) if ibit_lvl.get('gamma_flip') is not None else None,
                     'regime': ibit_lvl.get('regime'),
                     'net_vanna': ibit_lvl.get('net_vanna', 0),
                     'net_charm': ibit_lvl.get('net_charm', 0),
@@ -5494,7 +5516,7 @@ def build_analysis_data(ticker='IBIT'):
                     'net_gex': d.get('deribit_net_gex', 0),
                     'call_wall_btc': round(deribit_lvl.get('call_wall', 0)) if deribit_lvl else None,
                     'put_wall_btc': round(deribit_lvl.get('put_wall', 0)) if deribit_lvl else None,
-                    'gamma_flip_btc': round(deribit_lvl.get('gamma_flip', 0)) if deribit_lvl else None,
+                    'gamma_flip_btc': round(deribit_lvl['gamma_flip']) if deribit_lvl and deribit_lvl.get('gamma_flip') is not None else None,
                     'regime': deribit_lvl.get('regime') if deribit_lvl else None,
                     'net_vanna': deribit_lvl.get('net_vanna', 0) if deribit_lvl else 0,
                     'net_charm': deribit_lvl.get('net_charm', 0) if deribit_lvl else 0,
@@ -5539,8 +5561,8 @@ def build_analysis_data(ticker='IBIT'):
                 'call_wall_btc_change': round(ibit_lvl['call_wall'] / bps - prev_lvl['call_wall'] / prev_bps),
                 'put_wall_btc_prev': round(prev_lvl['put_wall'] / prev_bps),
                 'put_wall_btc_change': round(ibit_lvl['put_wall'] / bps - prev_lvl['put_wall'] / prev_bps),
-                'gamma_flip_btc_prev': round(prev_lvl['gamma_flip'] / prev_bps),
-                'gamma_flip_btc_change': round(ibit_lvl['gamma_flip'] / bps - prev_lvl['gamma_flip'] / prev_bps),
+                'gamma_flip_btc_prev': round(prev_lvl['gamma_flip'] / prev_bps) if prev_lvl.get('gamma_flip') is not None else None,
+                'gamma_flip_btc_change': round(ibit_lvl['gamma_flip'] / bps - prev_lvl['gamma_flip'] / prev_bps) if (ibit_lvl.get('gamma_flip') is not None and prev_lvl.get('gamma_flip') is not None) else None,
                 'net_gex_prev': prev_lvl.get('net_gex_total', 0),
                 'net_gex_change': ibit_lvl.get('net_gex_total', 0) - prev_lvl.get('net_gex_total', 0),
                 'pcr_prev': prev_lvl.get('pcr', 0),
