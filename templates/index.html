@@ -1055,8 +1055,9 @@ function renderSidebar(data){
   }
 
   // Breakout
-  h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--purple)"></span>Breakout</div>`;
   const bo=data.breakout;
+  if(bo){
+  h+=`<div class="sec"><div class="sec-title"><span class="dot" style="background:var(--purple)"></span>Breakout</div>`;
   if(bo.up_score>0){
     const dots=Array.from({length:5},(_,i)=>`<div class="bo-dot ${i<bo.up_score?'bo-dot-g':'bo-dot-e'}"></div>`).join('');
     h+=`<div class="bo-dir bo-up"><div class="bo-hdr"><span class="bo-label" style="color:var(--green)">\u25b2 UP (${bo.up_score})</span><div class="bo-dots">${dots}</div></div>`;
@@ -1077,6 +1078,7 @@ function renderSidebar(data){
   h+=`<div class="bias-box" style="color:${bc}">${bt}</div>`;
   if(bo.em_note)h+=`<div style="font-size:9px;color:var(--amber);margin-top:4px;padding:3px 6px;background:var(--amber-bg);border:1px solid rgba(255,176,32,.15);border-radius:2px">\u26a0 ${esc(bo.em_note)}</div>`;
   h+=`</div>`;
+  }
 
   // Dealer Flow Forecast (Vanna + Charm)
   if(data.flow_forecast){
