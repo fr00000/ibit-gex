@@ -1587,21 +1587,60 @@ def compute_macro_regime(conn, ticker, days=30):
     wall_detail = ''
     wall_history = []
 
-    cache_rows = c.execute(
-        'SELECT date, data_json FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT ?',
+    # Get distinct dates with wall data, preferring expiry_cache (Phase 4) over data_cache
+    hist_dates = [r[0] for r in c.execute(
+        'SELECT DISTINCT date FROM expiry_cache WHERE ticker=? ORDER BY date DESC LIMIT ?',
         (ticker, days)
-    ).fetchall()
+    ).fetchall()]
+    if len(hist_dates) < 7:
+        # Supplement with data_cache dates not already covered
+        dc_dates = [r[0] for r in c.execute(
+            'SELECT DISTINCT date FROM data_cache WHERE ticker=? AND dte=45 ORDER BY date DESC LIMIT ?',
+            (ticker, days)
+        ).fetchall()]
+        existing = set(hist_dates)
+        for d in dc_dates:
+            if d not in existing:
+                hist_dates.append(d)
+                existing.add(d)
+        hist_dates.sort(reverse=True)
+        hist_dates = hist_dates[:days]
 
-    if len(cache_rows) >= 7:
-        for row in cache_rows:
+    if len(hist_dates) >= 7:
+        for hist_date in hist_dates:
             try:
-                d = json.loads(row[1])
-                comb = d.get('combined_levels_btc') or {}
-                levels = d.get('levels', {})
-                cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
-                pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
+                cw = pw = 0
+                # Try expiry_cache first: aggregate expiries that were 31-45 DTE on this date
+                ec_rows = c.execute(
+                    'SELECT data_json FROM expiry_cache WHERE date=? AND ticker=?',
+                    (hist_date, ticker)
+                ).fetchall()
+                filtered = []
+                for er in ec_rows:
+                    blob = json.loads(er[0])
+                    dte_val = blob.get('dte', 0)
+                    if 31 <= dte_val <= 45:
+                        filtered.append(er)
+                if filtered:
+                    agg = _aggregate_expiry_blobs(filtered)
+                    if agg:
+                        lvl = agg.get('levels_btc', {})
+                        cw = lvl.get('call_wall', 0)
+                        pw = lvl.get('put_wall', 0)
+                # Fallback to data_cache if expiry_cache didn't yield walls
+                if not (cw and pw):
+                    dc_row = c.execute(
+                        'SELECT data_json FROM data_cache WHERE ticker=? AND dte=45 AND date=? ORDER BY date DESC LIMIT 1',
+                        (ticker, hist_date)
+                    ).fetchone()
+                    if dc_row:
+                        d = json.loads(dc_row[0])
+                        comb = d.get('combined_levels_btc') or {}
+                        levels = d.get('levels', {})
+                        cw = comb.get('call_wall') or (levels.get('call_wall', 0) / btc_per_share if btc_per_share else 0)
+                        pw = comb.get('put_wall') or (levels.get('put_wall', 0) / btc_per_share if btc_per_share else 0)
                 if cw and pw:
-                    wall_history.append({'date': row[0], 'call_wall': cw, 'put_wall': pw})
+                    wall_history.append({'date': hist_date, 'call_wall': cw, 'put_wall': pw})
             except (json.JSONDecodeError, TypeError):
                 continue
 
@@ -2595,6 +2634,366 @@ def update_btc_candles(symbol, tf):
 
 
 # ── DATA ────────────────────────────────────────────────────────────────────
+def _merge_and_store_expiry_data(ticker_symbol, expiry_strike_data, deribit_expiry_strike_data,
+                                  spot, spot_btc, ref_per_share, is_crypto):
+    """Merge per-expiry strike data from Yahoo and Deribit, compute per-expiry levels,
+    and store each expiry blob in the expiry_cache table.
+
+    Args:
+        ticker_symbol: 'IBIT' or 'ETHA'
+        expiry_strike_data: {exp_str: {strike: {call_oi, put_oi, call_gex, ...}}} from Yahoo
+        deribit_expiry_strike_data: {exp_str: {strike_btc: {...}}} from Deribit
+        spot: IBIT/ETHA share price
+        spot_btc: BTC/ETH price
+        ref_per_share: btc_per_share conversion factor
+        is_crypto: True for IBIT/ETHA
+
+    Returns:
+        list of stored expiry dates, or empty list on failure
+    """
+    try:
+        conn_exp = get_db()
+        c_exp = conn_exp.cursor()
+        today_str = today_str_et()
+        now = datetime.now(timezone.utc)
+
+        all_exp_dates = sorted(set(
+            list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
+        ))
+
+        stored_expiries = []
+        for exp_str in all_exp_dates:
+            exp_date_obj = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dte_val = max(int((exp_date_obj - now).total_seconds() / 86400.0), 0)
+            spot_btc_val = spot / ref_per_share if is_crypto else spot
+
+            # Build IBIT lookup by BTC price
+            ibit_by_btc = {}
+            for strike_val, d in expiry_strike_data.get(exp_str, {}).items():
+                btc_p = round(strike_val / ref_per_share) if is_crypto else round(strike_val)
+                ibit_by_btc[btc_p] = (strike_val, d)
+
+            # Deribit lookup already in BTC
+            deribit_by_btc = {}
+            for strike_btc_key, d in deribit_expiry_strike_data.get(exp_str, {}).items():
+                deribit_by_btc[round(strike_btc_key)] = d
+
+            all_btc = sorted(set(list(ibit_by_btc.keys()) + list(deribit_by_btc.keys())))
+
+            strike_rows = []
+            for btc_p in all_btc:
+                ib_entry = ibit_by_btc.get(btc_p)
+                db_entry = deribit_by_btc.get(btc_p)
+                ib = ib_entry[1] if ib_entry else None
+                ibit_strike = ib_entry[0] if ib_entry else 0
+
+                i_call_gex = ib['call_gex'] if ib else 0
+                i_put_gex = ib['put_gex'] if ib else 0
+                d_call_gex = db_entry['call_gex'] if db_entry else 0
+                d_put_gex = db_entry['put_gex'] if db_entry else 0
+
+                # Blended OI-weighted IV from both venues
+                c_iv_sum = (ib.get('call_iv_sum', 0) if ib else 0) + (db_entry.get('call_iv_sum', 0) if db_entry else 0)
+                c_iv_oi = (ib.get('call_iv_oi', 0) if ib else 0) + (db_entry.get('call_iv_oi', 0) if db_entry else 0)
+                p_iv_sum = (ib.get('put_iv_sum', 0) if ib else 0) + (db_entry.get('put_iv_sum', 0) if db_entry else 0)
+                p_iv_oi = (ib.get('put_iv_oi', 0) if ib else 0) + (db_entry.get('put_iv_oi', 0) if db_entry else 0)
+
+                strike_rows.append({
+                    'strike': ibit_strike,
+                    'btc': float(btc_p),
+                    'call_oi': (ib['call_oi'] if ib else 0) + (db_entry['call_oi'] if db_entry else 0),
+                    'put_oi': (ib['put_oi'] if ib else 0) + (db_entry['put_oi'] if db_entry else 0),
+                    'ibit_call_oi': ib['call_oi'] if ib else 0,
+                    'ibit_put_oi': ib['put_oi'] if ib else 0,
+                    'deribit_call_oi': db_entry['call_oi'] if db_entry else 0,
+                    'deribit_put_oi': db_entry['put_oi'] if db_entry else 0,
+                    'call_gex': round(i_call_gex + d_call_gex, 2),
+                    'put_gex': round(i_put_gex + d_put_gex, 2),
+                    'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
+                    'ibit_gex': round(i_call_gex + i_put_gex, 2),
+                    'deribit_gex': round(d_call_gex + d_put_gex, 2),
+                    'net_dealer_delta': round(
+                        (ib['call_delta'] + ib['put_delta'] if ib else 0) +
+                        (db_entry['call_delta'] + db_entry['put_delta'] if db_entry else 0), 2),
+                    'net_vanna': round(
+                        (ib['call_vanna'] + ib['put_vanna'] if ib else 0) +
+                        (db_entry['call_vanna'] + db_entry['put_vanna'] if db_entry else 0), 2),
+                    'net_charm': round(
+                        (ib['call_charm'] + ib['put_charm'] if ib else 0) +
+                        (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
+                    'call_volume': ib['call_volume'] if ib else 0,
+                    'put_volume': ib['put_volume'] if ib else 0,
+                    'call_iv': round(c_iv_sum / c_iv_oi, 4) if c_iv_oi > 0 else 0,
+                    'put_iv': round(p_iv_sum / p_iv_oi, 4) if p_iv_oi > 0 else 0,
+                })
+
+            # Compute per-expiry levels
+            level_rows = [{
+                'strike': sr['btc'], 'net_gex': sr['net_gex'],
+                'call_gex': sr['call_gex'], 'put_gex': sr['put_gex'],
+                'call_oi': sr['call_oi'], 'put_oi': sr['put_oi'],
+                'total_oi': sr['call_oi'] + sr['put_oi'],
+                'net_dealer_delta': sr['net_dealer_delta'],
+                'net_vanna': sr['net_vanna'], 'net_charm': sr['net_charm'],
+                'call_volume': sr['call_volume'], 'put_volume': sr['put_volume'],
+                'call_vol_gex': 0, 'put_vol_gex': 0,
+                'active_gex': sr['net_gex'],
+            } for sr in strike_rows]
+            level_df = pd.DataFrame(level_rows)
+            levels_exp = _compute_levels_from_df(level_df, spot_btc_val) if not level_df.empty else {}
+
+            net_gex = sum(sr['net_gex'] for sr in strike_rows)
+            total_call = sum(sr['call_oi'] for sr in strike_rows)
+            total_put = sum(sr['put_oi'] for sr in strike_rows)
+            has_deribit = any(sr['deribit_gex'] != 0 for sr in strike_rows)
+
+            expiry_blob = {
+                'expiry_date': exp_str, 'dte': dte_val,
+                'spot': spot, 'spot_btc': round(spot_btc_val, 2),
+                'btc_per_share': ref_per_share,
+                'deribit_available': has_deribit,
+                'strikes': strike_rows,
+                'summary': {
+                    'net_gex_total': round(net_gex, 2),
+                    'total_call_oi': total_call, 'total_put_oi': total_put,
+                    'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
+                    'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+                    'call_wall_btc': levels_exp.get('call_wall'),
+                    'put_wall_btc': levels_exp.get('put_wall'),
+                    'gamma_flip_btc': levels_exp.get('gamma_flip'),
+                }
+            }
+
+            c_exp.execute(
+                'INSERT OR REPLACE INTO expiry_cache (date, ticker, expiry_date, data_json) VALUES (?, ?, ?, ?)',
+                (today_str, ticker_symbol, exp_str, json.dumps(expiry_blob))
+            )
+            stored_expiries.append(exp_str)
+        conn_exp.commit()
+        conn_exp.close()
+        return stored_expiries
+    except Exception as e:
+        log.warning(f"[expiry-cache] Failed to store per-expiry data: {e}")
+        try:
+            conn_exp.close()
+        except Exception:
+            pass
+        return []
+
+
+def fetch_all_and_store(ticker_symbol='IBIT'):
+    """Single Yahoo + single Deribit fetch for ALL expiries (0-45 DTE).
+    Merges data, stores per-expiry blobs, then aggregates all DTE windows.
+
+    This replaces the 5x fetch_with_cache calls in bg-refresh with 1+1.
+
+    Returns:
+        dict mapping max_dte -> aggregated result for each DTE window,
+        or None on complete failure.
+    """
+    cfg = TICKER_CONFIG.get(ticker_symbol)
+    is_crypto = cfg is not None
+    if not cfg:
+        log.error(f"[fetch-all] Unknown ticker: {ticker_symbol}")
+        return None
+
+    overall_max_dte = max(w[2] for w in DTE_WINDOWS)  # 45
+
+    # Step 1: Single Yahoo fetch
+    log.info(f"[fetch-all] {ticker_symbol}: fetching Yahoo data (0-{overall_max_dte} DTE)...")
+    ticker = yf.Ticker(ticker_symbol)
+    spot = ticker.info.get('regularMarketPrice')
+    if spot is None:
+        hist = ticker.history(period="1d")
+        spot = float(hist['Close'].iloc[-1])
+
+    ref_per_share = cfg['per_share_default']
+    if is_crypto:
+        try:
+            ref_price = yf.Ticker(cfg['ref_ticker']).info.get('regularMarketPrice')
+            if ref_price and ref_price > 0:
+                ref_per_share = spot / ref_price
+        except Exception:
+            pass
+
+    btc_spot = spot / ref_per_share if is_crypto else None
+
+    rfr = get_risk_free_rate()
+    now = datetime.now(timezone.utc)
+
+    all_exps = list(ticker.options)
+    cutoff_max = (now + timedelta(days=overall_max_dte)).replace(hour=23, minute=59, second=59, microsecond=0)
+    cutoff_min = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    selected_exps = [
+        e for e in all_exps
+        if cutoff_min <= datetime.strptime(e, "%Y-%m-%d").replace(tzinfo=timezone.utc) <= cutoff_max
+    ]
+    # Drop today's expiry after 4 PM ET
+    now_eastern = now_et()
+    if now_eastern.hour >= 16:
+        today_str = now_eastern.strftime('%Y-%m-%d')
+        selected_exps = [e for e in selected_exps if e != today_str]
+
+    if not selected_exps:
+        log.warning(f"[fetch-all] {ticker_symbol}: no expirations found in 0-{overall_max_dte} DTE")
+        return None
+
+    # Process all Yahoo options chains
+    expiry_strike_data = {}
+    expiry_iv_data = {}
+    for exp_str in selected_exps:
+        exp_date = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        dte_float = max((exp_date - now).total_seconds() / 86400.0, 0.0)
+        T = max(dte_float / 365.0, 0.5 / 365)
+        dte_days = int(dte_float)
+        try:
+            chain = ticker.option_chain(exp_str)
+        except Exception as e:
+            log.warning(f"[fetch-all] {ticker_symbol}: chain fetch failed for {exp_str}: {e}")
+            continue
+
+        for opt_type, df_chain, sign in [('call', chain.calls, 1), ('put', chain.puts, -1)]:
+            for _, row in df_chain.iterrows():
+                strike = row['strike']
+                if strike < spot * (1 - STRIKE_RANGE_PCT) or strike > spot * (1 + STRIKE_RANGE_PCT):
+                    continue
+                oi = row.get('openInterest', 0)
+                if pd.isna(oi) or oi == 0:
+                    continue
+                oi = int(oi)
+                iv = row.get('impliedVolatility', 0)
+                if pd.isna(iv) or iv <= 0:
+                    continue
+
+                # Collect IV for term structure
+                if exp_str not in expiry_iv_data:
+                    expiry_iv_data[exp_str] = []
+                expiry_iv_data[exp_str].append({
+                    'strike': strike, 'iv': iv, 'oi': oi, 'opt_type': opt_type, 'dte': dte_days
+                })
+
+                gamma = bs_gamma(spot, strike, T, rfr, iv)
+                delta = bs_delta(spot, strike, T, rfr, iv, opt_type)
+                vanna = bs_vanna(spot, strike, T, rfr, iv)
+                charm = bs_charm(spot, strike, T, rfr, iv, opt_type)
+                gex = sign * gamma * oi * 100 * spot ** 2 * 0.01
+                vol = row.get('volume', 0)
+                if pd.isna(vol):
+                    vol = 0
+                vol = int(vol)
+                dealer_delta = -delta * oi * 100 * spot
+                dealer_vanna = -vanna * oi * 100 * spot * 0.01
+                dealer_charm = -charm * oi * 100 / 365.0 * spot
+
+                # Per-expiry accumulator
+                if exp_str not in expiry_strike_data:
+                    expiry_strike_data[exp_str] = {}
+                esd = expiry_strike_data[exp_str]
+                if strike not in esd:
+                    esd[strike] = {
+                        'call_oi': 0, 'put_oi': 0,
+                        'call_gex': 0, 'put_gex': 0,
+                        'call_delta': 0, 'put_delta': 0,
+                        'call_vanna': 0, 'put_vanna': 0,
+                        'call_charm': 0, 'put_charm': 0,
+                        'call_volume': 0, 'put_volume': 0,
+                        'call_iv_sum': 0, 'call_iv_oi': 0,
+                        'put_iv_sum': 0, 'put_iv_oi': 0,
+                        'dte': dte_days,
+                    }
+                esd[strike][f'{opt_type}_oi'] += oi
+                esd[strike][f'{opt_type}_gex'] += gex
+                esd[strike][f'{opt_type}_delta'] += dealer_delta
+                esd[strike][f'{opt_type}_vanna'] += dealer_vanna
+                esd[strike][f'{opt_type}_charm'] += dealer_charm
+                esd[strike][f'{opt_type}_volume'] += vol
+                esd[strike][f'{opt_type}_iv_sum'] += iv * oi
+                esd[strike][f'{opt_type}_iv_oi'] += oi
+
+    log.info(f"[fetch-all] {ticker_symbol}: Yahoo processed {len(expiry_strike_data)} expiries, "
+             f"{sum(len(v) for v in expiry_strike_data.values())} total strikes")
+
+    # Step 2: Single Deribit fetch (0 to overall_max_dte)
+    deribit_expiry_strike_data = {}
+    deribit_iv_data = {}
+    deribit_currency = cfg.get('deribit_currency')
+    if is_crypto and deribit_currency:
+        try:
+            deribit_options = fetch_deribit_options(0, overall_max_dte, currency=deribit_currency)
+            if deribit_options:
+                _, deribit_iv_data, _, deribit_expiry_strike_data = process_deribit_options(
+                    deribit_options, rfr, full_greeks=True
+                )
+                log.info(f"[fetch-all] {ticker_symbol}: Deribit processed {len(deribit_expiry_strike_data)} expiries")
+        except Exception as e:
+            log.warning(f"[fetch-all] {ticker_symbol}: Deribit fetch failed: {e}")
+
+    # Step 3: Merge and store per-expiry data
+    stored_expiries = _merge_and_store_expiry_data(
+        ticker_symbol, expiry_strike_data, deribit_expiry_strike_data,
+        spot, btc_spot, ref_per_share, is_crypto
+    )
+    log.info(f"[fetch-all] {ticker_symbol}: stored {len(stored_expiries)} expiry blobs in expiry_cache")
+
+    # Step 3b: Compute IV term structure from collected IV data
+    iv_term_structure = []
+    for exp_str, iv_entries in sorted(expiry_iv_data.items()):
+        if not iv_entries:
+            continue
+        dte_val = iv_entries[0]['dte']
+        result = compute_atm_iv(iv_entries, spot)
+        if not result:
+            continue
+        iv_term_structure.append({
+            'expiry': exp_str, 'dte': dte_val,
+            'atm_iv': result['atm_iv'], 'call_iv': result['call_iv'],
+            'put_iv': result['put_iv'], 'num_atm_options': result['num_entries'],
+            'source': 'ibit',
+        })
+    iv_term_structure.extend(compute_deribit_iv_term(deribit_iv_data))
+    log.info(f"[fetch-all] {ticker_symbol}: IV term structure: {len(iv_term_structure)} entries")
+
+    # Step 4: Aggregate all DTE windows from expiry_cache
+    results = {}
+    for label, min_d, max_d in DTE_WINDOWS:
+        try:
+            agg = aggregate_dte_window(ticker_symbol, min_d, max_d)
+            if agg:
+                # Inject IV term structure (filtered to this window's DTE range)
+                window_iv = [e for e in iv_term_structure if min_d <= e.get('dte', 0) <= max_d]
+                agg['iv_term_structure'] = window_iv if window_iv else iv_term_structure
+                set_cached_data(ticker_symbol, max_d, agg)
+                results[max_d] = agg
+                log.info(f"[fetch-all] {ticker_symbol}: DTE {min_d}-{max_d} aggregated and cached")
+            else:
+                log.warning(f"[fetch-all] {ticker_symbol}: DTE {min_d}-{max_d} aggregation returned None")
+        except Exception as e:
+            log.error(f"[fetch-all] {ticker_symbol}: DTE {min_d}-{max_d} aggregation error: {e}")
+
+    # Step 4b: Compute weekly outlook
+    try:
+        _compute_weekly_outlook(ticker_symbol)
+    except Exception as e:
+        log.warning(f"[fetch-all] {ticker_symbol}: weekly outlook compute error: {e}")
+
+    # Step 5: Save snapshot (use the 0-3 DTE window result for snapshot)
+    if results:
+        try:
+            first_max_dte = DTE_WINDOWS[0][2]  # 3
+            first_result = results.get(first_max_dte)
+            if first_result:
+                conn = get_db()
+                save_snapshot(conn, ticker_symbol, spot, btc_spot,
+                              first_result.get('levels', {}),
+                              pd.DataFrame(first_result.get('gex_chart', [])))
+                conn.close()
+        except Exception as e:
+            log.warning(f"[fetch-all] {ticker_symbol}: snapshot save error: {e}")
+
+    log.info(f"[fetch-all] {ticker_symbol}: complete ({len(results)}/{len(DTE_WINDOWS)} windows)")
+    return results
+
+
 def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     cfg = TICKER_CONFIG.get(ticker_symbol)
     is_crypto = cfg is not None
@@ -3062,125 +3461,10 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     expiry_meta.sort(key=lambda x: x['dte'])
 
     # Store per-expiry chain snapshots (merged IBIT + Deribit)
-    try:
-        conn_exp = get_db()
-        c_exp = conn_exp.cursor()
-        today_str = today_str_et()
-
-        all_exp_dates = sorted(set(
-            list(expiry_strike_data.keys()) + list(deribit_expiry_strike_data.keys())
-        ))
-
-        for exp_str in all_exp_dates:
-            exp_date_obj = datetime.strptime(exp_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            dte_val = max(int((exp_date_obj - now).total_seconds() / 86400.0), 0)
-            spot_btc_val = spot / ref_per_share if is_crypto else spot
-
-            # Build IBIT lookup by BTC price (same pattern as gex_chart_data)
-            ibit_by_btc = {}
-            for strike_val, d in expiry_strike_data.get(exp_str, {}).items():
-                btc_p = round(strike_val / ref_per_share) if is_crypto else round(strike_val)
-                ibit_by_btc[btc_p] = (strike_val, d)
-
-            # Deribit lookup already in BTC
-            deribit_by_btc = {}
-            for strike_btc, d in deribit_expiry_strike_data.get(exp_str, {}).items():
-                deribit_by_btc[round(strike_btc)] = d
-
-            all_btc = sorted(set(list(ibit_by_btc.keys()) + list(deribit_by_btc.keys())))
-
-            strike_rows = []
-            for btc_p in all_btc:
-                ib_entry = ibit_by_btc.get(btc_p)
-                db_entry = deribit_by_btc.get(btc_p)
-                ib = ib_entry[1] if ib_entry else None
-                ibit_strike = ib_entry[0] if ib_entry else 0
-
-                i_call_gex = ib['call_gex'] if ib else 0
-                i_put_gex = ib['put_gex'] if ib else 0
-                d_call_gex = db_entry['call_gex'] if db_entry else 0
-                d_put_gex = db_entry['put_gex'] if db_entry else 0
-
-                # Blended OI-weighted IV from both venues
-                c_iv_sum = (ib.get('call_iv_sum', 0) if ib else 0) + (db_entry.get('call_iv_sum', 0) if db_entry else 0)
-                c_iv_oi = (ib.get('call_iv_oi', 0) if ib else 0) + (db_entry.get('call_iv_oi', 0) if db_entry else 0)
-                p_iv_sum = (ib.get('put_iv_sum', 0) if ib else 0) + (db_entry.get('put_iv_sum', 0) if db_entry else 0)
-                p_iv_oi = (ib.get('put_iv_oi', 0) if ib else 0) + (db_entry.get('put_iv_oi', 0) if db_entry else 0)
-
-                strike_rows.append({
-                    'strike': ibit_strike,
-                    'btc': float(btc_p),
-                    'call_oi': (ib['call_oi'] if ib else 0) + (db_entry['call_oi'] if db_entry else 0),
-                    'put_oi': (ib['put_oi'] if ib else 0) + (db_entry['put_oi'] if db_entry else 0),
-                    'ibit_call_oi': ib['call_oi'] if ib else 0,
-                    'ibit_put_oi': ib['put_oi'] if ib else 0,
-                    'deribit_call_oi': db_entry['call_oi'] if db_entry else 0,
-                    'deribit_put_oi': db_entry['put_oi'] if db_entry else 0,
-                    'call_gex': round(i_call_gex + d_call_gex, 2),
-                    'put_gex': round(i_put_gex + d_put_gex, 2),
-                    'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
-                    'ibit_gex': round(i_call_gex + i_put_gex, 2),
-                    'deribit_gex': round(d_call_gex + d_put_gex, 2),
-                    'net_dealer_delta': round(
-                        (ib['call_delta'] + ib['put_delta'] if ib else 0) +
-                        (db_entry['call_delta'] + db_entry['put_delta'] if db_entry else 0), 2),
-                    'net_vanna': round(
-                        (ib['call_vanna'] + ib['put_vanna'] if ib else 0) +
-                        (db_entry['call_vanna'] + db_entry['put_vanna'] if db_entry else 0), 2),
-                    'net_charm': round(
-                        (ib['call_charm'] + ib['put_charm'] if ib else 0) +
-                        (db_entry['call_charm'] + db_entry['put_charm'] if db_entry else 0), 2),
-                    'call_volume': ib['call_volume'] if ib else 0,
-                    'put_volume': ib['put_volume'] if ib else 0,
-                    'call_iv': round(c_iv_sum / c_iv_oi, 4) if c_iv_oi > 0 else 0,
-                    'put_iv': round(p_iv_sum / p_iv_oi, 4) if p_iv_oi > 0 else 0,
-                })
-
-            # Compute per-expiry levels
-            level_rows = [{
-                'strike': sr['btc'], 'net_gex': sr['net_gex'],
-                'call_gex': sr['call_gex'], 'put_gex': sr['put_gex'],
-                'call_oi': sr['call_oi'], 'put_oi': sr['put_oi'],
-                'total_oi': sr['call_oi'] + sr['put_oi'],
-                'net_dealer_delta': sr['net_dealer_delta'],
-                'net_vanna': sr['net_vanna'], 'net_charm': sr['net_charm'],
-                'call_volume': sr['call_volume'], 'put_volume': sr['put_volume'],
-                'call_vol_gex': 0, 'put_vol_gex': 0,
-                'active_gex': sr['net_gex'],
-            } for sr in strike_rows]
-            level_df = pd.DataFrame(level_rows)
-            levels_exp = _compute_levels_from_df(level_df, spot_btc_val) if not level_df.empty else {}
-
-            net_gex = sum(sr['net_gex'] for sr in strike_rows)
-            total_call = sum(sr['call_oi'] for sr in strike_rows)
-            total_put = sum(sr['put_oi'] for sr in strike_rows)
-            has_deribit = any(sr['deribit_gex'] != 0 for sr in strike_rows)
-
-            expiry_blob = {
-                'expiry_date': exp_str, 'dte': dte_val,
-                'spot': spot, 'spot_btc': round(spot_btc_val, 2),
-                'btc_per_share': ref_per_share,
-                'deribit_available': has_deribit,
-                'strikes': strike_rows,
-                'summary': {
-                    'net_gex_total': round(net_gex, 2),
-                    'total_call_oi': total_call, 'total_put_oi': total_put,
-                    'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
-                    'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
-                    'call_wall_btc': levels_exp.get('call_wall'),
-                    'put_wall_btc': levels_exp.get('put_wall'),
-                    'gamma_flip_btc': levels_exp.get('gamma_flip'),
-                }
-            }
-
-            c_exp.execute(
-                'INSERT OR REPLACE INTO expiry_cache (date, ticker, expiry_date, data_json) VALUES (?, ?, ?, ?)',
-                (today_str, ticker_symbol, exp_str, json.dumps(expiry_blob))
-            )
-        conn_exp.commit()
-        conn_exp.close()
-    except Exception as e:
-        log.warning(f"[expiry-cache] Failed to store per-expiry data: {e}")
+    _merge_and_store_expiry_data(
+        ticker_symbol, expiry_strike_data, deribit_expiry_strike_data,
+        spot, btc_spot, ref_per_share, is_crypto
+    )
 
     # Positioning depth metrics (dealer cushion, put density, call overwrite zone)
     positioning_depth = {}
@@ -3332,9 +3616,115 @@ REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 
 
 def _refresh_deribit_only(ticker):
-    """Patch cached blobs with fresh Deribit data. Does NOT touch IBIT data,
-    dealer delta, flow forecast, or any other computed field.
-    Used when Yahoo/IBIT is unavailable (weekends)."""
+    """Refresh Deribit data with a single API fetch for all DTE ranges (0-45).
+    Updates Deribit strike data in existing expiry_cache rows, then re-aggregates
+    all DTE windows. Falls back to per-window patching on failure.
+
+    Used both for intraday Deribit updates (weekday) and weekend overlays."""
+    rfr = get_risk_free_rate()
+    deribit_currency = TICKER_CONFIG.get(ticker, {}).get('deribit_currency', 'BTC')
+    overall_max_dte = max(w[2] for w in DTE_WINDOWS)
+
+    try:
+        # Single Deribit fetch for 0-45 DTE
+        deribit_options = fetch_deribit_options(0, overall_max_dte, currency=deribit_currency)
+        if not deribit_options:
+            log.warning(f"[deribit-refresh] {ticker}: no Deribit data returned")
+            return
+
+        # Process with full_greeks=True for per-expiry strike data
+        deribit_strike_data, deribit_iv_data, deribit_oi_btc, deribit_expiry_strike_data = process_deribit_options(
+            deribit_options, rfr, full_greeks=True
+        )
+        log.info(f"[deribit-refresh] {ticker}: fetched {len(deribit_expiry_strike_data)} Deribit expiries")
+
+        # Get existing IBIT expiry data from expiry_cache to re-merge
+        today_str = today_str_et()
+        conn = get_db()
+        rows = conn.execute(
+            'SELECT expiry_date, data_json FROM expiry_cache WHERE date=? AND ticker=?',
+            (today_str, ticker)
+        ).fetchall()
+        conn.close()
+
+        if not rows:
+            log.warning(f"[deribit-refresh] {ticker}: no existing expiry_cache rows to update")
+            return
+
+        # Extract IBIT-only strike data from existing blobs
+        # We need spot/btc_per_share from an existing blob
+        sample_blob = json.loads(rows[0][1])
+        spot = sample_blob.get('spot', 0)
+        spot_btc = sample_blob.get('spot_btc', 0)
+        btc_per_share = sample_blob.get('btc_per_share', 1.0)
+        is_crypto = TICKER_CONFIG.get(ticker) is not None
+
+        # Rebuild IBIT-only expiry_strike_data from existing blobs
+        ibit_expiry_strike_data = {}
+        for exp_str, data_json in rows:
+            blob = json.loads(data_json)
+            strikes = blob.get('strikes', [])
+            if not strikes:
+                continue
+            esd = {}
+            for sr in strikes:
+                ibit_strike = sr.get('strike', 0)
+                if ibit_strike == 0:
+                    # Deribit-only strike, skip for IBIT data
+                    continue
+                dte_val = blob.get('dte', 0)
+                esd[ibit_strike] = {
+                    'call_oi': sr.get('ibit_call_oi', 0),
+                    'put_oi': sr.get('ibit_put_oi', 0),
+                    'call_gex': sr.get('call_gex', 0) - (sr.get('deribit_gex', 0) * (sr.get('call_gex', 0) / (sr.get('net_gex', 1) or 1)) if sr.get('deribit_gex', 0) != 0 and sr.get('net_gex', 0) != 0 else 0),
+                    'put_gex': sr.get('put_gex', 0) - (sr.get('deribit_gex', 0) * (sr.get('put_gex', 0) / (sr.get('net_gex', 1) or 1)) if sr.get('deribit_gex', 0) != 0 and sr.get('net_gex', 0) != 0 else 0),
+                    'call_delta': 0, 'put_delta': 0,
+                    'call_vanna': 0, 'put_vanna': 0,
+                    'call_charm': 0, 'put_charm': 0,
+                    'call_volume': sr.get('call_volume', 0),
+                    'put_volume': sr.get('put_volume', 0),
+                    'call_iv_sum': sr.get('call_iv', 0) * sr.get('ibit_call_oi', 0),
+                    'call_iv_oi': sr.get('ibit_call_oi', 0),
+                    'put_iv_sum': sr.get('put_iv', 0) * sr.get('ibit_put_oi', 0),
+                    'put_iv_oi': sr.get('ibit_put_oi', 0),
+                    'dte': dte_val,
+                }
+            if esd:
+                ibit_expiry_strike_data[exp_str] = esd
+
+        # Re-merge with fresh Deribit data and store
+        stored = _merge_and_store_expiry_data(
+            ticker, ibit_expiry_strike_data, deribit_expiry_strike_data,
+            spot, spot_btc, btc_per_share, is_crypto
+        )
+        log.info(f"[deribit-refresh] {ticker}: re-merged {len(stored)} expiry blobs with fresh Deribit")
+
+        # Re-aggregate all DTE windows
+        for label, min_d, max_d in REFRESH_DTES:
+            try:
+                agg = aggregate_dte_window(ticker, min_d, max_d)
+                if agg:
+                    set_cached_data(ticker, max_d, agg)
+                    log.info(f"[deribit-refresh] {ticker}: DTE {min_d}-{max_d} re-aggregated")
+            except Exception as e:
+                log.error(f"[deribit-refresh] {ticker}: DTE {min_d}-{max_d} aggregation error: {e}")
+
+        # Re-compute weekly outlook
+        try:
+            _compute_weekly_outlook(ticker)
+        except Exception as e:
+            log.warning(f"[deribit-refresh] {ticker}: weekly outlook recompute error: {e}")
+
+        log.info(f"[deribit-refresh] {ticker}: complete")
+
+    except Exception as e:
+        log.error(f"[deribit-refresh] {ticker}: single-fetch failed ({e}), falling back to per-window...")
+        _refresh_deribit_only_legacy(ticker)
+
+
+def _refresh_deribit_only_legacy(ticker):
+    """Legacy per-window Deribit overlay. Patches cached blobs directly.
+    Fallback when the single-fetch approach fails."""
     rfr = get_risk_free_rate()
     deribit_currency = TICKER_CONFIG.get(ticker, {}).get('deribit_currency', 'BTC')
 
@@ -3440,10 +3830,10 @@ def _refresh_deribit_only(ticker):
             cached['iv_term_structure'] = existing_iv
 
             set_cached_data(ticker, max_d, cached)
-            log.info(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay done")
+            log.info(f"[deribit-refresh-legacy] {ticker} DTE {min_d}-{max_d} Deribit overlay done")
 
         except Exception as e:
-            log.error(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay error: {e}")
+            log.error(f"[deribit-refresh-legacy] {ticker} DTE {min_d}-{max_d} Deribit overlay error: {e}")
 
 
 def _bg_refresh():
@@ -3514,29 +3904,35 @@ def _bg_refresh():
             stale_windows = []
             for label, min_d, max_d in REFRESH_DTES:
                 cache_date, cached = get_latest_cache(tk, max_d)
-                # Check both date and that min_dte matches
                 if cache_date != today or (cached and cached.get('dte_window', {}).get('min', 0) != min_d):
                     stale_windows.append((label, min_d, max_d))
             if stale_windows:
                 all_fresh = False
-                with ThreadPoolExecutor(max_workers=len(stale_windows)) as pool:
-                    futures = {pool.submit(fetch_with_cache, tk, max_d, min_d): (label, min_d, max_d) for label, min_d, max_d in stale_windows}
-                    for fut in as_completed(futures):
-                        try:
-                            fut.result()
-                        except Exception as e:
-                            w = futures[fut]
-                            log.error(f"[bg-refresh] {tk} DTE {w[1]}-{w[2]} error: {e}")
-
-                # Pre-compute weekly outlook with fresh expiry data
+                # Phase 3: single fetch_all_and_store instead of per-window fetch_with_cache
                 try:
-                    _compute_weekly_outlook(tk)
+                    log.info(f"[bg-refresh] {tk} stale ({len(stale_windows)} windows), running fetch_all_and_store...")
+                    fas_result = fetch_all_and_store(tk)
+                    if not fas_result:
+                        raise RuntimeError("fetch_all_and_store returned None")
+                    log.info(f"[bg-refresh] {tk} fetch_all_and_store complete")
                 except Exception as e:
-                    log.warning(f"[bg-refresh] {tk} weekly outlook compute error: {e}")
+                    log.error(f"[bg-refresh] {tk} fetch_all_and_store failed ({e}), falling back to per-window fetch...")
+                    with ThreadPoolExecutor(max_workers=len(stale_windows)) as pool:
+                        futures = {pool.submit(fetch_with_cache, tk, max_d, min_d): (label, min_d, max_d) for label, min_d, max_d in stale_windows}
+                        for fut in as_completed(futures):
+                            try:
+                                fut.result()
+                            except Exception as e2:
+                                w = futures[fut]
+                                log.error(f"[bg-refresh] {tk} DTE {w[1]}-{w[2]} fallback error: {e2}")
+                    # Fallback: also compute weekly outlook
+                    try:
+                        _compute_weekly_outlook(tk)
+                    except Exception as e2:
+                        log.warning(f"[bg-refresh] {tk} weekly outlook fallback error: {e2}")
 
             if all_fresh:
                 # Re-run AI analysis only if ref asset moved >2% since last analysis
-                # (Primary analysis is triggered post-close at 4:20 PM ET)
                 cached_analysis = get_cached_analysis(tk)
                 should_run = False
                 if cached_analysis and cached_analysis.get('_btc_price'):
@@ -3572,27 +3968,12 @@ def _bg_refresh():
                             _deribit_caches[deribit_currency]['time'] = 0
 
                         if all_fresh:
-                            # Weekday: IBIT is current, safe to do full refresh
-                            log.info(f"[bg-refresh] {tk} Deribit stale, full refresh...")
-                            with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
-                                futures = {
-                                    pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
-                                    for label, min_d, max_d in REFRESH_DTES
-                                }
-                                for fut in as_completed(futures):
-                                    try:
-                                        fut.result()
-                                    except Exception as e:
-                                        w = futures[fut]
-                                        log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
-                            log.info(f"[bg-refresh] {tk} Deribit full refresh complete")
-                            # Re-compute weekly outlook with fresh Deribit data
-                            try:
-                                _compute_weekly_outlook(tk)
-                            except Exception as e:
-                                log.warning(f"[bg-refresh] {tk} weekly outlook recompute error: {e}")
+                            # Weekday: IBIT is current, do single Deribit refresh via _refresh_deribit_only
+                            log.info(f"[bg-refresh] {tk} Deribit stale, refreshing via single fetch...")
+                            _refresh_deribit_only(tk)
+                            log.info(f"[bg-refresh] {tk} Deribit refresh complete")
                         else:
-                            # Weekend: IBIT stale, only update Deribit fields in cached blobs
+                            # Weekend: IBIT stale, only update Deribit fields
                             log.info(f"[bg-refresh] {tk} Deribit stale, weekend overlay...")
                             _refresh_deribit_only(tk)
                             log.info(f"[bg-refresh] {tk} Deribit weekend overlay complete")
@@ -3609,26 +3990,31 @@ def _bg_refresh():
                 already_done_today = post_close_done.get(tk) == today
 
                 if is_trading_day and post_close_window and not already_done_today:
-                    log.info(f"[bg-refresh] {tk} post-close refresh: re-fetching all windows with fresh IBIT data...")
+                    log.info(f"[bg-refresh] {tk} post-close refresh via fetch_all_and_store...")
 
-                    # Force-refresh all DTE windows to pull new IBIT close data
-                    with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
-                        futures = {
-                            pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
-                            for label, min_d, max_d in REFRESH_DTES
-                        }
-                        for fut in as_completed(futures):
-                            try:
-                                fut.result()
-                            except Exception as e:
-                                w = futures[fut]
-                                log.error(f"[bg-refresh] {tk} post-close DTE {w[1]}-{w[2]} error: {e}")
-
-                    # Pre-compute weekly outlook with fresh post-close data
+                    # Single fetch for all windows with fresh post-close data
                     try:
-                        _compute_weekly_outlook(tk)
+                        fas_result = fetch_all_and_store(tk)
+                        if not fas_result:
+                            raise RuntimeError("fetch_all_and_store returned None")
+                        log.info(f"[bg-refresh] {tk} post-close fetch_all_and_store complete")
                     except Exception as e:
-                        log.warning(f"[bg-refresh] {tk} weekly outlook post-close error: {e}")
+                        log.error(f"[bg-refresh] {tk} post-close fetch_all_and_store failed ({e}), falling back...")
+                        with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
+                            futures = {
+                                pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
+                                for label, min_d, max_d in REFRESH_DTES
+                            }
+                            for fut in as_completed(futures):
+                                try:
+                                    fut.result()
+                                except Exception as e2:
+                                    w = futures[fut]
+                                    log.error(f"[bg-refresh] {tk} post-close fallback DTE {w[1]}-{w[2]} error: {e2}")
+                        try:
+                            _compute_weekly_outlook(tk)
+                        except Exception:
+                            pass
 
                     # Run analysis with fresh data
                     try:

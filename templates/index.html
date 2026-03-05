@@ -619,8 +619,8 @@ function switchTicker(tk){
   document.querySelectorAll('.hdr-tab').forEach(b=>b.classList.toggle('active',b.dataset.ticker===tk));
   aiData=null;
   aiUnsaved=false;
-  loadData();
-  loadExpiryOptions();
+  document.getElementById('dte-select').value='0-3';
+  loadExpiryOptions().then(()=>loadData()).catch(()=>loadData());
   loadAnalysis();
   loadSnapshotDates();
 }
@@ -1380,6 +1380,12 @@ async function loadExpiryOptions(){
 
     // Hide range group entirely if no ranges available
     rangeGroup.style.display=rangeGroup.children.length?'':'none';
+
+    // Default to "This Week" range if available and still on initial DTE selection
+    const sel=document.getElementById('dte-select');
+    if(sel.value==='0-3' && rangeGroup.children.length){
+      sel.value=rangeGroup.children[0].value;
+    }
 
   }catch(e){console.warn('Expiry options:',e)}
 }
@@ -2736,8 +2742,7 @@ function renderStructure(data, outlook){
 
 // Init
 try{initTV()}catch(e){console.warn('TV init:',e)}
-loadData();
-loadExpiryOptions();
+loadExpiryOptions().then(()=>loadData()).catch(()=>loadData());
 loadAnalysis();
 loadSnapshotDates();
 // Modal dismiss: backdrop click + Escape
