@@ -212,6 +212,35 @@ def init_db():
         cols = [row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()]
         if 'weighted_net_gex' not in cols:
             c.execute(f'ALTER TABLE {table} ADD COLUMN weighted_net_gex REAL')
+    # Migrate: add dte column to strike_history + recreate with per-window unique constraint
+    sh_idx = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='strike_history'").fetchall()}
+    if 'idx_strike_history_dte' not in sh_idx:
+        try:
+            c.execute('''CREATE TABLE strike_history_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL, ticker TEXT NOT NULL,
+                strike REAL NOT NULL, call_oi INTEGER,
+                put_oi INTEGER, total_oi INTEGER, net_gex REAL,
+                weighted_net_gex REAL, dte INTEGER DEFAULT 0,
+                UNIQUE(date, ticker, strike, dte)
+            )''')
+            sh_cols = {r[1] for r in c.execute('PRAGMA table_info(strike_history)').fetchall()}
+            if 'dte' in sh_cols:
+                c.execute('''INSERT OR IGNORE INTO strike_history_new
+                    (date, ticker, strike, call_oi, put_oi, total_oi, net_gex, weighted_net_gex, dte)
+                    SELECT date, ticker, strike, call_oi, put_oi, total_oi, net_gex,
+                           COALESCE(weighted_net_gex, net_gex), COALESCE(dte, 0)
+                    FROM strike_history''')
+            else:
+                c.execute('''INSERT OR IGNORE INTO strike_history_new
+                    (date, ticker, strike, call_oi, put_oi, total_oi, net_gex, weighted_net_gex, dte)
+                    SELECT date, ticker, strike, call_oi, put_oi, total_oi, net_gex,
+                           COALESCE(weighted_net_gex, net_gex), 0
+                    FROM strike_history''')
+            c.execute('DROP TABLE strike_history')
+            c.execute('ALTER TABLE strike_history_new RENAME TO strike_history')
+        except Exception as e:
+            log.warning(f'[init_db] strike_history dte migration error: {e}')
     # Migrate: add total_btc_etf_flow column to etf_flows
     cols = [row[1] for row in c.execute('PRAGMA table_info(etf_flows)').fetchall()]
     if 'total_btc_etf_flow' not in cols:
@@ -306,7 +335,7 @@ def get_db():
     return conn
 
 
-def get_prev_strikes(conn, ticker):
+def get_prev_strikes(conn, ticker, dte=0):
     c = conn.cursor()
     today = today_str_et()
     c.execute('SELECT date FROM snapshots WHERE ticker=? AND date<? ORDER BY date DESC LIMIT 1',
@@ -315,29 +344,30 @@ def get_prev_strikes(conn, ticker):
     if not row:
         return None, {}
     prev_date = row[0]
-    c.execute('SELECT strike, call_oi, put_oi, total_oi, net_gex, weighted_net_gex FROM strike_history WHERE date=? AND ticker=?',
-              (prev_date, ticker))
+    c.execute('SELECT strike, call_oi, put_oi, total_oi, net_gex, weighted_net_gex FROM strike_history WHERE date=? AND ticker=? AND COALESCE(dte,0)=?',
+              (prev_date, ticker, dte))
     strikes = {}
     for r in c.fetchall():
         strikes[r[0]] = {'call_oi': r[1], 'put_oi': r[2], 'total_oi': r[3], 'net_gex': r[4], 'weighted_net_gex': r[5]}
     return prev_date, strikes
 
 
-def save_snapshot(conn, ticker, spot, btc_price, levels, df):
+def save_snapshot(conn, ticker, spot, btc_price, levels, df, dte=0, write_snapshot=True):
     date_str = today_str_et()
     c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO snapshots
-        (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-        (date_str, ticker, spot, btc_price, levels.get('gamma_flip'), levels.get('call_wall'),
-         levels.get('put_wall'), levels.get('max_pain'), levels.get('regime'),
-         levels.get('net_gex_total'), levels.get('total_call_oi'), levels.get('total_put_oi'),
-         levels.get('net_gex_total')))
+    if write_snapshot:
+        c.execute('''INSERT OR REPLACE INTO snapshots
+            (date,ticker,spot,btc_price,gamma_flip,call_wall,put_wall,max_pain,regime,net_gex,total_call_oi,total_put_oi,weighted_net_gex)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (date_str, ticker, spot, btc_price, levels.get('gamma_flip'), levels.get('call_wall'),
+             levels.get('put_wall'), levels.get('max_pain'), levels.get('regime'),
+             levels.get('net_gex_total'), levels.get('total_call_oi'), levels.get('total_put_oi'),
+             levels.get('net_gex_total')))
     for _, row in df.iterrows():
-        c.execute('''INSERT OR REPLACE INTO strike_history (date,ticker,strike,call_oi,put_oi,total_oi,net_gex,weighted_net_gex)
-            VALUES (?,?,?,?,?,?,?,?)''',
+        c.execute('''INSERT OR REPLACE INTO strike_history (date,ticker,strike,call_oi,put_oi,total_oi,net_gex,weighted_net_gex,dte)
+            VALUES (?,?,?,?,?,?,?,?,?)''',
             (date_str, ticker, row['strike'], int(row['call_oi']), int(row['put_oi']),
-             int(row['total_oi']), row['net_gex'], row['net_gex']))
+             int(row['total_oi']), row['net_gex'], row['net_gex'], dte))
     conn.commit()
 
 
@@ -687,7 +717,8 @@ def summarize_structure_trends(conn, ticker, days=7):
         else:
             cw = lvl.get('call_wall', 0) / bps if bps else None
             pw = lvl.get('put_wall', 0) / bps if bps else None
-            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            gf_raw = lvl.get('gamma_flip')
+            gf = gf_raw / bps if (bps and gf_raw is not None) else None
             regime = lvl.get('regime')
 
         if window not in window_history:
@@ -1841,11 +1872,13 @@ def compute_macro_regime(conn, ticker, days=30):
 
     if venue_data:
         try:
-            comb = venue_data.get('combined_levels_btc') or {}
             deribit = venue_data.get('deribit_levels_btc') or {}
+            bps_venue = venue_data.get('btc_per_share', 1)
+            ibit_lvl = venue_data.get('levels', {})
 
-            combined_cw = comb.get('call_wall', 0)
-            combined_pw = comb.get('put_wall', 0)
+            # Compare IBIT-only vs Deribit (not combined vs Deribit — combined already includes Deribit)
+            ibit_cw = ibit_lvl.get('call_wall', 0) / bps_venue if bps_venue else 0
+            ibit_pw = ibit_lvl.get('put_wall', 0) / bps_venue if bps_venue else 0
             deribit_cw = deribit.get('call_wall', 0)
             deribit_pw = deribit.get('put_wall', 0)
 
@@ -1856,13 +1889,13 @@ def compute_macro_regime(conn, ticker, days=30):
             pw_diff_pct = 0
             cw_diff_pct = 0
 
-            if combined_pw and deribit_pw and combined_pw > 0:
-                pw_diff_pct = abs(combined_pw - deribit_pw) / combined_pw
+            if ibit_pw and deribit_pw and ibit_pw > 0:
+                pw_diff_pct = abs(ibit_pw - deribit_pw) / ibit_pw
                 if pw_diff_pct <= convergence_pct:
                     pw_converging = True
 
-            if combined_cw and deribit_cw and combined_cw > 0:
-                cw_diff_pct = abs(combined_cw - deribit_cw) / combined_cw
+            if ibit_cw and deribit_cw and ibit_cw > 0:
+                cw_diff_pct = abs(ibit_cw - deribit_cw) / ibit_cw
                 if cw_diff_pct <= convergence_pct:
                     cw_converging = True
 
@@ -1993,6 +2026,7 @@ def compute_macro_regime(conn, ticker, days=30):
             'score_components_daily': score_history,
         },
         'coinglass_available': bool(os.environ.get('COINGLASS_API_KEY')),
+        'btc_led': ticker != 'IBIT',
         'structural_entry': structural_entry,
         'invalidation': invalidation,
         'timestamp': now_et().isoformat(),
@@ -2642,7 +2676,7 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
     # Fetch previous day's strike data (needed for Active GEX + breakout + sig levels)
     conn = get_db()
-    prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol)
+    prev_date, prev_strikes = get_prev_strikes(conn, ticker_symbol, dte=max_dte)
     conn.close()
 
     etf_flows = fetch_farside_flows() if (is_crypto and ticker_symbol == 'IBIT') else None
@@ -2891,7 +2925,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
 
     # Level strength trajectory
     level_trajectory = {}
-    for lname, lstrike in [('call_wall', levels['call_wall']), ('put_wall', levels['put_wall']), ('gamma_flip', levels['gamma_flip'])]:
+    for lname, lstrike in [('call_wall', levels['call_wall']), ('put_wall', levels['put_wall']), ('gamma_flip', levels.get('gamma_flip'))]:
+        if lstrike is None:
+            continue
         traj = {'status': 'STABLE', 'change_pct': 0.0, 'dominant_expiry': None, 'dominant_expiry_dte': None}
         # Current GEX at this strike
         strike_rows = df[df['strike'] == lstrike]
@@ -2951,10 +2987,9 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
     except Exception as e:
         log.warning(f"[delta-scenario] Failed: {e}")
 
-    # Save to DB (only for 0-min_dte windows — most relevant for day-over-day comparisons)
+    # Save to DB — strike history saved per DTE window; snapshot row only for nearest-term window
     conn = get_db()
-    if min_dte == 0:
-        save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df)
+    save_snapshot(conn, ticker_symbol, spot, btc_spot, levels, df, dte=max_dte, write_snapshot=(min_dte == 0))
 
     # OI aggregate changes
     oi_changes = None
@@ -3121,6 +3156,8 @@ def fetch_and_analyze(ticker_symbol='IBIT', max_dte=7, min_dte=0):
                     'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
                     'ibit_gex': round(i_call_gex + i_put_gex, 2),
                     'deribit_gex': round(d_call_gex + d_put_gex, 2),
+                    'deribit_call_gex': round(d_call_gex, 2),
+                    'deribit_put_gex': round(d_put_gex, 2),
                     'net_dealer_delta': round(
                         (ib['call_delta'] + ib['put_delta'] if ib else 0) +
                         (db_entry['call_delta'] + db_entry['put_delta'] if db_entry else 0), 2),
@@ -3319,7 +3356,13 @@ def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
         old_oi = (cached['levels']['total_call_oi'], cached['levels']['total_put_oi'])
         new_oi = (data['levels']['total_call_oi'], data['levels']['total_put_oi'])
         if old_oi == new_oi:
-            return cached  # Still stale, serve previous cache
+            # Secondary check: detect strike rotation even when total OI is unchanged
+            old_cw = cached['levels'].get('call_wall', 0)
+            new_cw = data['levels'].get('call_wall', 0)
+            old_pw = cached['levels'].get('put_wall', 0)
+            new_pw = data['levels'].get('put_wall', 0)
+            if old_cw == new_cw and old_pw == new_pw:
+                return cached  # Still stale, serve previous cache
 
     # New data (or first run or force_refresh) — save as today
     set_cached_data(ticker, dte, data)
@@ -3401,13 +3444,16 @@ def _refresh_deribit_only(ticker):
             deribit_levels_btc = _compute_levels_from_df(deribit_df, btc_spot) if not deribit_df.empty else None
 
             # Rebuild combined levels from patched gex_chart
+            # Use net_gex split for call/put walls — ensures call_wall (max call_gex)
+            # and put_wall (min put_gex) are consistent with updated net_gex values.
             combined_rows = []
             for entry in gex_chart:
                 if entry.get('net_gex', 0) != 0:
+                    ng = entry['net_gex']
                     combined_rows.append({
                         'strike': entry['btc'],
-                        'call_gex': entry.get('call_gex', 0),
-                        'put_gex': entry.get('put_gex', 0),
+                        'call_gex': max(ng, 0),
+                        'put_gex': min(ng, 0),
                         'net_gex': entry['net_gex'],
                         'call_oi': entry.get('call_oi', 0),
                         'put_oi': entry.get('put_oi', 0),
@@ -3918,7 +3964,8 @@ def api_outlook():
         else:
             cw = lvl.get('call_wall', 0) / bps if bps else None
             pw = lvl.get('put_wall', 0) / bps if bps else None
-            gf = lvl.get('gamma_flip', 0) / bps if bps else None
+            gf_raw = lvl.get('gamma_flip')
+            gf = gf_raw / bps if (bps and gf_raw is not None) else None
             mp = lvl.get('max_pain', 0) / bps if bps else None
             regime = lvl.get('regime')
             net_gex = lvl.get('net_gex_total', 0)
@@ -4294,6 +4341,7 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
                     'call_oi': 0, 'put_oi': 0,
                     'call_gex': 0, 'put_gex': 0,
                     'net_gex': 0, 'ibit_gex': 0, 'deribit_gex': 0,
+                    'deribit_call_gex': 0, 'deribit_put_gex': 0,
                     'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
                     'call_volume': 0, 'put_volume': 0, 'total_volume': 0,
                 }
@@ -4305,6 +4353,8 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
             a['put_gex'] += s.get('put_gex', 0)
             a['ibit_gex'] += s.get('ibit_gex', s['net_gex'])
             a['deribit_gex'] += s.get('deribit_gex', 0)
+            a['deribit_call_gex'] += s.get('deribit_call_gex', 0)
+            a['deribit_put_gex'] += s.get('deribit_put_gex', 0)
             a['net_dealer_delta'] += s['net_dealer_delta']
             a['net_vanna'] += s['net_vanna']
             a['net_charm'] += s['net_charm']
@@ -4450,7 +4500,7 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
     if deribit_strikes:
         deri_rows = [{
             'strike': s['btc'], 'net_gex': s.get('deribit_gex', 0),
-            'call_gex': 0, 'put_gex': 0,
+            'call_gex': s.get('deribit_call_gex', 0), 'put_gex': s.get('deribit_put_gex', 0),
             'call_oi': s.get('call_oi', 0), 'put_oi': s.get('put_oi', 0),
             'total_oi': s.get('call_oi', 0) + s.get('put_oi', 0),
             'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
@@ -4771,6 +4821,20 @@ def api_expiry_data():
     _, prev_strikes = get_prev_strikes(conn2, ticker)
     history_raw = get_history(conn2, ticker, 10)
     conn2.close()
+
+    # Convert prev_strikes from IBIT share-price space to BTC space for expiry aggregation
+    if prev_strikes and rows:
+        try:
+            first_blob = json.loads(rows[0][0])
+            bps_conv = first_blob.get('btc_per_share', 0)
+            if bps_conv and bps_conv > 0:
+                prev_strikes_btc = {}
+                for strike_share, strike_data in prev_strikes.items():
+                    btc_strike = round(strike_share / bps_conv)
+                    prev_strikes_btc[btc_strike] = strike_data
+                prev_strikes = prev_strikes_btc
+        except Exception:
+            pass
 
     history_data = [{'date': h[0], 'spot': h[1], 'btc_price': h[2],
                      'gamma_flip': h[3], 'call_wall': h[4], 'put_wall': h[5],

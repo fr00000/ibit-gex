@@ -408,6 +408,13 @@ function updateSignals(data) {
 
   if (!data.signals) return;
 
+  if (data.btc_led) {
+    const note = document.createElement('div');
+    note.style.cssText = 'font-size:11px;color:var(--t2);opacity:0.7;margin-bottom:8px;padding:4px 0;border-bottom:1px solid var(--border)';
+    note.textContent = 'Macro signals use BTC derivatives (leading indicator for ETH)';
+    container.appendChild(note);
+  }
+
   const keys = Object.keys(data.signals);
   keys.forEach(key => {
     const sig = data.signals[key];

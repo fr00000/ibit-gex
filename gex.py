@@ -287,7 +287,7 @@ def _compute_levels_from_df(df, spot, etf_flows=None):
             if (g2 - g1) != 0:
                 flip = s1 + (s2 - s1) * (-g1) / (g2 - g1)
                 all_flips.append(flip)
-    levels['gamma_flip'] = float(min(all_flips, key=lambda x: abs(x - spot))) if all_flips else float(spot)
+    levels['gamma_flip'] = float(min(all_flips, key=lambda x: abs(x - spot))) if all_flips else None
 
     # Max pain (vectorized)
     strikes_arr = df['strike'].values
@@ -482,7 +482,7 @@ def compute_dealer_delta_scenarios(cached_chains, spot, levels, expected_move, r
     """Pre-compute dealer delta at hypothetical prices across the key level grid."""
     cw = levels.get('call_wall', spot * 1.05)
     pw = levels.get('put_wall', spot * 0.95)
-    gf = levels.get('gamma_flip', spot)
+    gf = levels.get('gamma_flip') or spot
     mp = levels.get('max_pain', spot)
 
     # Build price grid
