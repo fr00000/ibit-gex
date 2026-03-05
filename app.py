@@ -5274,55 +5274,37 @@ def api_expiry_data():
         return Response(json.dumps({'error': 'All expiries in range have settled'}),
                         mimetype='application/json'), 404
 
-    agg = _aggregate_expiry_blobs(rows)
-    if not agg:
+    # Get prev_strikes for OI changes
+    conn2 = get_db()
+    prev_date, prev_strikes = get_prev_strikes(conn2, ticker)
+    history_rows = get_history(conn2, ticker, 10)
+    conn2.close()
+
+    history_data = []
+    for h in history_rows:
+        history_data.append({
+            'date': h[0], 'spot': h[1], 'btc_price': h[2],
+            'gamma_flip': h[3], 'call_wall': h[4], 'put_wall': h[5],
+            'max_pain': h[6], 'regime': h[7], 'net_gex': h[8],
+            'total_call_oi': h[9], 'total_put_oi': h[10],
+            'weighted_net_gex': h[11] if len(h) > 11 else None,
+        })
+
+    etf_flows = fetch_farside_flows() if ticker == 'IBIT' else None
+
+    result = _aggregate_expiry_blobs(
+        rows, ticker=ticker, min_dte=0, max_dte=90,
+        etf_flows=etf_flows, prev_strikes=prev_strikes,
+        history=history_data, iv_term_structure=None)
+
+    if not result:
         return Response(json.dumps({'error': 'No data to aggregate'}),
                         mimetype='application/json'), 404
 
-    first_blob = json.loads(rows[0][0])
+    # Add date and included_expiries metadata
+    result['date'] = snapshot_date
 
-    # Significant levels (not in shared helper — only needed here)
-    sig_levels = []
-    if agg['levels_btc']:
-        try:
-            level_rows = [{
-                'strike': s['btc'], 'net_gex': s['net_gex'],
-                'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
-                'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
-                'total_oi': s['call_oi'] + s['put_oi'],
-                'net_dealer_delta': s['net_dealer_delta'],
-                'net_vanna': s['net_vanna'], 'net_charm': s['net_charm'],
-                'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
-                'call_vol_gex': 0, 'put_vol_gex': 0,
-                'active_gex': s['net_gex'],
-            } for s in agg['gex_chart']]
-            level_df = pd.DataFrame(level_rows)
-            if not level_df.empty:
-                sig_levels = compute_significant_levels(level_df, agg['spot_btc'], agg['levels_btc'], {}, True, 1.0)
-        except Exception as e:
-            log.warning(f"[expiry-data] significant_levels failed: {e}")
-
-    result = {
-        'date': snapshot_date,
-        'spot_btc': agg['spot_btc'],
-        'spot': first_blob.get('spot'),
-        'btc_per_share': first_blob.get('btc_per_share'),
-        'included_expiries': agg['included_expiries'],
-        'gex_chart': agg['gex_chart'],
-        'levels_btc': agg['levels_btc'],
-        'net_gex_total': agg['net_gex_total'],
-        'total_call_oi': agg['total_call_oi'],
-        'total_put_oi': agg['total_put_oi'],
-        'pcr': round(agg['total_put_oi'] / agg['total_call_oi'], 3) if agg['total_call_oi'] > 0 else 0,
-        'regime': agg['regime'],
-        'deribit_available': any(s.get('deribit_gex', 0) != 0 for s in agg['gex_chart']),
-        'flow_forecast': agg['flow_forecast'],
-        'significant_levels': sig_levels,
-        'delta_flip_points': agg['delta_flip_points'],
-        'dealer_delta_profile': agg['dealer_delta_profile'],
-    }
-
-    return Response(json.dumps(result, default=str), mimetype='application/json')
+    return Response(json.dumps(result, cls=NumpyEncoder), mimetype='application/json')
 
 
 @app.route('/api/data')

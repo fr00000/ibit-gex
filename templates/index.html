@@ -1420,16 +1420,17 @@ async function loadData(){
 
     // Normalize expiry-data response to match /api/data shape
     if(isExpiryMode){
-      data.btc_spot=data.spot_btc||0;
+      // Map enriched response fields to match /api/data shape
+      data.btc_spot=data.btc_spot||data.spot_btc||0;
       data.spot=data.spot||0;
-      data.levels=data.levels_btc||{};
-      data.combined_levels_btc=data.levels_btc||{};
+      data.levels=data.levels||data.levels_btc||{};
+      data.combined_levels_btc=data.combined_levels_btc||data.levels_btc||{};
       data.deribit_available=data.deribit_available||false;
-      data.timestamp=data.date||'';
+      data.timestamp=data.timestamp||data.date||'';
       data.dealer_delta_profile=data.dealer_delta_profile||[];
-      data.expirations=data.included_expiries||[];
-      data.etf_flows=null;
-      data.data_freshness=null;
+      data.expirations=data.expirations||data.included_expiries||[];
+      data.etf_flows=data.etf_flows||null;
+      data.data_freshness=data.data_freshness||null;
       data.flow_forecast=data.flow_forecast||null;
       data.significant_levels=data.significant_levels||[];
       data.delta_flip_points=data.delta_flip_points||[];
