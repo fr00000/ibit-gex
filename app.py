@@ -2711,6 +2711,8 @@ def _merge_and_store_expiry_data(ticker_symbol, expiry_strike_data, deribit_expi
                     'put_gex': round(i_put_gex + d_put_gex, 2),
                     'net_gex': round(i_call_gex + i_put_gex + d_call_gex + d_put_gex, 2),
                     'ibit_gex': round(i_call_gex + i_put_gex, 2),
+                    'ibit_call_gex': round(i_call_gex, 2),
+                    'ibit_put_gex': round(i_put_gex, 2),
                     'deribit_gex': round(d_call_gex + d_put_gex, 2),
                     'net_dealer_delta': round(
                         (ib['call_delta'] + ib['put_delta'] if ib else 0) +
@@ -3676,8 +3678,8 @@ def _refresh_deribit_only(ticker):
                 esd[ibit_strike] = {
                     'call_oi': sr.get('ibit_call_oi', 0),
                     'put_oi': sr.get('ibit_put_oi', 0),
-                    'call_gex': sr.get('call_gex', 0) - (sr.get('deribit_gex', 0) * (sr.get('call_gex', 0) / (sr.get('net_gex', 1) or 1)) if sr.get('deribit_gex', 0) != 0 and sr.get('net_gex', 0) != 0 else 0),
-                    'put_gex': sr.get('put_gex', 0) - (sr.get('deribit_gex', 0) * (sr.get('put_gex', 0) / (sr.get('net_gex', 1) or 1)) if sr.get('deribit_gex', 0) != 0 and sr.get('net_gex', 0) != 0 else 0),
+                    'call_gex': sr.get('ibit_call_gex', sr.get('call_gex', 0)),
+                    'put_gex': sr.get('ibit_put_gex', sr.get('put_gex', 0)),
                     'call_delta': 0, 'put_delta': 0,
                     'call_vanna': 0, 'put_vanna': 0,
                     'call_charm': 0, 'put_charm': 0,
@@ -5059,17 +5061,22 @@ def aggregate_dte_window(ticker, min_dte, max_dte):
     now = now_et()
     conn = get_db()
 
-    # Filter expiries within the DTE window
-    all_dates = conn.execute(
-        'SELECT DISTINCT expiry_date FROM expiry_cache WHERE ticker=? AND date=?',
-        (ticker, today)).fetchall()
+    # Filter expiries within the DTE window, using latest data per expiry
+    latest_per_expiry = conn.execute('''
+        SELECT expiry_date, MAX(date) as latest_date
+        FROM expiry_cache WHERE ticker=? AND expiry_date>=?
+        GROUP BY expiry_date
+    ''', (ticker, today)).fetchall()
+
     target_expiries = []
-    for (exp_str,) in all_dates:
+    expiry_snapshot = {}
+    for exp_str, latest_date in latest_per_expiry:
         try:
             exp_dt = datetime.strptime(exp_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
             dte = max((exp_dt - now).days, 0)
             if min_dte <= dte <= max_dte:
                 target_expiries.append(exp_str)
+                expiry_snapshot[exp_str] = latest_date
         except Exception:
             continue
 
@@ -5077,10 +5084,15 @@ def aggregate_dte_window(ticker, min_dte, max_dte):
         conn.close()
         return None
 
-    placeholders = ','.join('?' * len(target_expiries))
-    rows = conn.execute(
-        f'SELECT data_json FROM expiry_cache WHERE date=? AND ticker=? AND expiry_date IN ({placeholders})',
-        (today, ticker, *target_expiries)).fetchall()
+    # Query latest row for each target expiry
+    rows = []
+    for exp in target_expiries:
+        snap = expiry_snapshot[exp]
+        row = conn.execute(
+            'SELECT data_json FROM expiry_cache WHERE date=? AND ticker=? AND expiry_date=?',
+            (snap, ticker, exp)).fetchone()
+        if row:
+            rows.append(row)
 
     # Get prev_strikes for OI changes
     prev_date, prev_strikes = get_prev_strikes(conn, ticker)
