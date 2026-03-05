@@ -4769,8 +4769,16 @@ def api_expiry_data():
     # Fetch enrichment data for full response
     conn2 = get_db()
     _, prev_strikes = get_prev_strikes(conn2, ticker)
-    history_data = get_history(conn2, ticker, 10)
+    history_raw = get_history(conn2, ticker, 10)
     conn2.close()
+
+    history_data = [{'date': h[0], 'spot': h[1], 'btc_price': h[2],
+                     'gamma_flip': h[3], 'call_wall': h[4], 'put_wall': h[5],
+                     'max_pain': h[6], 'regime': h[7], 'net_gex': h[8],
+                     'total_call_oi': h[9], 'total_put_oi': h[10],
+                     'weighted_net_gex': h[11] if len(h) > 11 else None}
+                    for h in history_raw]
+
     etf_flows_data = fetch_farside_flows() if ticker == 'IBIT' else None
 
     agg = _aggregate_expiry_blobs(
