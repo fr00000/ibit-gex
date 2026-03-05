@@ -459,13 +459,8 @@ if(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && window.location.path
       <span class="cell-tab" data-view="heatmap-oi" onclick="setStructView('heatmap-oi')" style="margin-right:8px">OI Heat</span>
       <span class="cell-tab" data-view="heatmap-gex" onclick="setStructView('heatmap-gex')">GEX Heat</span>
       <span id="struct-dte-selector" style="margin-left:auto;display:flex;align-items:center">
-        <select onchange="setStructDte(this.value)" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 4px;border-radius:2px;border:1px solid var(--border2);background:var(--bg);color:var(--t2);cursor:pointer;outline:none">
-          <option value="all">ALL DTE</option>
-          <option value="0-3">0-3 DTE</option>
-          <option value="4-7">4-7 DTE</option>
-          <option value="8-14">8-14 DTE</option>
-          <option value="15-30">15-30 DTE</option>
-          <option value="31-45" selected>31-45 DTE</option>
+        <select id="struct-dte-select" onchange="setStructDte(this.value)" style="font-family:var(--mono);font-size:8px;font-weight:600;letter-spacing:.4px;padding:1px 4px;border-radius:2px;border:1px solid var(--border2);background:var(--bg);color:var(--t2);cursor:pointer;outline:none">
+          <option value="all">ALL</option>
         </select>
       </span>
     </div>
@@ -1950,16 +1945,8 @@ function renderOutlook(data){
 }
 
 // Structure chart (simplified 30d wall evolution) — matches /structure page style
-const STRUCT_WINDOWS=[
-  {key:'31-45',label:'31-45d',bg:'rgba(168,139,250,0.06)',border:'rgba(168,139,250,0.25)',bw:1},
-  {key:'15-30',label:'15-30d',bg:'rgba(255,176,32,0.06)', border:'rgba(255,176,32,0.25)', bw:1},
-  {key:'8-14', label:'8-14d', bg:'rgba(56,144,255,0.08)', border:'rgba(56,144,255,0.35)', bw:1.5},
-  {key:'4-7',  label:'4-7d',  bg:'rgba(0,180,220,0.10)',  border:'rgba(0,180,220,0.45)',  bw:1.5},
-  {key:'0-3',  label:'0-3d',  bg:'rgba(0,220,130,0.12)',  border:'rgba(0,220,130,0.55)',  bw:2},
-];
-
 let structView='walls';
-let structDteWindow='31-45';
+let structDteWindow='all';
 function setStructDte(w){
   structDteWindow=w;
   if(window._structData&&window._outlookData) renderStructure(window._structData,window._outlookData);
@@ -2143,8 +2130,8 @@ function renderHeatmap(){
 async function loadStructure(){
   try{
     const [structRes, outlookRes] = await Promise.all([
-      fetch(`/api/structure?ticker=${currentTicker}&days=30`),
-      fetch(`/api/outlook?ticker=${currentTicker}`)
+      fetch(`/api/structure?ticker=${currentTicker}&days=30&mode=weekly`),
+      fetch(`/api/outlook?ticker=${currentTicker}&mode=weekly`)
     ]);
     window._structData = await structRes.json();
     window._outlookData = await outlookRes.json();
@@ -2371,11 +2358,48 @@ function renderStructure(data, outlook){
   const today = new Date();
   today.setHours(0,0,0,0);
 
+  // Discover window keys from data + populate selector
+  const allWindowKeys = new Set();
+  for(const d of dates){
+    for(const k of Object.keys(data[d]?.windows||{})) allWindowKeys.add(k);
+  }
+  const sortedKeys = [...allWindowKeys].sort((a,b)=>{
+    const order={'This Week':0,'Next Week':1};
+    const oa=order[a]!==undefined?order[a]:(parseInt(a.replace('Week ',''))||99);
+    const ob=order[b]!==undefined?order[b]:(parseInt(b.replace('Week ',''))||99);
+    return oa-ob;
+  });
+  const sel=document.getElementById('struct-dte-select');
+  if(sel){
+    const curVal=sel.value;
+    sel.innerHTML='<option value="all">ALL</option>';
+    for(const k of sortedKeys){
+      const opt=document.createElement('option');
+      opt.value=k;opt.textContent=k;sel.appendChild(opt);
+    }
+    if(sortedKeys.includes(curVal)) sel.value=curVal;
+    else sel.value='all';
+    structDteWindow=sel.value;
+  }
+
+  // Generate dynamic palette for weekly keys
+  const palette = sortedKeys.map((_,i) => {
+    const t = sortedKeys.length > 1 ? i / (sortedKeys.length - 1) : 0;
+    const hue = 140 + t * 220;
+    return {
+      key: sortedKeys[i],
+      label: sortedKeys[i],
+      border: `hsla(${hue},60%,60%,${(0.3 + t*0.25).toFixed(2)})`,
+      bg: `hsla(${hue},60%,60%,${(0.04 + t*0.08).toFixed(2)})`,
+      bw: Math.round((2 - t)*10)/10,
+    };
+  });
+
   // Historical data points (from /api/structure)
   const pw = structDteWindow;
   const isAll = pw === 'all';
-  const allKeys = ['0-3','4-7','8-14','15-30','31-45'];
-  const sw = isAll ? null : (pw === '0-3' ? '31-45' : '0-3');
+  const allKeys = sortedKeys;
+  const sw = isAll ? null : (pw === sortedKeys[0] ? sortedKeys[sortedKeys.length-1] : sortedKeys[0]);
   const histLabels = dates.map(d => d.slice(5));
   const histSpot = dates.map(d => data[d]?.spot || null);
 
@@ -2401,7 +2425,7 @@ function renderStructure(data, outlook){
         if(cws.length) histCW[histCW.length-1] = Math.max(...cws);
         if(pws.length) histPW[histPW.length-1] = Math.min(...pws);
       } else {
-        const wPri = outlook.windows.find(w => w.label === pw+'d');
+        const wPri = outlook.windows.find(w => w.label === pw);
         if(wPri){
           if(wPri.call_wall) histCW[histCW.length-1] = wPri.call_wall;
           if(wPri.put_wall) histPW[histPW.length-1] = wPri.put_wall;
@@ -2409,7 +2433,7 @@ function renderStructure(data, outlook){
         }
       }
       if(sw){
-        const wSec = outlook.windows.find(w => w.label === sw+'d');
+        const wSec = outlook.windows.find(w => w.label === sw);
         if(wSec){
           if(wSec.call_wall) histCWSec[histCWSec.length-1] = wSec.call_wall;
           if(wSec.put_wall) histPWSec[histPWSec.length-1] = wSec.put_wall;
@@ -2421,9 +2445,8 @@ function renderStructure(data, outlook){
   // Forward projection points (from /api/outlook)
   const fwdPoints = [];
   if(outlook && outlook.windows){
-    const dteOffsets = {'0-3d':1, '4-7d':5, '8-14d':11, '15-30d':22, '31-45d':38};
     for(const w of outlook.windows){
-      const offset = dteOffsets[w.label] || 0;
+      const offset = Math.round((w.min_dte + w.max_dte) / 2);
       if(offset <= 1) continue;
       if(w.call_wall && w.put_wall){
         const fDate = new Date(today);
@@ -2461,11 +2484,11 @@ function renderStructure(data, outlook){
   if(fwdPoints.length > 0){
     let bridgePW = histPW[histPW.length-1];
     let bridgeCW = histCW[histCW.length-1];
-    if(isAll && outlook && outlook.windows){
-      const w03 = outlook.windows.find(w => w.label === '0-3d');
-      if(w03){
-        if(w03.put_wall) bridgePW = w03.put_wall;
-        if(w03.call_wall) bridgeCW = w03.call_wall;
+    if(isAll && outlook && outlook.windows && outlook.windows.length){
+      const nearest = outlook.windows[0];
+      if(nearest){
+        if(nearest.put_wall) bridgePW = nearest.put_wall;
+        if(nearest.call_wall) bridgeCW = nearest.call_wall;
       }
     }
     fwdPWArr[fwdPWArr.length-1] = bridgePW;
@@ -2487,13 +2510,13 @@ function renderStructure(data, outlook){
 
   const dividerIdx = dates.length - 1;
   const datasets = [];
-  const pwLabel = isAll ? 'all' : pw+'d';
-  const swLabel = sw ? sw+'d' : '';
+  const pwLabel = isAll ? 'all' : pw;
+  const swLabel = sw || '';
   const fwdPad = new Array(fwdPoints.length).fill(null);
 
   if(isAll){
-    // === ALL DTE: nested filled bands per window ===
-    const drawOrder = ['31-45','15-30','8-14','4-7','0-3'];
+    // === ALL: nested filled bands per weekly window ===
+    const drawOrder = [...sortedKeys].reverse();
     const windowData = allKeys.map(key => ({
       key,
       pw: dates.map(d => data[d]?.windows?.[key]?.put_wall || null),
@@ -2502,7 +2525,7 @@ function renderStructure(data, outlook){
     // Live override per window
     if(outlook && outlook.windows){
       for(const wd of windowData){
-        const ow = outlook.windows.find(w => w.label === wd.key+'d');
+        const ow = outlook.windows.find(w => w.label === wd.key);
         if(ow){
           if(ow.call_wall) wd.cw[wd.cw.length-1] = ow.call_wall;
           if(ow.put_wall) wd.pw[wd.pw.length-1] = ow.put_wall;
@@ -2511,7 +2534,8 @@ function renderStructure(data, outlook){
     }
     for(const key of drawOrder){
       const wd = windowData.find(w => w.key === key);
-      const swDef = STRUCT_WINDOWS.find(s => s.key === key);
+      const pi = sortedKeys.indexOf(key);
+      const swDef = palette[pi];
       if(!wd || !swDef) continue;
       const pwArr = [...wd.pw, ...fwdPad];
       const cwArr = [...wd.cw, ...fwdPad];
@@ -2664,7 +2688,7 @@ function renderStructure(data, outlook){
                     const w=d.windows?.[key];
                     if(w&&w.put_wall&&w.call_wall){
                       const range=Math.round((w.call_wall-w.put_wall)/1000);
-                      lines.push(key+'d: '+fB(w.put_wall)+' — '+fB(w.call_wall)+' ('+range+'K)');
+                      lines.push(key+': '+fB(w.put_wall)+' — '+fB(w.call_wall)+' ('+range+'K)');
                     }
                   }
                   const allCWs=allKeys.map(k=>d.windows?.[k]?.call_wall).filter(v=>v);
@@ -2680,14 +2704,14 @@ function renderStructure(data, outlook){
                 } else {
                   const s = d.windows?.[pw];
                   if(s){
-                    lines.push(pw+'d: '+fB(s.put_wall)+' — '+fB(s.call_wall));
+                    lines.push(pw+': '+fB(s.put_wall)+' — '+fB(s.call_wall));
                     lines.push('Range: '+Math.round((s.call_wall-s.put_wall)/1000)+'K');
                     lines.push(s.regime==='negative_gamma'?'neg γ':'pos γ');
                     if(s.venue_agree) lines.push('✓ Venues agree');
                   }
                   if(sw){
                     const t = d.windows?.[sw];
-                    if(t) lines.push(sw+'d: '+fB(t.put_wall)+' — '+fB(t.call_wall));
+                    if(t) lines.push(sw+': '+fB(t.put_wall)+' — '+fB(t.call_wall));
                   }
                 }
               } else {
@@ -2728,9 +2752,12 @@ function renderStructure(data, outlook){
   const L = (swatch, txt) => `<span style="display:flex;align-items:center;gap:2px;font-size:7px;color:#8892a4">${swatch}${txt}</span>`;
   const legendItems = [];
   if(isAll){
-    for(const swDef of [...STRUCT_WINDOWS].reverse()){
+    for(const key of [...sortedKeys].reverse()){
+      const pi = sortedKeys.indexOf(key);
+      const swDef = palette[pi];
+      if(!swDef) continue;
       legendItems.push(L(
-        `<span style="display:inline-block;width:12px;height:4px;background:${swDef.bg.replace(/[\d.]+\)$/,'0.4)')};border:1px solid ${swDef.border};border-radius:1px"></span>`,
+        `<span style="display:inline-block;width:12px;height:4px;background:${swDef.bg};border:1px solid ${swDef.border};border-radius:1px"></span>`,
         swDef.label
       ));
     }

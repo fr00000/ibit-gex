@@ -4053,8 +4053,83 @@ def api_structure():
     ticker = request.args.get('ticker', 'IBIT').upper()
     days = int(request.args.get('days', 30))
 
+    mode = request.args.get('mode', 'dte')
     cutoff = (now_et() - timedelta(days=days)).strftime('%Y-%m-%d')
 
+    if mode == 'weekly':
+        from datetime import datetime as dt_cls
+
+        all_snap_dates = [r[0] for r in c.execute(
+            'SELECT DISTINCT date FROM expiry_cache WHERE ticker=? AND date>=? ORDER BY date',
+            (ticker, cutoff)).fetchall()]
+
+        data = {}
+        for snap_date in all_snap_dates:
+            expiry_rows = c.execute(
+                'SELECT expiry_date, data_json FROM expiry_cache WHERE date=? AND ticker=? ORDER BY expiry_date',
+                (snap_date, ticker)).fetchall()
+
+            if not expiry_rows:
+                continue
+
+            first_blob = json.loads(expiry_rows[0][1])
+            spot_btc = first_blob.get('spot_btc', 0)
+
+            valid_rows = [(exp, dj) for exp, dj in expiry_rows if exp >= snap_date]
+
+            snap_dt = dt_cls.strptime(snap_date, '%Y-%m-%d')
+            snap_monday = snap_dt - timedelta(days=snap_dt.weekday())
+
+            weekly = {}
+            for exp_date, data_json in valid_rows:
+                exp_dt = dt_cls.strptime(exp_date, '%Y-%m-%d')
+                exp_monday = exp_dt - timedelta(days=exp_dt.weekday())
+                week_offset = int((exp_monday - snap_monday).days / 7)
+                if week_offset < 0:
+                    continue
+                if week_offset not in weekly:
+                    weekly[week_offset] = []
+                weekly[week_offset].append(json.loads(data_json))
+
+            windows = {}
+            for week_offset in sorted(weekly.keys()):
+                blobs = weekly[week_offset]
+
+                call_walls = [b['summary'].get('call_wall_btc') for b in blobs
+                              if b.get('summary', {}).get('call_wall_btc')]
+                put_walls = [b['summary'].get('put_wall_btc') for b in blobs
+                             if b.get('summary', {}).get('put_wall_btc')]
+                gamma_flips = [b['summary'].get('gamma_flip_btc') for b in blobs
+                               if b.get('summary', {}).get('gamma_flip_btc')]
+                net_gex_vals = [b['summary'].get('net_gex_total', 0) for b in blobs]
+                total_net_gex = sum(net_gex_vals)
+
+                cw = max(call_walls) if call_walls else None
+                pw = min(put_walls) if put_walls else None
+                gf = gamma_flips[0] if gamma_flips else None
+                regime = 'negative_gamma' if total_net_gex < 0 else 'positive_gamma'
+
+                if week_offset == 0:
+                    key = 'This Week'
+                elif week_offset == 1:
+                    key = 'Next Week'
+                else:
+                    key = f'Week {week_offset + 1}'
+
+                windows[key] = {
+                    'call_wall': cw, 'put_wall': pw,
+                    'gamma_flip': gf, 'regime': regime,
+                    'venue_agree': False,
+                    'deribit_cw': None, 'deribit_pw': None,
+                    'ibit_cw': None, 'ibit_pw': None,
+                }
+
+            data[snap_date] = {'spot': spot_btc, 'windows': windows}
+
+        conn.close()
+        return Response(json.dumps(data), mimetype='application/json')
+
+    # --- Existing DTE mode below (unchanged) ---
     rows = c.execute('''
         SELECT p.analysis_date, p.dte_window, p.spot_btc, p.call_wall_btc, p.put_wall_btc,
                p.gamma_flip_btc, p.regime, p.venue_walls_agree,
