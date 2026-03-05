@@ -1899,6 +1899,7 @@ function renderOutlook(data){
       scales:{
         x:{
           type:'linear',
+          offset:false,
           min:mode==='weekly'?Math.max(0,Math.min(...xPositions)-1):0,
           max:mode==='weekly'?Math.max(...xPositions)+1:46,
           grid:{color:'rgba(28,34,48,0.3)',lineWidth:0.5},
@@ -1931,6 +1932,7 @@ function renderOutlook(data){
           max:maxOi*3,
           grid:{display:false},
           stacked:true,
+          afterFit(axis){axis.width=0;},
         }
       }
     },
