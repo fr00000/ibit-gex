@@ -408,8 +408,8 @@ if(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) && window.location.path
   <div class="outlook-row" id="outlook-sec">
     <div class="cell-label">Positioning Outlook <span style="font-size:8px;color:var(--t3);font-weight:400;letter-spacing:0;text-transform:none;margin-left:4px">forward-looking range funnel</span>
       <span style="margin-left:auto;display:flex;gap:2px;align-items:center">
-        <button class="cell-tab active" data-outlook="dte" onclick="setOutlookMode('dte')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:var(--t2);cursor:pointer;line-height:1.4">DTE</button>
-        <button class="cell-tab" data-outlook="weekly" onclick="setOutlookMode('weekly')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--t3);cursor:pointer;line-height:1.4">Weekly</button>
+        <button class="cell-tab" data-outlook="dte" onclick="setOutlookMode('dte')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--t3);cursor:pointer;line-height:1.4">DTE</button>
+        <button class="cell-tab active" data-outlook="weekly" onclick="setOutlookMode('weekly')" style="font-size:8px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:var(--bg2);color:var(--t2);cursor:pointer;line-height:1.4">Weekly</button>
       </span>
     </div>
     <canvas id="outlook-chart"></canvas>
@@ -1769,7 +1769,7 @@ async function saveAnalysis(){
 }
 
 // Outlook funnel
-let outlookMode='dte';
+let outlookMode='weekly';
 function setOutlookMode(mode){
   outlookMode=mode;
   document.querySelectorAll('[data-outlook]').forEach(b=>{
