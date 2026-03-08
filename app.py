@@ -4625,6 +4625,7 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
                             net_dd += dd; put_dd += dd
                 dealer_delta_profile.append({
                     'price_btc': float(S_hyp),
+                    'price_ibit': float(S_hyp),
                     'net_dealer_delta': float(net_dd),
                 })
 
@@ -4636,7 +4637,14 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
                 if (d1 < 0 and d2 > 0) or (d1 > 0 and d2 < 0):
                     if (d2 - d1) != 0:
                         flip = p1 + (p2 - p1) * (-d1) / (d2 - d1)
-                        delta_flip_points.append({'price_btc': round(float(flip))})
+                        from_dir = 'BUY' if d1 < 0 else 'SELL'
+                        to_dir = 'SELL' if d1 < 0 else 'BUY'
+                        delta_flip_points.append({
+                            'price_btc': round(float(flip)),
+                            'price_ibit': round(float(flip)),
+                            'from_direction': from_dir,
+                            'to_direction': to_dir,
+                        })
             if delta_flip_points:
                 delta_flip_points.sort(key=lambda x: abs(x['price_btc'] - spot_btc))
                 delta_flip_points = delta_flip_points[:2]
@@ -4807,6 +4815,7 @@ def _aggregate_expiry_blobs(rows, *, ticker=None, min_dte=None, max_dte=None,
         'ticker': ticker or first_blob.get('ticker', 'IBIT'),
         'spot': float(spot_share),
         'btc_spot': float(spot_btc),
+        'spot_btc': float(spot_btc),
         'btc_per_share': float(btc_per_share),
         'is_btc': is_crypto,
         'timestamp': now_et().strftime('%Y-%m-%d %H:%M'),
