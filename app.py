@@ -3385,6 +3385,131 @@ def fetch_with_cache(ticker, dte, min_dte=0, force_refresh=False):
 REFRESH_DTES = DTE_WINDOWS  # refresh all non-overlapping windows
 
 
+def _patch_expiry_cache_deribit(ticker, deribit_expiry_strike_data):
+    """Patch expiry_cache blobs with fresh Deribit per-expiry strike data.
+    Updates Deribit GEX/OI fields, recalculates combined fields and summary levels."""
+    today = today_str_et()
+    conn = get_db()
+    c = conn.cursor()
+
+    expiry_rows = c.execute(
+        'SELECT expiry_date, data_json FROM expiry_cache WHERE date=? AND ticker=?',
+        (today, ticker)
+    ).fetchall()
+
+    if not expiry_rows:
+        conn.close()
+        return
+
+    sample_blob = json.loads(expiry_rows[0][1])
+    spot_btc = sample_blob.get('spot_btc', 0)
+
+    updated = 0
+    for exp_date, data_json in expiry_rows:
+        deribit_strikes = deribit_expiry_strike_data.get(exp_date)
+        if not deribit_strikes:
+            continue
+
+        blob = json.loads(data_json)
+        strikes = blob.get('strikes', [])
+        if not strikes:
+            continue
+
+        deribit_by_btc = {round(k): v for k, v in deribit_strikes.items()}
+
+        seen_btc = set()
+        for sr in strikes:
+            btc_p = round(sr.get('btc', 0))
+            seen_btc.add(btc_p)
+            db = deribit_by_btc.get(btc_p)
+
+            d_call_gex = db.get('call_gex', 0) if db else 0
+            d_put_gex = db.get('put_gex', 0) if db else 0
+            d_call_oi = db.get('call_oi', 0) if db else 0
+            d_put_oi = db.get('put_oi', 0) if db else 0
+
+            sr['deribit_gex'] = round(d_call_gex + d_put_gex, 2)
+            sr['deribit_call_gex'] = round(d_call_gex, 2)
+            sr['deribit_put_gex'] = round(d_put_gex, 2)
+            sr['deribit_call_oi'] = d_call_oi
+            sr['deribit_put_oi'] = d_put_oi
+
+            ibit_call_oi = sr.get('ibit_call_oi', 0)
+            ibit_put_oi = sr.get('ibit_put_oi', 0)
+            sr['call_oi'] = ibit_call_oi + d_call_oi
+            sr['put_oi'] = ibit_put_oi + d_put_oi
+
+            if 'ibit_call_gex' in sr:
+                sr['call_gex'] = round(sr['ibit_call_gex'] + d_call_gex, 2)
+                sr['put_gex'] = round(sr['ibit_put_gex'] + d_put_gex, 2)
+            else:
+                ibit_net = sr.get('ibit_gex', 0)
+                sr['call_gex'] = round(max(ibit_net, 0) + d_call_gex, 2)
+                sr['put_gex'] = round(min(ibit_net, 0) + d_put_gex, 2)
+            sr['net_gex'] = round(sr['call_gex'] + sr['put_gex'], 2)
+
+        # Add Deribit-only strikes not in expiry blob
+        for btc_p, d in deribit_by_btc.items():
+            if btc_p not in seen_btc:
+                d_cg = d.get('call_gex', 0)
+                d_pg = d.get('put_gex', 0)
+                strikes.append({
+                    'strike': 0, 'btc': float(btc_p),
+                    'call_oi': d.get('call_oi', 0), 'put_oi': d.get('put_oi', 0),
+                    'ibit_call_oi': 0, 'ibit_put_oi': 0,
+                    'deribit_call_oi': d.get('call_oi', 0), 'deribit_put_oi': d.get('put_oi', 0),
+                    'call_gex': round(d_cg, 2), 'put_gex': round(d_pg, 2),
+                    'net_gex': round(d_cg + d_pg, 2),
+                    'ibit_gex': 0, 'deribit_gex': round(d_cg + d_pg, 2),
+                    'ibit_call_gex': 0, 'ibit_put_gex': 0,
+                    'deribit_call_gex': round(d_cg, 2), 'deribit_put_gex': round(d_pg, 2),
+                    'net_dealer_delta': 0, 'net_vanna': 0, 'net_charm': 0,
+                    'call_volume': 0, 'put_volume': 0,
+                    'call_iv': 0, 'put_iv': 0,
+                })
+
+        strikes.sort(key=lambda s: s.get('btc', 0))
+        blob['strikes'] = strikes
+        blob['deribit_available'] = True
+
+        net_gex = sum(s['net_gex'] for s in strikes)
+        total_call = sum(s['call_oi'] for s in strikes)
+        total_put = sum(s['put_oi'] for s in strikes)
+
+        level_rows = [{
+            'strike': s['btc'], 'net_gex': s['net_gex'],
+            'call_gex': s.get('call_gex', 0), 'put_gex': s.get('put_gex', 0),
+            'call_oi': s['call_oi'], 'put_oi': s['put_oi'],
+            'total_oi': s['call_oi'] + s['put_oi'],
+            'net_dealer_delta': s.get('net_dealer_delta', 0),
+            'net_vanna': s.get('net_vanna', 0), 'net_charm': s.get('net_charm', 0),
+            'call_volume': s.get('call_volume', 0), 'put_volume': s.get('put_volume', 0),
+            'call_vol_gex': 0, 'put_vol_gex': 0, 'active_gex': s['net_gex'],
+        } for s in strikes]
+        level_df = pd.DataFrame(level_rows)
+        levels_exp = _compute_levels_from_df(level_df, spot_btc) if not level_df.empty else {}
+
+        blob['summary'] = {
+            'net_gex_total': round(net_gex, 2),
+            'total_call_oi': total_call, 'total_put_oi': total_put,
+            'pcr': round(total_put / total_call, 3) if total_call > 0 else 0,
+            'regime': 'negative_gamma' if net_gex < 0 else 'positive_gamma',
+            'call_wall_btc': levels_exp.get('call_wall'),
+            'put_wall_btc': levels_exp.get('put_wall'),
+            'gamma_flip_btc': levels_exp.get('gamma_flip'),
+        }
+
+        c.execute(
+            'INSERT OR REPLACE INTO expiry_cache (date, ticker, expiry_date, data_json) VALUES (?, ?, ?, ?)',
+            (today, ticker, exp_date, json.dumps(blob))
+        )
+        updated += 1
+
+    conn.commit()
+    conn.close()
+    log.info(f"[deribit-refresh] {ticker}: patched {updated} expiry_cache blobs")
+
+
 def _refresh_deribit_only(ticker):
     """Patch cached blobs with fresh Deribit data. Does NOT touch IBIT data,
     dealer delta, flow forecast, or any other computed field.
@@ -3515,6 +3640,19 @@ def _refresh_deribit_only(ticker):
 
         except Exception as e:
             log.error(f"[bg-refresh] {ticker} DTE {min_d}-{max_d} Deribit overlay error: {e}")
+
+    # Patch expiry_cache with fresh Deribit per-expiry data
+    overall_max_dte = max(w[2] for w in DTE_WINDOWS)
+    try:
+        all_deribit_options = fetch_deribit_options(0, overall_max_dte, currency=deribit_currency)
+        if all_deribit_options:
+            _, _, _, deribit_expiry_strike_data = process_deribit_options(
+                all_deribit_options, rfr, full_greeks=True
+            )
+            if deribit_expiry_strike_data:
+                _patch_expiry_cache_deribit(ticker, deribit_expiry_strike_data)
+    except Exception as e:
+        log.error(f"[deribit-refresh] {ticker}: expiry_cache patch error: {e}")
 
 
 def _bg_refresh():
