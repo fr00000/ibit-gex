@@ -3428,6 +3428,10 @@ def _patch_expiry_cache_deribit(ticker, deribit_expiry_strike_data):
             d_call_oi = db.get('call_oi', 0) if db else 0
             d_put_oi = db.get('put_oi', 0) if db else 0
 
+            # Read old Deribit values before overwriting (needed for else branch below)
+            old_d_call = sr.get('deribit_call_gex', 0) or 0
+            old_d_put = sr.get('deribit_put_gex', 0) or 0
+
             sr['deribit_gex'] = round(d_call_gex + d_put_gex, 2)
             sr['deribit_call_gex'] = round(d_call_gex, 2)
             sr['deribit_put_gex'] = round(d_put_gex, 2)
@@ -3443,9 +3447,11 @@ def _patch_expiry_cache_deribit(ticker, deribit_expiry_strike_data):
                 sr['call_gex'] = round(sr['ibit_call_gex'] + d_call_gex, 2)
                 sr['put_gex'] = round(sr['ibit_put_gex'] + d_put_gex, 2)
             else:
-                ibit_net = sr.get('ibit_gex', 0)
-                sr['call_gex'] = round(max(ibit_net, 0) + d_call_gex, 2)
-                sr['put_gex'] = round(min(ibit_net, 0) + d_put_gex, 2)
+                # Derive IBIT per-side by subtracting old Deribit from existing combined
+                ibit_call = sr.get('call_gex', 0) - old_d_call
+                ibit_put = sr.get('put_gex', 0) - old_d_put
+                sr['call_gex'] = round(ibit_call + d_call_gex, 2)
+                sr['put_gex'] = round(ibit_put + d_put_gex, 2)
             sr['net_gex'] = round(sr['call_gex'] + sr['put_gex'], 2)
 
         # Add Deribit-only strikes not in expiry blob
@@ -3561,15 +3567,19 @@ def _refresh_deribit_only(ticker):
                 d_strike = deribit_strike_data.get(btc_p, deribit_strike_data.get(float(btc_p), {}))
                 new_d_call = d_strike.get('call_gex', 0) if isinstance(d_strike, dict) else 0
                 new_d_put = d_strike.get('put_gex', 0) if isinstance(d_strike, dict) else 0
+                # Read old Deribit values before overwriting
+                old_d_call = entry.get('deribit_call_gex', 0) or 0
+                old_d_put = entry.get('deribit_put_gex', 0) or 0
                 entry['deribit_call_gex'] = new_d_call
                 entry['deribit_put_gex'] = new_d_put
                 if 'ibit_call_gex' in entry:
                     entry['call_gex'] = entry['ibit_call_gex'] + new_d_call
                     entry['put_gex'] = entry['ibit_put_gex'] + new_d_put
                 else:
-                    ibit_net = entry.get('ibit_gex', 0)
-                    entry['call_gex'] = max(ibit_net, 0) + new_d_call
-                    entry['put_gex'] = min(ibit_net, 0) + new_d_put
+                    ibit_call = entry.get('call_gex', max(entry.get('ibit_gex', 0), 0)) - old_d_call
+                    ibit_put = entry.get('put_gex', min(entry.get('ibit_gex', 0), 0)) - old_d_put
+                    entry['call_gex'] = ibit_call + new_d_call
+                    entry['put_gex'] = ibit_put + new_d_put
 
             # Add Deribit-only strikes not already in chart
             for btc_p, net_gex in deribit_by_btc.items():
