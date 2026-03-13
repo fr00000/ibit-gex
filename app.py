@@ -3783,6 +3783,7 @@ def _bg_refresh():
                         if all_fresh:
                             # Weekday: IBIT is current, safe to do full refresh
                             log.info(f"[bg-refresh] {tk} Deribit stale, full refresh...")
+                            refresh_failures = 0
                             with ThreadPoolExecutor(max_workers=len(REFRESH_DTES)) as pool:
                                 futures = {
                                     pool.submit(fetch_with_cache, tk, max_d, min_d, True): (label, min_d, max_d)
@@ -3793,7 +3794,12 @@ def _bg_refresh():
                                         fut.result()
                                     except Exception as e:
                                         w = futures[fut]
+                                        refresh_failures += 1
                                         log.error(f"[bg-refresh] {tk} Deribit refresh DTE {w[1]}-{w[2]} error: {e}")
+                            if refresh_failures >= len(REFRESH_DTES):
+                                # All windows failed (likely Yahoo unavailable pre-market) — fall back to overlay
+                                log.warning(f"[bg-refresh] {tk} full refresh failed for all windows, falling back to Deribit overlay")
+                                _refresh_deribit_only(tk)
                             log.info(f"[bg-refresh] {tk} Deribit full refresh complete")
                             # Re-compute weekly outlook with fresh Deribit data
                             try:
