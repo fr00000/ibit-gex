@@ -3423,10 +3423,22 @@ def _patch_expiry_cache_deribit(ticker, deribit_expiry_strike_data):
             seen_btc.add(btc_p)
             db = deribit_by_btc.get(btc_p)
 
-            d_call_gex = db.get('call_gex', 0) if db else 0
-            d_put_gex = db.get('put_gex', 0) if db else 0
-            d_call_oi = db.get('call_oi', 0) if db else 0
-            d_put_oi = db.get('put_oi', 0) if db else 0
+            if not db:
+                # No Deribit data at this strike — clear Deribit fields, leave IBIT untouched
+                sr['deribit_gex'] = 0
+                sr['deribit_call_gex'] = 0
+                sr['deribit_put_gex'] = 0
+                sr['deribit_call_oi'] = 0
+                sr['deribit_put_oi'] = 0
+                sr['call_oi'] = sr.get('ibit_call_oi', sr.get('call_oi', 0))
+                sr['put_oi'] = sr.get('ibit_put_oi', sr.get('put_oi', 0))
+                # Don't touch call_gex, put_gex, net_gex — they came from the original fetch
+                continue
+
+            d_call_gex = db.get('call_gex', 0)
+            d_put_gex = db.get('put_gex', 0)
+            d_call_oi = db.get('call_oi', 0)
+            d_put_oi = db.get('put_oi', 0)
 
             # Read old Deribit values before overwriting (needed for else branch below)
             old_d_call = sr.get('deribit_call_gex', 0) or 0
@@ -3561,13 +3573,21 @@ def _refresh_deribit_only(ticker):
                 btc_p = round(entry.get('btc', 0))
                 seen.add(btc_p)
                 new_d_gex = deribit_by_btc.get(btc_p, 0)
+                d_strike = deribit_strike_data.get(btc_p, deribit_strike_data.get(float(btc_p), {}))
+                has_deribit = isinstance(d_strike, dict) and (d_strike.get('call_gex', 0) != 0 or d_strike.get('put_gex', 0) != 0)
+
                 entry['deribit_gex'] = new_d_gex
                 entry['net_gex'] = entry.get('ibit_gex', 0) + new_d_gex
+
+                if not has_deribit:
+                    # No Deribit data at this strike — clear Deribit per-side, don't touch call_gex/put_gex
+                    entry['deribit_call_gex'] = 0
+                    entry['deribit_put_gex'] = 0
+                    continue
+
                 # Reconstruct per-side GEX from stored IBIT + fresh Deribit
-                d_strike = deribit_strike_data.get(btc_p, deribit_strike_data.get(float(btc_p), {}))
-                new_d_call = d_strike.get('call_gex', 0) if isinstance(d_strike, dict) else 0
-                new_d_put = d_strike.get('put_gex', 0) if isinstance(d_strike, dict) else 0
-                # Read old Deribit values before overwriting
+                new_d_call = d_strike.get('call_gex', 0)
+                new_d_put = d_strike.get('put_gex', 0)
                 old_d_call = entry.get('deribit_call_gex', 0) or 0
                 old_d_put = entry.get('deribit_put_gex', 0) or 0
                 entry['deribit_call_gex'] = new_d_call
